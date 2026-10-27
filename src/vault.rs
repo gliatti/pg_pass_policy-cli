@@ -119,9 +119,14 @@ impl VaultConfig {
     }
 
     /// HTTP client trusting the system roots, the webpki roots and
-    /// `root_certs`.  Certificate verification is never disabled.
+    /// `root_certs`.  Certificate verification is never disabled.  Redirects
+    /// are never followed: a 307/308 would replay the token and the password
+    /// to whatever host the `Location` header names, bypassing the loopback
+    /// rule of `check_addr`.  A redirect is reported as an error instead.
     pub fn client(&self) -> Result<reqwest::Client> {
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none());
         for cert in &self.root_certs {
             builder = builder.add_root_certificate(cert.clone());
         }
@@ -234,6 +239,11 @@ pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Val
         .await
         .with_context(|| format!("Vault request to {url} failed"))?;
     let status = resp.status();
+    if status.is_redirection() {
+        bail!(
+            "Vault answered HTTP {status} (redirect) at {url}: redirects are not followed, point VAULT_ADDR at the final Vault address"
+        );
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let body = body.trim();

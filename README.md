@@ -300,6 +300,11 @@ jeton et le mot de passe y circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
 `--exec 'read -r pw; printf "%s" "$pw" | vault kv put -mount=secret db/app password=-'`.
 
+Les redirections HTTP ne sont jamais suivies : une réponse 301/302/307/308
+est une erreur (code 1). Suivre une redirection rejouerait le jeton et le mot
+de passe vers l'hôte indiqué par `Location`, ce qui contournerait la règle
+ci-dessus. `VAULT_ADDR` doit donc pointer sur l'adresse finale de Vault.
+
 Toute cette configuration (variables, certificats, chemin) est validée avant
 la connexion à PostgreSQL : une erreur de configuration ne provoque jamais de
 rotation.

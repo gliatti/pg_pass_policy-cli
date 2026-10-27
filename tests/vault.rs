@@ -129,3 +129,38 @@ async fn plain_http_is_refused_unless_loopback() {
     assert!(text.contains("https://"), "{text}");
     assert_eq!(mock.hits_async().await, 0, "nothing must be sent");
 }
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let server = MockServer::start_async().await;
+    let elsewhere = MockServer::start_async().await;
+    let redirect = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/secret/data/db/app");
+            then.status(307).header(
+                "Location",
+                format!("{}/v1/secret/data/db/app", elsewhere.base_url()),
+            );
+        })
+        .await;
+    let sink = elsewhere
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/secret/data/db/app");
+            then.status(200);
+        })
+        .await;
+    let cfg = VaultConfig::new(server.base_url(), "tok", None).unwrap();
+    let target = VaultTarget::parse("secret/db/app", None).unwrap();
+    let err = write_secret(&cfg, &target, &build_payload("app", "hidden-pw", "now"))
+        .await
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("307"), "{text}");
+    assert!(!text.contains("hidden-pw"), "payload must not leak: {text}");
+    redirect.assert_async().await;
+    assert_eq!(
+        sink.hits_async().await,
+        0,
+        "the redirect target must never be contacted"
+    );
+}
