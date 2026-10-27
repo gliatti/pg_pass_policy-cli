@@ -5,11 +5,17 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use sqlx::postgres::types::PgInterval;
 
+/// Upper bound of a delay: 100 years (36500 days).  Larger values have no
+/// use for a lock or a search window, and `now() + delay` must stay a valid
+/// PostgreSQL timestamp.
+pub const MAX_DURATION_SECS: u64 = 36_500 * 86_400;
+
 /// Parses a delay made of one or more `<number><unit>` groups.
 ///
 /// Units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
 /// Groups may be concatenated (`1h30m`, `1d12h`) or separated by spaces.
 /// A bare number is refused: the unit is mandatory to avoid ambiguity.
+/// The total is bounded by [`MAX_DURATION_SECS`] (100 years).
 pub fn parse_duration(input: &str) -> Result<Duration> {
     let s = input.trim();
     if s.is_empty() {
@@ -56,19 +62,26 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
     if !seen_group {
         bail!("invalid duration \"{input}\"");
     }
+    if total > MAX_DURATION_SECS {
+        bail!("invalid duration \"{input}\": at most 36500d (100 years)");
+    }
     Ok(Duration::from_secs(total))
 }
 
-/// Converts a delay to a PostgreSQL `interval` (days + microseconds, no months).
-pub fn to_pg_interval(d: Duration) -> PgInterval {
+/// Converts a delay to a PostgreSQL `interval` (days + microseconds, no
+/// months).  A delay that does not fit is an error, never a silently
+/// truncated value (`parse_duration` already bounds what the CLI accepts).
+pub fn to_pg_interval(d: Duration) -> Result<PgInterval> {
     let secs = d.as_secs();
-    let days = i32::try_from(secs / 86_400).unwrap_or(i32::MAX);
-    let micros = i64::try_from((secs % 86_400) * 1_000_000).unwrap_or(i64::MAX);
-    PgInterval {
+    let days = i32::try_from(secs / 86_400)
+        .map_err(|_| anyhow::anyhow!("duration too large for a PostgreSQL interval"))?;
+    // < 86400 s, always representable
+    let micros = ((secs % 86_400) * 1_000_000 + u64::from(d.subsec_micros())) as i64;
+    Ok(PgInterval {
         months: 0,
         days,
         microseconds: micros,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -109,9 +122,32 @@ mod tests {
 
     #[test]
     fn converts_to_pg_interval() {
-        let iv = to_pg_interval(Duration::from_secs(2 * 86_400 + 90));
+        let iv = to_pg_interval(Duration::from_secs(2 * 86_400 + 90)).unwrap();
         assert_eq!(iv.months, 0);
         assert_eq!(iv.days, 2);
         assert_eq!(iv.microseconds, 90_000_000);
+        let max = to_pg_interval(Duration::from_secs(MAX_DURATION_SECS)).unwrap();
+        assert_eq!(max.days, 36_500);
+        // out of range for an interval: error, not i32::MAX days
+        let huge = Duration::from_secs((i32::MAX as u64 + 1) * 86_400);
+        assert!(to_pg_interval(huge).is_err());
+    }
+
+    #[test]
+    fn bounds_the_total() {
+        assert_eq!(
+            parse_duration("36500d").unwrap(),
+            Duration::from_secs(MAX_DURATION_SECS)
+        );
+        assert_eq!(
+            parse_duration("5214w2d").unwrap(),
+            Duration::from_secs(MAX_DURATION_SECS)
+        );
+        for big in ["36500d1s", "36501d", "99999999999d", "5215w", "3000000000d"] {
+            let err = parse_duration(big).unwrap_err();
+            assert!(err.to_string().contains("100 years"), "{big}: {err}");
+        }
+        // overflow of u64 is still reported as such
+        assert!(parse_duration("99999999999999999999d").is_err());
     }
 }

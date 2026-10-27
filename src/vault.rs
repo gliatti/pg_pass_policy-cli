@@ -47,15 +47,26 @@ impl VaultTarget {
         Ok(VaultTarget { mount, path })
     }
 
-    /// URL of the KV v2 data endpoint.
-    pub fn url(&self, addr: &str) -> String {
-        format!(
-            "{}/v1/{}/data/{}",
-            addr.trim_end_matches('/'),
-            self.mount,
-            self.path
-        )
+    /// URL of the KV v2 data endpoint, below the path of `addr` (if any).
+    pub fn url(&self, addr: &Url) -> Url {
+        let segments = std::iter::once("v1")
+            .chain(self.mount.split('/'))
+            .chain(std::iter::once("data"))
+            .chain(self.path.split('/'));
+        endpoint(addr, segments)
     }
+}
+
+/// Appends path segments to the base address.  Each segment is
+/// percent-encoded by `url` as a single segment, so that it can never add a
+/// query, a fragment or a `..` step; a trailing `/` of the base is dropped.
+fn endpoint<'a>(addr: &Url, segments: impl IntoIterator<Item = &'a str>) -> Url {
+    let mut url = addr.clone();
+    url.path_segments_mut()
+        .expect("check_addr only accepts http(s) URLs, which have a path")
+        .pop_if_empty()
+        .extend(segments);
+    url
 }
 
 /// Refuses a path segment that would change the endpoint once placed in the
@@ -79,29 +90,40 @@ fn check_segment(seg: &str, option: &str) -> Result<()> {
 /// `VAULT_NAMESPACE` and the optional `VAULT_CACERT` / `VAULT_CAPATH`.
 #[derive(Debug, Clone)]
 pub struct VaultConfig {
-    pub addr: String,
+    /// Validated `VAULT_ADDR`.
+    pub addr: Url,
     pub token: String,
     pub namespace: Option<String>,
-    /// Extra root certificates (private CA) trusted besides the system and
-    /// webpki stores.
-    pub root_certs: Vec<Certificate>,
+    /// HTTP client built once (with the extra root certificates) and used
+    /// for every request: token preflight and secret write.
+    client: reqwest::Client,
 }
 
 impl VaultConfig {
     /// Builds a configuration; `addr` must use `https://`, or `http://` on a
     /// loopback host only.
     pub fn new(
-        addr: impl Into<String>,
+        addr: impl AsRef<str>,
         token: impl Into<String>,
         namespace: Option<String>,
     ) -> Result<Self> {
-        let addr = addr.into();
-        check_addr(&addr)?;
+        Self::with_root_certs(addr, token, namespace, &[])
+    }
+
+    /// Same as [`VaultConfig::new`], trusting in addition `root_certs`
+    /// (private CA) besides the system and webpki stores.
+    pub fn with_root_certs(
+        addr: impl AsRef<str>,
+        token: impl Into<String>,
+        namespace: Option<String>,
+        root_certs: &[Certificate],
+    ) -> Result<Self> {
+        let addr = check_addr(addr.as_ref())?;
         Ok(VaultConfig {
             addr,
             token: token.into(),
             namespace,
-            root_certs: Vec::new(),
+            client: build_client(root_certs)?,
         })
     }
 
@@ -112,36 +134,55 @@ impl VaultConfig {
         let var = |name: &str| std::env::var(name).ok().filter(|s| !s.is_empty());
         let addr = var("VAULT_ADDR").context("VAULT_ADDR is not set")?;
         let token = var("VAULT_TOKEN").context("VAULT_TOKEN is not set")?;
-        let mut cfg = Self::new(addr, token, var("VAULT_NAMESPACE"))?;
-        cfg.root_certs = root_certs_from_env()?;
-        cfg.client()?;
-        Ok(cfg)
+        let certs = root_certs_from_env()?;
+        Self::with_root_certs(addr, token, var("VAULT_NAMESPACE"), &certs)
     }
 
-    /// HTTP client trusting the system roots, the webpki roots and
-    /// `root_certs`.  Certificate verification is never disabled.  Redirects
-    /// are never followed: a 307/308 would replay the token and the password
-    /// to whatever host the `Location` header names, bypassing the loopback
-    /// rule of `check_addr`.  A redirect is reported as an error instead.
-    pub fn client(&self) -> Result<reqwest::Client> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none());
-        for cert in &self.root_certs {
-            builder = builder.add_root_certificate(cert.clone());
+    /// Request carrying the token and namespace headers.
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .request(method, url)
+            .header("X-Vault-Token", self.token.as_str())
+            .header("X-Vault-Request", "true");
+        if let Some(ns) = &self.namespace {
+            req = req.header("X-Vault-Namespace", ns.as_str());
         }
-        builder.build().context("cannot build the HTTP client")
+        req
     }
 }
 
-/// Checks `VAULT_ADDR`: a URL whose scheme is `https`, or `http` when the host
-/// is loopback (`127.0.0.0/8`, `::1`, `localhost`).  Plain HTTP to a remote
-/// host would send the token and the password in clear.
-pub fn check_addr(addr: &str) -> Result<()> {
+/// HTTP client trusting the system roots, the webpki roots and `root_certs`.
+/// Certificate verification is never disabled.  Redirects are never
+/// followed: a 307/308 would replay the token and the password to whatever
+/// host the `Location` header names, bypassing the loopback rule of
+/// `check_addr`.  A redirect is reported as an error instead.
+fn build_client(root_certs: &[Certificate]) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none());
+    for cert in root_certs {
+        builder = builder.add_root_certificate(cert.clone());
+    }
+    builder.build().context("cannot build the HTTP client")
+}
+
+/// Checks `VAULT_ADDR` and returns it parsed: a URL whose scheme is `https`,
+/// or `http` when the host is loopback (`127.0.0.0/8`, `::1`, `localhost`),
+/// without query string, fragment or credentials.  Plain HTTP to a remote
+/// host would send the token and the password in clear; a query or a
+/// fragment would be carried over to (or truncate) every endpoint URL.
+pub fn check_addr(addr: &str) -> Result<Url> {
     let url =
         Url::parse(addr).with_context(|| format!("VAULT_ADDR {addr:?} is not a valid URL"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("VAULT_ADDR: credentials in the URL are not allowed (use VAULT_TOKEN)");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("VAULT_ADDR {addr:?}: a query string (?) or a fragment (#) is not allowed");
+    }
     match url.scheme() {
-        "https" => Ok(()),
+        "https" => Ok(url),
         "http" => {
             let host = url.host_str().unwrap_or("");
             let bare = host.trim_start_matches('[').trim_end_matches(']');
@@ -150,7 +191,7 @@ pub fn check_addr(addr: &str) -> Result<()> {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback());
             if local {
-                Ok(())
+                Ok(url)
             } else {
                 bail!(
                     "VAULT_ADDR {addr:?}: plain http:// is only accepted for a loopback host \
@@ -220,37 +261,71 @@ pub fn build_payload(username: &str, password: &str, rotated_at: &str) -> Value 
     })
 }
 
+/// Checks, before any rotation, that Vault is reachable at `VAULT_ADDR`
+/// (no redirect) and accepts `VAULT_TOKEN`:
+/// `GET {addr}/v1/auth/token/lookup-self`, allowed by Vault's default policy.
+/// An expired or revoked token, an unreachable host or a redirect is thus
+/// reported while the password is still unchanged.  The response body (token
+/// metadata) is not read.
+pub async fn preflight(cfg: &VaultConfig) -> Result<()> {
+    let url = endpoint(&cfg.addr, ["v1", "auth", "token", "lookup-self"]);
+    let resp = cfg
+        .request(reqwest::Method::GET, url.clone())
+        .send()
+        .await
+        .with_context(|| format!("Vault preflight request to {url} failed"))?;
+    let status = resp.status();
+    if status.is_redirection() {
+        bail!(redirect_message(status, &url));
+    }
+    if !status.is_success() {
+        bail!(
+            "Vault refused VAULT_TOKEN at {url}: HTTP {status}{} (expired or revoked token?)",
+            error_body(resp).await
+        );
+    }
+    Ok(())
+}
+
+fn redirect_message(status: reqwest::StatusCode, url: &Url) -> String {
+    format!(
+        "Vault answered HTTP {status} (redirect) at {url}: redirects are not followed, \
+         point VAULT_ADDR at the final Vault address"
+    )
+}
+
+/// `": <body>"` of an error response (Vault puts its error list there), or
+/// an empty string.
+async fn error_body(resp: reqwest::Response) -> String {
+    let body = resp.text().await.unwrap_or_default();
+    let body = body.trim();
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!(": {body}")
+    }
+}
+
 /// Writes the payload.  Errors (network, HTTP status) are reported with the
 /// status and the response body, which Vault fills with its own error list;
 /// the payload itself is never included.
 pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
     let url = target.url(&cfg.addr);
-    let client = cfg.client()?;
-    let mut req = client
-        .post(&url)
-        .header("X-Vault-Token", cfg.token.as_str())
-        .header("X-Vault-Request", "true")
-        .json(payload);
-    if let Some(ns) = &cfg.namespace {
-        req = req.header("X-Vault-Namespace", ns.as_str());
-    }
-    let resp = req
+    let resp = cfg
+        .request(reqwest::Method::POST, url.clone())
+        .json(payload)
         .send()
         .await
         .with_context(|| format!("Vault request to {url} failed"))?;
     let status = resp.status();
     if status.is_redirection() {
-        bail!(
-            "Vault answered HTTP {status} (redirect) at {url}: redirects are not followed, point VAULT_ADDR at the final Vault address"
-        );
+        bail!(redirect_message(status, &url));
     }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let body = body.trim();
-        if body.is_empty() {
-            bail!("Vault refused the write to {url}: HTTP {status}");
-        }
-        bail!("Vault refused the write to {url}: HTTP {status}: {body}");
+        bail!(
+            "Vault refused the write to {url}: HTTP {status}{}",
+            error_body(resp).await
+        );
     }
     Ok(())
 }
@@ -315,10 +390,43 @@ mod tests {
     #[test]
     fn builds_url() {
         let t = VaultTarget::parse("secret/db/app", None).unwrap();
+        for addr in ["https://vault:8200", "https://vault:8200/"] {
+            assert_eq!(
+                t.url(&check_addr(addr).unwrap()).as_str(),
+                "https://vault:8200/v1/secret/data/db/app"
+            );
+        }
+        // a path prefix of VAULT_ADDR (reverse proxy) is kept
+        let t = VaultTarget::parse("db/app", Some("team/kv")).unwrap();
         assert_eq!(
-            t.url("https://vault:8200/"),
-            "https://vault:8200/v1/secret/data/db/app"
+            t.url(&check_addr("https://proxy.example.net/vault/").unwrap())
+                .as_str(),
+            "https://proxy.example.net/vault/v1/team/kv/data/db/app"
         );
+        assert_eq!(
+            endpoint(
+                &check_addr("http://127.0.0.1:8200").unwrap(),
+                ["v1", "auth", "token", "lookup-self"]
+            )
+            .as_str(),
+            "http://127.0.0.1:8200/v1/auth/token/lookup-self"
+        );
+    }
+
+    #[test]
+    fn rejects_query_fragment_and_credentials_in_addr() {
+        for bad in [
+            "https://vault.example.net:8200/?x=1",
+            "https://vault.example.net:8200?",
+            "https://vault.example.net:8200#frag",
+            "https://vault.example.net:8200/#",
+            "http://127.0.0.1:8200/?namespace=a",
+            "https://user:pw@vault.example.net:8200",
+        ] {
+            let err = check_addr(bad).unwrap_err();
+            assert!(!err.to_string().contains("pw@"), "{err}");
+            assert!(VaultConfig::new(bad, "t", None).is_err(), "{bad}");
+        }
     }
 
     #[test]

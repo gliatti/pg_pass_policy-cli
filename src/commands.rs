@@ -4,7 +4,7 @@
 //! interpolate user input.  Timestamps and intervals are cast to text on the
 //! server so that special values (`infinity`) render faithfully.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -19,7 +19,7 @@ use crate::duration::to_pg_interval;
 use crate::kv::parse_settings;
 use crate::output::{print_message, print_record, Format, ResultSet};
 use crate::secret::{check_shell, run_exec, Secret};
-use crate::vault::{build_payload, write_secret, VaultConfig, VaultTarget};
+use crate::vault::{self, build_payload, write_secret, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
 
 const STATUS_COLUMNS: &str = "role_name, profile, password_changed_at::text, expires_at::text, \
@@ -52,7 +52,7 @@ pub async fn expiring(
          ORDER BY expires_at NULLS LAST, role_name"
     );
     let rows = sqlx::query(&sql)
-        .bind(within.map(to_pg_interval))
+        .bind(within.map(to_pg_interval).transpose()?)
         .fetch_all(conn)
         .await?;
     ResultSet::from_rows(&rows)?.print(fmt, "no expiring role");
@@ -93,7 +93,8 @@ async fn valid_until_after_rotation(conn: &mut PgConnection, role: &str) -> Opti
 
 /// Delivery channels of a rotation, resolved and validated before the
 /// password is rotated: the Vault environment (`VAULT_ADDR`, `VAULT_TOKEN`,
-/// certificates), the `--vault-kv` path and the availability of `sh`.
+/// certificates), the `--vault-kv` path, the availability of `sh`, and
+/// finally the Vault token itself (preflight request).
 pub struct Delivery {
     pub length: Option<i32>,
     pub show: bool,
@@ -102,9 +103,10 @@ pub struct Delivery {
 }
 
 impl Delivery {
-    /// Validates `--exec` and `--vault-kv` / `--vault-mount`; an error here is
-    /// a usage error, reported before any connection.
-    pub fn prepare(opts: &RotateOpts) -> Result<Self> {
+    /// Validates `--exec` and `--vault-kv` / `--vault-mount`, then checks
+    /// that Vault accepts the token (`lookup-self`); an error here is a usage
+    /// error, reported before any connection to PostgreSQL.
+    pub async fn prepare(opts: &RotateOpts) -> Result<Self> {
         let vault = match &opts.vault_kv {
             Some(kv) => {
                 let target = VaultTarget::parse(kv, opts.vault_mount.as_deref())?;
@@ -115,6 +117,9 @@ impl Delivery {
         };
         if opts.exec.is_some() {
             check_shell()?;
+        }
+        if let Some((cfg, _)) = &vault {
+            vault::preflight(cfg).await?;
         }
         Ok(Delivery {
             length: opts.length,
@@ -310,16 +315,22 @@ pub async fn lock(
 ) -> Result<()> {
     sqlx::query("SELECT pass_policy.lock_role($1::name, $2::interval, $3::text)")
         .bind(role)
-        .bind(duration.map(to_pg_interval))
+        .bind(duration.map(to_pg_interval).transpose()?)
         .bind(reason)
         .execute(&mut *conn)
         .await?;
-    let until: Option<String> =
-        sqlx::query("SELECT locked_until::text FROM pass_policy.role_state WHERE role_name = $1")
-            .bind(role)
-            .fetch_optional(conn)
-            .await?
-            .and_then(|r| r.get(0));
+    // role_state.role_name is refreshed by the maintenance only: after an
+    // ALTER ROLE ... RENAME it still holds the old name, so look the row up
+    // by OID through pg_roles.
+    let until: Option<String> = sqlx::query(
+        "SELECT s.locked_until::text FROM pass_policy.role_state s \
+           JOIN pg_catalog.pg_roles r ON r.oid = s.role_oid \
+          WHERE r.rolname = $1",
+    )
+    .bind(role)
+    .fetch_optional(conn)
+    .await?
+    .and_then(|r| r.get(0));
     let text = match &until {
         Some(u) if u != "infinity" => format!("role \"{role}\" locked until {u}"),
         _ => format!("role \"{role}\" locked until manual unlock"),
@@ -492,7 +503,7 @@ pub async fn audit(
            AND ($3::text IS NULL OR event_type = $3) \
          ORDER BY id DESC LIMIT $4::bigint",
     )
-    .bind(since.map(to_pg_interval))
+    .bind(since.map(to_pg_interval).transpose()?)
     .bind(role)
     .bind(event_type)
     .bind(limit)
@@ -512,13 +523,24 @@ fn read_password() -> Result<Secret> {
         let pw = rpassword::read_password().context("cannot read the password")?;
         return Ok(Zeroizing::new(pw));
     }
-    let mut buf = Zeroizing::new(String::new());
-    stdin
-        .lock()
-        .read_to_string(&mut buf)
-        .context("cannot read the password from stdin")?;
-    let line = buf.lines().next().unwrap_or("").to_string();
-    Ok(Zeroizing::new(line))
+    read_first_line(&mut stdin.lock()).context("cannot read the password from stdin")
+}
+
+/// Reads one line (the rest of the input is left unread, so that a writer
+/// that keeps its end of the pipe open does not block pgpp) and strips the
+/// final `\n` / `\r\n`.
+fn read_first_line(input: &mut impl BufRead) -> std::io::Result<Secret> {
+    // pre-allocated so that a usual password never makes the buffer grow
+    // (a reallocation would leave an unwiped copy behind)
+    let mut line = Zeroizing::new(String::with_capacity(1024));
+    input.read_line(&mut line)?;
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(line)
 }
 
 /// Keeps the candidate password out of the server log.  A bound parameter is
@@ -616,4 +638,29 @@ pub async fn worker_status(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     }
     print_record(&record, fmt);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_only_the_first_line() {
+        let mut input: &[u8] = b"first\r\nsecond\n";
+        assert_eq!(read_first_line(&mut input).unwrap().as_str(), "first");
+        assert_eq!(input, b"second\n", "the rest is left unread");
+        let mut input: &[u8] = b"pw\n";
+        assert_eq!(read_first_line(&mut input).unwrap().as_str(), "pw");
+        let mut input: &[u8] = b"no-newline";
+        assert_eq!(read_first_line(&mut input).unwrap().as_str(), "no-newline");
+        let mut input: &[u8] = b"  spaces kept \t\n";
+        assert_eq!(
+            read_first_line(&mut input).unwrap().as_str(),
+            "  spaces kept \t"
+        );
+        let mut input: &[u8] = b"";
+        assert_eq!(read_first_line(&mut input).unwrap().as_str(), "");
+        let mut input: &[u8] = b"\nnext";
+        assert_eq!(read_first_line(&mut input).unwrap().as_str(), "");
+    }
 }

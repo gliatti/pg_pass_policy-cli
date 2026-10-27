@@ -16,7 +16,9 @@ pub async fn connect() -> Result<PgConnection> {
             .context("invalid DATABASE_URL (the value itself is not shown)")?,
         _ => PgConnectOptions::new(),
     };
-    if std::env::var("PGAPPNAME").is_err() {
+    // keep an application_name given by DATABASE_URL (?application_name=)
+    // or by PGAPPNAME (read by sqlx), default to "pgpp" otherwise
+    if opts.get_application_name().is_none() {
         opts = opts.application_name("pgpp");
     }
     opts = opts.disable_statement_logging();

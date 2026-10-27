@@ -57,11 +57,12 @@ pub fn format_error(err: &anyhow::Error) -> String {
 }
 
 /// Validates the delivery options of `rotate` / `switch-pair` before any
-/// connection: a bad Vault configuration or path, or a missing shell, must
-/// not be discovered after the password has been rotated.  Returns `None`
+/// connection: a bad Vault configuration or path, a token refused by Vault,
+/// an unreachable Vault or a missing shell must not be discovered after the
+/// password has been rotated.  Returns `None`
 /// (usage error, already printed) when they are refused.
-fn prepare_delivery(opts: &RotateOpts) -> Option<Delivery> {
-    match Delivery::prepare(opts) {
+async fn prepare_delivery(opts: &RotateOpts) -> Option<Delivery> {
+    match Delivery::prepare(opts).await {
         Ok(d) => Some(d),
         Err(e) => {
             eprintln!("pgpp: error: {}", format_error(&e));
@@ -75,7 +76,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     let fmt = cli.format;
     let delivery = match &cli.command {
         Command::Rotate { opts, .. } | Command::SwitchPair { opts, .. } => {
-            match prepare_delivery(opts) {
+            match prepare_delivery(opts).await {
                 Some(d) => Some(d),
                 None => return Ok(EXIT_USAGE),
             }

@@ -268,6 +268,10 @@ mod tests {
     fn invalid_duration_is_a_usage_error() {
         let err = Cli::try_parse_from(["pgpp", "lock", "app", "--for", "soon"]).unwrap_err();
         assert_eq!(err.exit_code(), 2);
+        let err = Cli::try_parse_from(["pgpp", "lock", "app", "--for", "36501d"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        let err = Cli::try_parse_from(["pgpp", "audit", "--since", "9999999999d"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

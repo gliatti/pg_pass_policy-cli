@@ -1,10 +1,10 @@
 //! Vault KV v2 integration against a mock HTTP server: payload shape,
 //! X-Vault-Token / X-Vault-Namespace headers, error reporting, refusal of a
-//! plain-HTTP address that is not loopback.
+//! plain-HTTP address that is not loopback, token preflight.
 
 use httpmock::prelude::*;
 use httpmock::MockServer;
-use pgpp::vault::{build_payload, write_secret, VaultConfig, VaultTarget};
+use pgpp::vault::{build_payload, preflight, write_secret, VaultConfig, VaultTarget};
 use serde_json::{json, Value};
 
 fn no_namespace_header(req: &HttpMockRequest) -> bool {
@@ -163,4 +163,105 @@ async fn redirects_are_not_followed() {
         0,
         "the redirect target must never be contacted"
     );
+}
+
+#[tokio::test]
+async fn preflight_looks_up_the_token() {
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/v1/auth/token/lookup-self")
+                .header("X-Vault-Token", "good")
+                .header("X-Vault-Namespace", "team-a");
+            then.status(200)
+                .json_body(json!({"data": {"ttl": 3600, "policies": ["default"]}}));
+        })
+        .await;
+    let cfg = VaultConfig::new(server.base_url(), "good", Some("team-a".into())).unwrap();
+    preflight(&cfg).await.unwrap();
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn preflight_reports_a_refused_token() {
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(403)
+                .json_body(json!({"errors": ["permission denied"]}));
+        })
+        .await;
+    let cfg = VaultConfig::new(server.base_url(), "expired-token", None).unwrap();
+    let text = format!("{:#}", preflight(&cfg).await.unwrap_err());
+    assert!(
+        text.contains("403") && text.contains("VAULT_TOKEN"),
+        "{text}"
+    );
+    assert!(text.contains("permission denied"), "{text}");
+    assert!(
+        !text.contains("expired-token"),
+        "token must not leak: {text}"
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn preflight_refuses_a_redirect_and_an_unreachable_host() {
+    let server = MockServer::start_async().await;
+    let elsewhere = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(307).header(
+                "Location",
+                format!("{}/v1/auth/token/lookup-self", elsewhere.base_url()),
+            );
+        })
+        .await;
+    let sink = elsewhere
+        .mock_async(|when, then| {
+            when.any_request();
+            then.status(200);
+        })
+        .await;
+    let cfg = VaultConfig::new(server.base_url(), "tok", None).unwrap();
+    let text = format!("{:#}", preflight(&cfg).await.unwrap_err());
+    assert!(text.contains("307") && text.contains("redirect"), "{text}");
+    assert_eq!(sink.hits_async().await, 0);
+
+    let cfg = VaultConfig::new("http://127.0.0.1:9", "tok", None).unwrap();
+    let text = format!("{:#}", preflight(&cfg).await.unwrap_err());
+    assert!(
+        text.contains("http://127.0.0.1:9/v1/auth/token/lookup-self"),
+        "{text}"
+    );
+}
+
+/// A path prefix of VAULT_ADDR (Vault behind a reverse proxy) is kept for
+/// both endpoints.
+#[tokio::test]
+async fn path_prefix_of_vault_addr_is_kept() {
+    let server = MockServer::start_async().await;
+    let lookup = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/vault/v1/auth/token/lookup-self");
+            then.status(200);
+        })
+        .await;
+    let write = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/vault/v1/secret/data/db/app");
+            then.status(204);
+        })
+        .await;
+    let cfg = VaultConfig::new(format!("{}/vault/", server.base_url()), "tok", None).unwrap();
+    preflight(&cfg).await.unwrap();
+    let target = VaultTarget::parse("secret/db/app", None).unwrap();
+    write_secret(&cfg, &target, &build_payload("app", "x", "now"))
+        .await
+        .unwrap();
+    lookup.assert_async().await;
+    write.assert_async().await;
 }

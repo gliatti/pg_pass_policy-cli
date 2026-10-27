@@ -268,6 +268,49 @@ async fn exec_receives_password_on_stdin_and_env() {
     assert_eq!(failed.status.code(), Some(1));
     let stderr = String::from_utf8(failed.stderr).unwrap();
     assert!(stderr.contains("exit status: 3"), "{stderr}");
+
+    // a command that never reads its stdin loses the password: failed delivery
+    for cmd in ["true", "exec 0<&-; sleep 0.2"] {
+        let out = run(
+            &url,
+            &["-f", "json", "rotate", "pgpp_t_exec", "--exec", cmd],
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}: {stdout} {stderr}");
+        assert!(
+            stderr.contains("without reading the password"),
+            "{cmd}: {stderr}"
+        );
+        let v: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(v["delivered_to"], serde_json::json!([]), "{cmd}: {stdout}");
+    }
+
+    // the standard output of the hook goes to stderr: the JSON stays clean
+    let out = run(
+        &url,
+        &[
+            "-f",
+            "json",
+            "rotate",
+            "pgpp_t_exec",
+            "--exec",
+            "cat >/dev/null; echo hook-stdout-line; echo hook-stderr-line >&2",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let v: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be the JSON alone: {e}: {stdout}"));
+    assert_eq!(v["delivered_to"], serde_json::json!(["exec"]));
+    assert!(!stdout.contains("hook-"), "{stdout}");
+    assert!(stderr.contains("hook-stdout-line"), "{stderr}");
+    assert!(stderr.contains("hook-stderr-line"), "{stderr}");
 }
 
 fn vault_body_from_cli(req: &HttpMockRequest) -> bool {
@@ -293,6 +336,15 @@ async fn rotate_writes_to_vault_mock() {
     fresh_login_role(&mut conn, "pgpp_t_vault").await;
 
     let server = MockServer::start_async().await;
+    let lookup = server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/v1/auth/token/lookup-self")
+                .header("X-Vault-Token", "t-cli-token");
+            then.status(200)
+                .json_body(serde_json::json!({"data": {"ttl": 600}}));
+        })
+        .await;
     let mock = server
         .mock_async(|when, then| {
             when.method(POST)
@@ -328,6 +380,11 @@ async fn rotate_writes_to_vault_mock() {
     assert_eq!(v["delivered_to"], serde_json::json!(["vault"]));
     assert!(v.get("password").is_none());
     mock.assert_async().await;
+    assert_eq!(
+        lookup.hits_async().await,
+        1,
+        "token checked before the rotation"
+    );
 
     // Vault failure: exit 1, password not shown, rotation still happened
     let fail = pgpp(&url)
@@ -340,6 +397,55 @@ async fn rotate_writes_to_vault_mock() {
     let stderr = String::from_utf8(fail.stderr).unwrap();
     assert!(stderr.contains("Vault delivery failed"), "{stderr}");
     assert!(stderr.contains("404"), "{stderr}");
+    assert_eq!(lookup.hits_async().await, 2);
+}
+
+/// The token is checked (lookup-self) before the rotation: a refused token,
+/// a redirect or an unreachable Vault exit with 2 and rotate nothing.
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn vault_preflight_failure_rotates_nothing() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_vpre").await;
+
+    let server = MockServer::start_async().await;
+    let lookup = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(403)
+                .json_body(serde_json::json!({"errors": ["permission denied"]}));
+        })
+        .await;
+    let write = server
+        .mock_async(|when, then| {
+            when.method(POST);
+            then.status(204);
+        })
+        .await;
+    for addr in [server.base_url(), "http://127.0.0.1:9".to_string()] {
+        let out = pgpp(&url)
+            .args([
+                "-f",
+                "json",
+                "rotate",
+                "pgpp_t_vpre",
+                "--vault-kv",
+                "secret/app",
+            ])
+            .env("VAULT_ADDR", &addr)
+            .env("VAULT_TOKEN", "t-expired")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(stderr.contains("lookup-self"), "{addr}: {stderr}");
+        assert!(!stderr.contains("t-expired"), "{stderr}");
+        assert_refused_before_rotation(&url, "pgpp_t_vpre", out);
+    }
+    assert_eq!(lookup.hits_async().await, 1);
+    assert_eq!(write.hits_async().await, 0, "nothing written to Vault");
+    let st = run_json(&url, &["status", "--role", "pgpp_t_vpre"]);
+    assert_eq!(st[0]["status"], "unknown", "password never changed");
 }
 
 #[tokio::test]
@@ -389,6 +495,22 @@ async fn lock_and_unlock() {
     let out = run_json(&url, &["lock", "pgpp_t_lock"]);
     assert_eq!(out["locked_until"], "infinity");
     run_ok(&url, &["unlock", "pgpp_t_lock"]);
+
+    // after a rename, role_state.role_name keeps the old name until the next
+    // maintenance pass: locked_until must still be reported (lookup by OID)
+    exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_lock_renamed").await;
+    conn.execute("ALTER ROLE pgpp_t_lock RENAME TO pgpp_t_lock_renamed")
+        .await
+        .unwrap();
+    let out = run_json(&url, &["lock", "pgpp_t_lock_renamed", "--for", "1h"]);
+    assert!(
+        out["locked_until"]
+            .as_str()
+            .is_some_and(|s| s != "infinity"),
+        "{out}"
+    );
+    run_ok(&url, &["unlock", "pgpp_t_lock_renamed"]);
+    exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_lock_renamed").await;
 
     let missing = run(&url, &["lock", "pgpp_t_missing_role"]);
     assert_eq!(missing.status.code(), Some(1));
@@ -546,6 +668,46 @@ async fn check_reads_password_from_stdin() {
     assert_eq!(v["ok"], true);
     assert!(v["reason"].is_null());
 
+    // only the first line is read: a writer that keeps the pipe open, as in
+    // `(echo "$PW"; sleep 300) | pgpp check`, must not block pgpp
+    let mut child = pgpp(&url)
+        .args(["-f", "json", "check", "pgpp_t_chk"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"Zq7!vLm2#pRw9xKt\r\n").unwrap();
+    stdin.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    drop(stdin);
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        status.is_some(),
+        "pgpp check blocked waiting for EOF on stdin"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "CRLF stripped: {v}");
+
     let (code, _) = check_with_stdin(&url, "pgpp_t_chk", "", false);
     assert_eq!(code, 1, "an empty password is an error, not a refusal");
     let (code, _) = check_with_stdin("postgres://u@127.0.0.1:9/db", "pgpp_t_chk", "x", false);
@@ -666,6 +828,40 @@ async fn audit_filters() {
 
     let bad = run(&url, &["audit", "--limit", "0"]);
     assert_eq!(bad.status.code(), Some(2));
+}
+
+/// application_name: "pgpp" by default, the value of DATABASE_URL
+/// (`?application_name=`) or of PGAPPNAME otherwise; the audit log records it.
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn application_name_of_the_url_is_kept() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_app").await;
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let with_name = format!("{url}{sep}application_name=pgpp_t_from_url");
+    let last_app = |u: &str| {
+        let rows = run_json(u, &["audit", "--role", "pgpp_t_app", "--limit", "1"]);
+        rows[0]["application_name"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    run_ok(&url, &["expire", "pgpp_t_app"]);
+    assert_eq!(last_app(&url), "pgpp");
+    run_ok(&with_name, &["expire", "pgpp_t_app"]);
+    assert_eq!(last_app(&url), "pgpp_t_from_url");
+    let out = pgpp(&url)
+        .args(["expire", "pgpp_t_app"])
+        .env("PGAPPNAME", "pgpp_t_from_env")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(last_app(&url), "pgpp_t_from_env");
 }
 
 #[tokio::test]
@@ -796,6 +992,37 @@ fn bad_vault_setup_is_refused_before_connecting() {
             "token must not be echoed: {stderr}"
         );
     }
+}
+
+/// The Vault token preflight also runs before the PostgreSQL connection.
+#[tokio::test]
+async fn vault_token_refused_before_connecting() {
+    let server = MockServer::start_async().await;
+    let lookup = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(403);
+        })
+        .await;
+    let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .args(["rotate", "x", "--vault-kv", "secret/app"])
+        .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+        .env("VAULT_ADDR", server.base_url())
+        .env("VAULT_TOKEN", "t-refused")
+        .env_remove("VAULT_NAMESPACE")
+        .env_remove("VAULT_CACERT")
+        .env_remove("VAULT_CAPATH")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("403") && stderr.contains("VAULT_TOKEN"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot connect"), "{stderr}");
+    assert!(!stderr.contains("t-refused"), "{stderr}");
+    lookup.assert_async().await;
 }
 
 #[test]

@@ -42,6 +42,10 @@ l'historique du shell ou dans la liste des processus) et préférer
 `PGPASSFILE` ou `~/.pgpass` en mode 0600. L'URL n'est jamais affichée dans
 les messages d'erreur. Le journal des requêtes de sqlx est désactivé.
 
+`application_name` vaut `pgpp` sauf s'il est fourni par `DATABASE_URL`
+(`?application_name=…`) ou par `PGAPPNAME` : la valeur choisie est conservée
+et apparaît dans `pass_policy.audit_log`.
+
 Exemple :
 
 ```bash
@@ -60,11 +64,13 @@ les listes sont des tableaux d'objets et les actions renvoient un objet
 |---|---|
 | 0 | succès (pour `check` : mot de passe conforme) |
 | 1 | erreur (base injoignable, réseau, refus de l'extension, échec de remise du mot de passe après rotation) |
-| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation |
+| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé ou Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation |
 | 3 | mot de passe refusé par `check` (motif `PPP-xxx`) |
 
 Les durées (`--within`, `--for`, `--since`) s'écrivent `45s`, `30m`, `12h`,
-`14d`, `2w`, ou combinées (`1h30m`). L'unité est obligatoire.
+`14d`, `2w`, ou combinées (`1h30m`). L'unité est obligatoire et le total est
+borné à 100 ans (`36500d`) : au-delà, la durée est refusée (code 2) au lieu
+d'être tronquée en silence.
 
 ## Commandes
 
@@ -108,10 +114,12 @@ Politique d'affichage :
 - les options de remise sont vérifiées avant la connexion et avant la
   rotation : variables `VAULT_ADDR` / `VAULT_TOKEN` présentes, certificat
   `VAULT_CACERT` / `VAULT_CAPATH` lisible, chemin `--vault-kv` bien formé,
-  `sh` disponible pour `--exec`. Une erreur à ce stade sort avec le code 2
+  `sh` disponible pour `--exec`, puis jeton accepté par Vault (requête
+  `GET /v1/auth/token/lookup-self`). Une erreur à ce stade sort avec le code 2
   sans rien changer côté serveur ;
-- si une remise (`--exec`, Vault) échoue malgré cela (Vault injoignable,
-  commande en erreur), le mot de passe a déjà été changé côté serveur ; il
+- si une remise (`--exec`, Vault) échoue malgré cela (Vault devenu
+  injoignable, droits insuffisants sur le chemin, commande en erreur ou qui
+  n'a pas lu le mot de passe), le mot de passe a déjà été changé côté serveur ; il
   n'est pas affiché sauf `--show`, le code de retour est 1 et le message
   invite à relancer la rotation ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
@@ -190,7 +198,8 @@ printf '%s\n' "$CANDIDATE" | pgpp check app_user -f json
 pass show db/app | pgpp check app_user
 ```
 
-Le mot de passe est lu sur l'entrée standard (première ligne) ou demandé
+Le mot de passe est lu sur l'entrée standard (première ligne seulement, sans
+attendre la fin de l'entrée ; le `\n` ou `\r\n` final est retiré) ou demandé
 sans écho sur un terminal, puis envoyé en paramètre lié à
 `pass_policy.check_password(role, password)`. Code 0 si conforme, 3 avec le
 motif `PPP-xxx` sinon ; le code 1 est réservé aux erreurs (base injoignable,
@@ -199,8 +208,8 @@ Il n'est jamais passé en argument de ligne de commande.
 
 Journal du serveur : un paramètre lié n'apparaît pas dans le texte de la
 requête, mais PostgreSQL l'écrit dans la ligne `DETAIL:  parameters: …` dès
-que `log_statement = 'all'` ou `log_min_duration_statement >= 0` est actif
-(ou pgaudit), selon `log_parameter_max_length` (défaut -1 : tout). Pour
+que `log_statement = 'all'` ou `log_min_duration_statement >= 0` est actif,
+selon `log_parameter_max_length` (défaut -1 : tout). Pour
 l'éviter, `pgpp check` exécute `SET LOCAL log_parameter_max_length = 0` dans
 sa transaction avant d'appeler `check_password`. Ce réglage est réservé au
 superutilisateur par défaut : si le serveur le refuse, `pgpp` continue et
@@ -216,6 +225,16 @@ Sans l'une de ces deux mesures, sur un serveur qui journalise toutes les
 requêtes, le mot de passe candidat de `pgpp check` finit en clair dans le
 journal PostgreSQL.
 
+pgaudit n'est pas concerné par `log_parameter_max_length` : avec
+`pgaudit.log_parameter = on`, il écrit les paramètres liés dans sa propre
+ligne `AUDIT:`, quel que soit ce réglage. Sur un serveur équipé de pgaudit,
+`pgaudit.log_parameter` doit donc rester à `off` pour le rôle qui lance
+`pgpp check` (réglage réservé au superutilisateur, que `pgpp` ne modifie pas) :
+
+```sql
+ALTER ROLE pgpp_admin SET pgaudit.log_parameter = off;
+```
+
 ### Maintenance
 
 ```bash
@@ -229,7 +248,10 @@ déverrouillages automatiques, purge des rôles disparus.
 ## Intégration `--exec`
 
 Le mot de passe est écrit sur l'entrée standard du processus lancé par
-`sh -c CMD`, suivi d'un saut de ligne, puis l'entrée est fermée. Il n'est
+`sh -c CMD`, suivi d'un saut de ligne, puis l'entrée est fermée. La sortie
+standard du hook est renvoyée sur la sortie d'erreur de `pgpp` (sa sortie
+d'erreur aussi, inchangée) : elle ne se mélange jamais au résultat de `pgpp`,
+en particulier au JSON de `-f json`. Il n'est
 jamais passé en argument ni en variable d'environnement. Le processus hérite
 de l'environnement de `pgpp` (ce qui permet à l'exemple `vault kv put`
 ci-dessous de trouver `VAULT_ADDR` / `VAULT_TOKEN`) et reçoit en plus les
@@ -241,7 +263,15 @@ variables suivantes :
 | `PGPP_VALID_UNTIL` | nouveau `rolvaliduntil` (texte PostgreSQL, vide si illimité) |
 | `PGPP_PAIR`, `PGPP_PREVIOUS_ROLE` | uniquement pour `switch-pair` |
 
-Un code de retour non nul du processus est une erreur de remise (code 1).
+Sont des erreurs de remise (code 1, `delivered_to` sans `exec`) : un code de
+retour non nul du processus, une erreur d'écriture sur son entrée, et un
+processus qui se termine sans avoir lu toute la ligne du mot de passe (par
+exemple `--exec true`). `pgpp` garde pour cela sa propre copie de
+l'extrémité de lecture du tube et vérifie, une fois le processus terminé,
+qu'il n'y reste aucun octet. Le hook doit donc consommer la ligne avant de
+se terminer (`cat`, `read -r pw`, `--from-file=/dev/stdin`…) ; une lecture
+confiée à un processus lancé en arrière-plan qui survit au hook n'est pas
+reconnue.
 
 Conséquence de l'héritage : un hook fourni par un tiers (script de
 déploiement d'une autre équipe) reçoit les identifiants de l'opérateur
@@ -293,6 +323,12 @@ client Vault :
 | `VAULT_CACERT` | un fichier PEM (un certificat ou une chaîne complète), prioritaire sur `VAULT_CAPATH` |
 | `VAULT_CAPATH` | un répertoire de fichiers `*.pem` / `*.crt` / `*.cer`, tous chargés |
 
+`VAULT_ADDR` est une URL sans paramètres (`?…`), sans fragment (`#…`) et
+sans identifiants (`user:pass@`), refusée sinon (code 2). Un préfixe de
+chemin est conservé (`https://proxy.example.net/vault` donne
+`https://proxy.example.net/vault/v1/…`) ; les URL sont construites segment
+par segment, jamais par concaténation de texte.
+
 `VAULT_ADDR` doit être en `https://` ; `http://` n'est accepté que vers un
 hôte de boucle locale (`127.0.0.0/8`, `::1`, `localhost`), par exemple un
 agent Vault local. Toute autre adresse en clair est refusée (code 2) : le
@@ -306,8 +342,14 @@ de passe vers l'hôte indiqué par `Location`, ce qui contournerait la règle
 ci-dessus. `VAULT_ADDR` doit donc pointer sur l'adresse finale de Vault.
 
 Toute cette configuration (variables, certificats, chemin) est validée avant
-la connexion à PostgreSQL : une erreur de configuration ne provoque jamais de
-rotation.
+la connexion à PostgreSQL, puis `pgpp` vérifie le jeton par
+`GET {VAULT_ADDR}/v1/auth/token/lookup-self` (autorisé par la politique
+`default` de Vault), avec le même client HTTP que pour l'écriture
+(redirections refusées). Un jeton expiré ou révoqué, un Vault injoignable ou
+une redirection sortent donc avec le code 2 avant toute rotation. Restent
+possibles après la rotation : un refus d'écriture sur le chemin (politique
+du jeton) ou une panne survenue entre les deux requêtes (code 1, voir
+« Politique d'affichage »).
 
 ## Sécurité
 
@@ -320,7 +362,9 @@ rotation.
   `log_min_duration_statement >= 0` est actif : `pgpp check` neutralise cela
   par `SET LOCAL log_parameter_max_length = 0` quand le rôle y est autorisé
   (voir la section « Vérifier un mot de passe candidat » pour `ALTER ROLE …
-  SET` / `GRANT SET ON PARAMETER`), sinon il avertit.
+  SET` / `GRANT SET ON PARAMETER`), sinon il avertit. Ce réglage ne couvre
+  pas pgaudit : `pgaudit.log_parameter` doit rester à `off` pour le rôle
+  appelant.
 - Aucun mot de passe n'est écrit par `pgpp` dans un journal, un message
   d'erreur, une URL ou un argument de processus. Le journal de requêtes de
   sqlx est désactivé.
