@@ -122,6 +122,11 @@ impl Delivery {
         let vault = match &opts.vault_kv {
             Some(kv) => {
                 let target = VaultTarget::parse(kv, opts.vault_mount.as_deref())?;
+                if opts.vault_mount.is_some() {
+                    if let Some(w) = target.repeated_mount_warning() {
+                        eprintln!("pgpp: warning: {w}");
+                    }
+                }
                 let cfg = VaultConfig::from_env()?;
                 Some((cfg, target))
             }
@@ -162,23 +167,24 @@ struct Rotation {
     previous_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_valid_until: Option<String>,
+    /// `rolvaliduntil` after the rotation; `None` (JSON null) for an
+    /// unbounded role, or when the value is unknown (see `valid_until_known`)
     valid_until: Option<String>,
     /// false when `rolvaliduntil` could not be read after the rotation
-    /// (`valid_until` is then None although the role may be bounded)
-    #[serde(skip)]
-    valid_until_read: bool,
+    /// (`valid_until` is then null although the role may be bounded)
+    valid_until_known: bool,
 }
 
 impl Rotation {
     fn set_valid_until(&mut self, read: Option<Option<String>>) {
-        self.valid_until_read = read.is_some();
+        self.valid_until_known = read.is_some();
         self.valid_until = read.flatten();
     }
 
     /// Value of `PGPP_VALID_UNTIL`: empty for an unbounded role, unset when
     /// the value could not be read.
     fn valid_until_env(&self) -> Option<&str> {
-        self.valid_until_read
+        self.valid_until_known
             .then(|| self.valid_until.as_deref().unwrap_or(""))
     }
 }
@@ -203,17 +209,13 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
     let mut failures: Vec<String> = Vec::new();
 
     if let Some((cfg, target)) = &opts.vault {
-        let result = async {
-            let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            let mut payload = build_payload(&rot.role, &password, &rotated_at);
-            let res = write_secret(cfg, target, &payload).await;
-            // wipe the copy of the password held by the JSON payload
-            if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
-                s.zeroize();
-            }
-            res
+        let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let mut payload = build_payload(&rot.role, &password, &rotated_at);
+        let result = write_secret(cfg, target, &payload).await;
+        // wipe the copy of the password held by the JSON payload
+        if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
+            s.zeroize();
         }
-        .await;
         match result {
             Ok(()) => delivered.push("vault"),
             Err(e) => failures.push(format!("Vault delivery failed: {e:#}")),
@@ -841,5 +843,38 @@ mod tests {
         f.read_to_string(&mut rest).unwrap();
         assert_eq!(rest, "second line\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn json_tells_an_unknown_valid_until_from_an_unbounded_one() {
+        let json_of = |read: Option<Option<String>>| {
+            let mut rot = Rotation {
+                role: "app".into(),
+                ..Rotation::default()
+            };
+            rot.set_valid_until(read);
+            let out = RotationOutput {
+                rotation: &rot,
+                delivered_to: &["exec"],
+                password: None,
+            };
+            (
+                serde_json::to_value(&out).unwrap(),
+                rot.valid_until_env().map(str::to_string),
+            )
+        };
+        let (bounded, env) = json_of(Some(Some("2027-01-01 00:00:00+00".into())));
+        assert_eq!(bounded["valid_until"], "2027-01-01 00:00:00+00");
+        assert_eq!(bounded["valid_until_known"], true);
+        assert_eq!(env.as_deref(), Some("2027-01-01 00:00:00+00"));
+        let (unbounded, env) = json_of(Some(None));
+        assert!(unbounded["valid_until"].is_null());
+        assert_eq!(unbounded["valid_until_known"], true);
+        assert_eq!(env.as_deref(), Some(""));
+        let (unknown, env) = json_of(None);
+        assert!(unknown["valid_until"].is_null());
+        assert_eq!(unknown["valid_until_known"], false);
+        assert_eq!(env, None);
+        assert!(unknown.get("password").is_none());
     }
 }

@@ -3,6 +3,7 @@
 
 use std::io::Read;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -12,6 +13,22 @@ use zeroize::Zeroizing;
 
 /// A password that is wiped from memory when dropped.
 pub type Secret = Zeroizing<String>;
+
+/// Longest wait for the password to be written into the pipe of `--exec`.
+/// The write only blocks when the line exceeds the capacity of the pipe
+/// (64 KiB on Linux) and the command does not read it.
+pub const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outcome of the write of the password line into the pipe.
+enum Written {
+    /// Every byte is in the pipe (or already read).
+    Complete,
+    /// The command exited before the line was entirely written.
+    Incomplete,
+    /// The write did not end within the delay; the command was killed.
+    TimedOut,
+    Failed(std::io::Error),
+}
 
 /// Checks that `sh` can be started, so that a missing shell is reported
 /// before the password is rotated.
@@ -47,12 +64,37 @@ pub fn check_shell() -> Result<()> {
 /// end of the pipe and checks, once the command has exited, that no byte is
 /// left in it.  A command that ignores its stdin would otherwise be reported
 /// as a successful delivery while the password is lost.
+///
+/// The write and the wait for the command run concurrently: a line larger
+/// than the pipe, sent to a command that exits without reading it, cannot
+/// block pgpp.  The write is bounded by [`EXEC_WRITE_TIMEOUT`]; past it the
+/// command (still running, not reading) is killed and the delivery fails.
+/// Once the line is written, the command may run as long as it needs.
 pub async fn run_exec(
     cmd: &str,
     password: &Secret,
     role: &str,
     valid_until: Option<&str>,
     extra_env: &[(&str, &str)],
+) -> Result<()> {
+    run_exec_with_timeout(
+        cmd,
+        password,
+        role,
+        valid_until,
+        extra_env,
+        EXEC_WRITE_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_exec_with_timeout(
+    cmd: &str,
+    password: &Secret,
+    role: &str,
+    valid_until: Option<&str>,
+    extra_env: &[(&str, &str)],
+    write_timeout: Duration,
 ) -> Result<()> {
     let (tx, rx) = pipe::pipe().context("cannot create the pipe for --exec")?;
     // The child gets a blocking descriptor; pgpp keeps another one on the
@@ -84,24 +126,67 @@ pub async fn run_exec(
     drop(command);
     let mut child = spawned.with_context(|| format!("cannot run --exec command: {cmd}"))?;
 
-    let write_result = {
-        let mut tx = tx;
-        let mut line = Zeroizing::new(Vec::with_capacity(password.len() + 1));
-        line.extend_from_slice(password.as_bytes());
-        line.push(b'\n');
-        let r = tx.write_all(&line).await;
-        // closing the write end gives EOF to the child
-        drop(tx);
-        r
+    let mut line = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    line.extend_from_slice(password.as_bytes());
+    line.push(b'\n');
+    let (written, exited) = {
+        // the future owns the write end: dropping it gives EOF to the child
+        let write = async move {
+            let mut tx = tx;
+            tx.write_all(&line).await
+        };
+        tokio::pin!(write);
+        tokio::select! {
+            r = tokio::time::timeout(write_timeout, &mut write) => match r {
+                Ok(Ok(())) => (Written::Complete, None),
+                Ok(Err(e)) => (Written::Failed(e), None),
+                Err(_) => (Written::TimedOut, None),
+            },
+            status = child.wait() => {
+                // The child exited first: take a write that ended at the
+                // same time (a zero timeout still polls it once), give up
+                // the rest, nobody will read it.
+                let written = match tokio::time::timeout(Duration::ZERO, &mut write).await {
+                    Ok(Ok(())) => Written::Complete,
+                    Ok(Err(e)) => Written::Failed(e),
+                    Err(_) => Written::Incomplete,
+                };
+                (written, Some(status))
+            }
+        }
     };
-    let status = child.wait().await.context("--exec command failed")?;
-    if let Err(e) = write_result {
-        bail!("cannot write the password to the stdin of the --exec command: {e}");
+    let status = match exited {
+        Some(status) => status,
+        None => {
+            if matches!(written, Written::TimedOut) {
+                // the line is not written and the command does not read it
+                let _ = child.start_kill();
+            }
+            child.wait().await
+        }
+    }
+    .context("--exec command failed")?;
+    match written {
+        Written::Failed(e) => {
+            bail!("cannot write the password to the stdin of the --exec command: {e}")
+        }
+        Written::TimedOut => bail!(
+            "--exec command did not read the password from its stdin within {} s \
+             (command killed)",
+            write_timeout.as_secs_f32()
+        ),
+        Written::Complete | Written::Incomplete => {}
     }
     if !status.success() {
         bail!("--exec command exited with {status}");
     }
     let unread = unread_bytes(probe).context("cannot check the stdin of the --exec command")?;
+    if matches!(written, Written::Incomplete) {
+        bail!(
+            "--exec command exited without reading the password from its stdin \
+             (line only partly written, {unread} byte(s) left unread in the pipe)"
+        );
+    }
     if unread > 0 {
         bail!(
             "--exec command exited without reading the password from its stdin \
@@ -203,6 +288,66 @@ mod tests {
         .unwrap();
         // unknown: unset
         run_exec(unset, &pw, "app", None, &[]).await.unwrap();
+    }
+
+    /// A line larger than the pipe capacity (64 KiB on Linux) cannot be
+    /// written at once: a command that exits without reading must not block
+    /// the write (the server limits passwords to 1024 characters, hence a
+    /// direct call).
+    #[tokio::test]
+    async fn a_line_larger_than_the_pipe_does_not_block() {
+        let big = secret(&"p".repeat(256 * 1024));
+        for cmd in ["true", "head -c 10 >/dev/null", "exec 0<&-; sleep 0.2"] {
+            let started = std::time::Instant::now();
+            let err = run_exec(cmd, &big, "app", None, &[]).await.unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("without reading the password"),
+                "{cmd}: {text}"
+            );
+            assert!(!text.contains("ppppp"), "{cmd}: {text}");
+            assert!(started.elapsed() < Duration::from_secs(10), "{cmd}");
+        }
+        // a command that reads it all succeeds
+        run_exec("cat >/dev/null", &big, "app", None, &[])
+            .await
+            .unwrap();
+        run_exec("test \"$(wc -c)\" -eq 262145", &big, "app", None, &[])
+            .await
+            .unwrap();
+    }
+
+    /// A command that neither reads nor exits is killed once the write delay
+    /// is over.
+    #[tokio::test]
+    async fn a_write_that_never_ends_is_bounded() {
+        let big = secret(&"p".repeat(256 * 1024));
+        let started = std::time::Instant::now();
+        let err = run_exec_with_timeout(
+            "exec sleep 30",
+            &big,
+            "app",
+            None,
+            &[],
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("within 0.3 s"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // a short line is written at once: the delay does not apply to the
+        // run time of the command
+        run_exec_with_timeout(
+            "sleep 0.5; cat >/dev/null",
+            &secret("pw"),
+            "app",
+            None,
+            &[],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -132,6 +132,7 @@ async fn rotate_show_returns_a_working_password() {
     let pw = out["password"].as_str().expect("password shown");
     assert_eq!(pw.chars().count(), 30);
     assert!(out["valid_until"].is_string(), "{out}");
+    assert_eq!(out["valid_until_known"], true, "{out}");
     assert!(can_login("pgpp_t_rot", pw).await, "new password must work");
 
     // without --show the password is not printed
@@ -1356,6 +1357,44 @@ fn rotate_against_vault(server: &MockServer) -> Output {
         .env_remove("PGPP_VAULT_SKIP_PREFLIGHT")
         .output()
         .unwrap()
+}
+
+/// `--vault-mount kv --vault-kv kv/app` writes kv/data/kv/app: a warning
+/// is printed, before the preflight and the connection.
+#[tokio::test]
+async fn repeated_vault_mount_is_warned_about() {
+    let server = MockServer::start_async().await;
+    let lookup = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(403);
+        })
+        .await;
+    let run = |kv: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pgpp"))
+            .args(["rotate", "x", "--vault-mount", "kv", "--vault-kv", kv])
+            .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+            .env("VAULT_ADDR", server.base_url())
+            .env("VAULT_TOKEN", "t-refused")
+            .env_remove("VAULT_NAMESPACE")
+            .env_remove("VAULT_CACERT")
+            .env_remove("VAULT_CAPATH")
+            .env_remove("PGPP_VAULT_SKIP_PREFLIGHT")
+            .output()
+            .unwrap()
+    };
+    let out = run("kv/app");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("warning") && stderr.contains("kv/data/kv/app"),
+        "{stderr}"
+    );
+    let out = run("app");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("starts with the mount"), "{stderr}");
+    assert_eq!(lookup.hits_async().await, 2);
 }
 
 /// The Vault token preflight also runs before the PostgreSQL connection.

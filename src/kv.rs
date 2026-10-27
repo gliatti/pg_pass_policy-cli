@@ -6,7 +6,9 @@ use serde_json::{Map, Value};
 
 /// Converts one `KEY=VALUE` item.  Booleans and integers are typed, `null`
 /// becomes JSON null (clears an optional setting such as `max_age`), anything
-/// else stays a string (intervals such as `"30 days"`).
+/// else stays a string (intervals such as `"30 days"`).  The keywords
+/// (`true`/`false`, `on`/`off`, `yes`/`no`, `null`) are case-insensitive, as
+/// in PostgreSQL (`TRUE`, `Off`, `NULL`).  A string is passed unchanged.
 pub fn parse_kv(item: &str) -> Result<(String, Value)> {
     let Some((key, value)) = item.split_once('=') else {
         bail!("invalid setting \"{item}\": expected KEY=VALUE");
@@ -20,10 +22,10 @@ pub fn parse_kv(item: &str) -> Result<(String, Value)> {
         bail!("invalid setting key \"{key}\": expected a lower-case profile column name");
     }
     let value = value.trim();
-    let json = match value {
+    let json = match value.to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" => Value::Bool(true),
         "false" | "off" | "no" => Value::Bool(false),
-        "null" | "NULL" => Value::Null,
+        "null" => Value::Null,
         _ => match value.parse::<i64>() {
             Ok(n) => Value::from(n),
             Err(_) => Value::String(value.to_string()),
@@ -71,6 +73,26 @@ mod tests {
             parse_kv(" lock_duration = 1 hour ").unwrap(),
             ("lock_duration".into(), json!("1 hour"))
         );
+    }
+
+    #[test]
+    fn keywords_are_case_insensitive() {
+        for (item, expected) in [
+            ("reject_username=TRUE", json!(true)),
+            ("reject_username=True", json!(true)),
+            ("reject_username=ON", json!(true)),
+            ("reject_username=Yes", json!(true)),
+            ("reject_username=FALSE", json!(false)),
+            ("reject_username=Off", json!(false)),
+            ("reject_username=NO", json!(false)),
+            ("max_age=NULL", Value::Null),
+            ("max_age=Null", Value::Null),
+            // other strings keep their case
+            ("max_age=30 Days", json!("30 Days")),
+            ("max_age=nullx", json!("nullx")),
+        ] {
+            assert_eq!(parse_kv(item).unwrap().1, expected, "{item}");
+        }
     }
 
     #[test]

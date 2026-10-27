@@ -1,5 +1,7 @@
 //! Rendering of query results as a text table or as JSON.
 
+use std::io::IsTerminal;
+
 use anyhow::{bail, Result};
 use clap::ValueEnum;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, ContentArrangement, Table as CTable};
@@ -101,7 +103,7 @@ impl ResultSet {
                 }
                 let mut t = CTable::new();
                 t.load_preset(UTF8_FULL_CONDENSED)
-                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_content_arrangement(stdout_arrangement())
                     .set_header(&self.columns);
                 for r in &self.rows {
                     t.add_row(r.iter().map(cell));
@@ -109,6 +111,21 @@ impl ResultSet {
                 println!("{t}");
             }
         }
+    }
+}
+
+/// Layout of the tables printed on stdout: wrapped to the terminal width on
+/// a terminal, never wrapped otherwise (pipe, file), so that a value
+/// (timestamp, reason) is not split over several lines for a script.
+fn stdout_arrangement() -> ContentArrangement {
+    arrangement(std::io::stdout().is_terminal())
+}
+
+fn arrangement(is_terminal: bool) -> ContentArrangement {
+    if is_terminal {
+        ContentArrangement::Dynamic
+    } else {
+        ContentArrangement::Disabled
     }
 }
 
@@ -128,7 +145,7 @@ pub fn print_record(record: &Map<String, Value>, fmt: Format) {
         Format::Table => {
             let mut t = CTable::new();
             t.load_preset(UTF8_FULL_CONDENSED)
-                .set_content_arrangement(ContentArrangement::Dynamic)
+                .set_content_arrangement(stdout_arrangement())
                 .set_header(["setting", "value"]);
             for (k, v) in record {
                 t.add_row([k.clone(), cell(v)]);
@@ -166,6 +183,23 @@ mod tests {
             json!({"a": 1, "b": null})
         );
         assert!(ResultSet::default().first_record().is_none());
+    }
+
+    #[test]
+    fn tables_wrap_only_on_a_terminal() {
+        assert!(matches!(arrangement(true), ContentArrangement::Dynamic));
+        assert!(matches!(arrangement(false), ContentArrangement::Disabled));
+        // a long value is kept on one line when wrapping is disabled
+        let long = "x".repeat(300);
+        let mut t = CTable::new();
+        t.load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(arrangement(false))
+            .set_width(40)
+            .set_header(["k", "v"])
+            .add_row(["a", long.as_str()]);
+        assert!(t.to_string().lines().any(|l| l.contains(&long)));
+        t.set_content_arrangement(arrangement(true));
+        assert!(!t.to_string().lines().any(|l| l.contains(&long)));
     }
 
     #[test]

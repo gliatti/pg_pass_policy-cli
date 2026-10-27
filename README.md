@@ -95,13 +95,20 @@ pgpp rotate app_user --show                # affiche le mot de passe une seule f
 pgpp rotate app_user --length 32 --show -f json
 pgpp rotate app_user --exec 'kubectl create secret generic app-db --from-file=password=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -'
 pgpp rotate app_user --vault-kv secret/db/app_user
-pgpp rotate app_user --exec '...' --vault-kv kv/app --vault-mount kv --show
+pgpp rotate app_user --exec '...' --vault-mount kv --vault-kv app --show   # écrit kv/data/app
 ```
 
 `rotate` appelle `pass_policy.rotate_password(role, length)` : le mot de passe
 est généré côté serveur, renvoyé une seule fois et n'apparaît ni dans
 l'audit ni dans les journaux. La sortie indique le rôle, le nouveau
-`VALID UNTIL` et les canaux de remise utilisés (`delivered_to`).
+`VALID UNTIL` et les canaux de remise utilisés (`delivered_to`). En JSON,
+`valid_until` vaut `null` pour un rôle sans limite et `valid_until_known`
+(booléen) indique si cette valeur a pu être relue : `false` signifie
+« inconnue », pas « illimitée ».
+
+```json
+{"role":"app_user","valid_until":"2027-01-25 10:00:00+01","valid_until_known":true,"delivered_to":["vault"]}
+```
 
 Politique d'affichage :
 
@@ -126,7 +133,8 @@ Politique d'affichage :
   invite à relancer la rotation ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
   coupée), un avertissement est émis, `valid_until` reste vide (`null` en
-  JSON), `PGPP_VALID_UNTIL` n'est pas définie pour `--exec` et la remise a
+  JSON, avec `valid_until_known: false` pour le distinguer d'un rôle
+  illimité), `PGPP_VALID_UNTIL` n'est pas définie pour `--exec` et la remise a
   lieu quand même : le mot de passe n'est jamais perdu de ce fait.
 
 ### Rotation sans coupure d'une paire
@@ -185,7 +193,10 @@ Chaque `--set` est un couple `clé=valeur` dont la clé est une colonne de
 `max_failures`, `failure_window`, `lock_duration`). Les entiers et les
 booléens (`true/false`, `on/off`, `yes/no`) sont typés, `null` efface une
 valeur optionnelle (`max_age`, `lock_duration`), le reste est transmis tel
-quel (intervalles PostgreSQL : `"30 days"`, `"1 hour"`). L'ensemble est
+quel (intervalles PostgreSQL : `"30 days"`, `"1 hour"`). Les mots-clés `true`,
+`false`, `on`, `off`, `yes`, `no` et `null` sont insensibles à la casse (`TRUE`,
+`Off`, `NULL` conviennent aussi) ; les autres
+valeurs sont transmises sans changement de casse. L'ensemble est
 envoyé en jsonb à `create_profile()` / `alter_profile()`, qui valident les
 clés.
 
@@ -291,6 +302,15 @@ se terminer (`cat`, `read -r pw`, `--from-file=/dev/stdin`…) ; une lecture
 confiée à un processus lancé en arrière-plan qui survit au hook n'est pas
 reconnue.
 
+L'écriture du mot de passe et l'attente du processus sont menées en
+parallèle : un processus qui se termine sans lire ne peut pas bloquer `pgpp`
+sur l'écriture. Celle-ci est en outre bornée à 30 s : au-delà, le processus
+`sh` (toujours en vie et qui ne lit pas) reçoit `SIGKILL` et la remise
+échoue ; un sous-processus qu'il aurait lancé n'est pas visé. Ce délai ne
+peut être atteint que si la ligne dépasse la capacité du tube (64 Kio sous
+Linux), ce que la longueur maximale du serveur exclut ; une fois la ligne
+écrite, le hook peut durer aussi longtemps que nécessaire.
+
 Conséquence de l'héritage : un hook fourni par un tiers (script de
 déploiement d'une autre équipe) reçoit les identifiants de l'opérateur
 (`VAULT_TOKEN`, `PGPASSWORD`, `DATABASE_URL`, `PGPASSFILE`…). Pour les lui
@@ -311,12 +331,18 @@ export VAULT_ADDR=https://vault.example.net:8200
 export VAULT_TOKEN=...                 # jamais sur la ligne de commande
 export VAULT_NAMESPACE=team-a          # optionnel (Vault Enterprise)
 pgpp rotate app_user --vault-kv secret/db/app_user
-pgpp rotate app_user --vault-kv db/app_user --vault-mount kv
+pgpp rotate app_user --vault-mount kv --vault-kv db/app_user   # kv/data/db/app_user
 ```
 
-`--vault-kv` désigne `<mount>/<chemin>` : la première composante est le point
-de montage du moteur KV v2, sauf si `--vault-mount` est donné (le chemin est
-alors pris en entier). Chaque segment du chemin est vérifié : un segment vide,
+Sans `--vault-mount`, `--vault-kv` désigne `<mount>/<chemin>` : la première
+composante est le point de montage du moteur KV v2 (`secret/db/app_user`
+donne le montage `secret` et le chemin `db/app_user`). Avec
+`--vault-mount M`, `--vault-kv` est le chemin sous ce montage, **sans** le
+montage : `--vault-mount kv --vault-kv kv/app` écrirait dans `kv/data/kv/app`.
+Ce cas (chemin qui commence par le montage) déclenche un avertissement sur la
+sortie d'erreur, sans être refusé : un tel chemin peut être voulu. L'option
+`--vault-mount` sert surtout pour un montage à plusieurs composantes
+(`--vault-mount team/kv --vault-kv db/app`). Chaque segment du chemin est vérifié : un segment vide,
 `.` ou `..`, ou contenant `?`, `#`, `%`, `\`, une espace ou un caractère de
 contrôle est refusé (code 2), sans quoi le secret partirait vers un autre
 endpoint que celui saisi. `pgpp` envoie
@@ -348,9 +374,15 @@ chemin est conservé (`https://proxy.example.net/vault` donne
 par segment, jamais par concaténation de texte.
 
 `VAULT_ADDR` doit être en `https://` ; `http://` n'est accepté que vers un
-hôte de boucle locale (`127.0.0.0/8`, `::1`, `localhost`), par exemple un
-agent Vault local. Toute autre adresse en clair est refusée (code 2) : le
-jeton et le mot de passe y circuleraient sans chiffrement. Pour un cas non
+hôte de boucle locale, par exemple un agent Vault local : une adresse IP
+littérale (`127.0.0.0/8`, `[::1]`), ou le nom `localhost` à condition que
+toutes les adresses qu'il résout (`/etc/hosts`, DNS) soient de boucle locale.
+Un nom peut en effet être dirigé n'importe où : si `localhost` résout vers
+une autre adresse, la commande est refusée (code 2). Le client HTTP se
+connecte ensuite aux seules adresses vérifiées, sans nouvelle résolution.
+Toute autre adresse en clair (y compris `localhost.` ou
+`[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe y
+circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
 `--exec 'read -r pw; printf "%s" "$pw" | vault kv put -mount=secret db/app password=-'`.
 
@@ -424,22 +456,34 @@ secours) ou relancer la rotation après correction du jeton.
   configuration de remise invalide (Vault, `--exec`) est détectée avant la
   rotation.
 - Le mot de passe reçu est conservé dans un tampon `zeroize` effacé dès que
-  la commande n'en a plus besoin (y compris la copie du corps JSON envoyé à
-  Vault et la sortie JSON formatée). Le mot de passe candidat de `check` est
+  la commande n'en a plus besoin, de même que la valeur JSON du secret Vault,
+  le corps HTTP sérialisé (alloué une fois à sa taille exacte, effacé quand
+  reqwest le libère), la ligne écrite vers `--exec` et la sortie JSON
+  formatée. Le mot de passe candidat de `check` est
   lu sur une copie du descripteur 0, sans le tampon interne de
   `std::io::stdin()` qui en garderait une copie non effacée : octet par
   octet depuis un tube ou un terminal, par blocs dans un tampon effacé depuis
   un fichier ordinaire (`pgpp check app < fichier`), la position étant alors
-  ramenée juste après le premier `\n`. Les tampons
-  internes des bibliothèques (réponse réseau et paramètres liés de sqlx,
-  requête HTTP de reqwest, saisie sans écho de rpassword) ne sont pas sous
-  contrôle de `pgpp`.
+  ramenée juste après le premier `\n`.
+- Limite de cet effacement : les copies faites par les bibliothèques ne sont
+  pas sous le contrôle de `pgpp` et restent en mémoire jusqu'à leur
+  réutilisation. Ce sont, pour `rotate` / `switch-pair`, le tampon de
+  réception de sqlx et la ligne `PgRow` qui contient le mot de passe renvoyé
+  par le serveur (la `String` décodée en est une copie, aussitôt placée dans
+  un tampon effacé, mais l'original n'est pas effacé) ; pour Vault, le tampon
+  d'écriture de hyper et les enregistrements TLS de rustls (la requête
+  chiffrée ou, en `http://` local, en clair) ; pour `check`, le paramètre
+  lié sérialisé par sqlx et, sur un terminal, la saisie de rpassword ; pour
+  `--show`, le tampon de la sortie standard. Un vidage mémoire (core dump,
+  swap) du processus peut donc contenir le mot de passe : désactiver les
+  core dumps (`ulimit -c 0`) sur les machines qui lancent des rotations.
 - Le mot de passe d'un `--exec` passe par un tube vers l'entrée standard du
   processus enfant, jamais par `argv` ni par l'environnement. Le processus
   enfant hérite en revanche de l'environnement de `pgpp` (voir la section
   `--exec`).
 - Vault n'est joint qu'en TLS vérifié (ou en clair sur la boucle locale
-  uniquement), avec `VAULT_CACERT` / `VAULT_CAPATH` pour une autorité privée.
+  uniquement, `localhost` étant résolu et vérifié), avec `VAULT_CACERT` /
+  `VAULT_CAPATH` pour une autorité privée.
 - Le rôle de connexion doit être membre de `pass_policy_admin` : les
   vérifications de droits sont faites par les fonctions `SECURITY DEFINER`
   de l'extension (un administrateur non superutilisateur ne peut pas agir sur

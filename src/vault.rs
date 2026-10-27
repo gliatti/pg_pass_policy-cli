@@ -1,12 +1,16 @@
 //! HashiCorp Vault KV v2 integration.
 
+use std::io::Write;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use reqwest::header::HeaderValue;
+use bytes::Bytes;
+use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::{Certificate, StatusCode, Url};
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 /// Where a secret is written: `POST {addr}/v1/{mount}/data/{path}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +50,28 @@ impl VaultTarget {
             check_segment(seg, "--vault-kv")?;
         }
         Ok(VaultTarget { mount, path })
+    }
+
+    /// Warning for a target parsed with an explicit `--vault-mount`, whose
+    /// `--vault-kv` is then the path below the mount: when that path starts
+    /// with the mount itself (`--vault-mount kv --vault-kv kv/app`), the
+    /// secret goes to `kv/data/kv/app`, which is rarely what was meant.
+    pub fn repeated_mount_warning(&self) -> Option<String> {
+        let repeated = self.path == self.mount
+            || self
+                .path
+                .strip_prefix(&self.mount)
+                .is_some_and(|rest| rest.starts_with('/'));
+        repeated.then(|| {
+            format!(
+                "--vault-kv \"{path}\" starts with the mount \"{mount}\" given by \
+                 --vault-mount: the secret is written to {api}; with --vault-mount, \
+                 --vault-kv is the path below the mount (drop the \"{mount}/\" prefix)",
+                path = self.path,
+                mount = self.mount,
+                api = self.api_path(),
+            )
+        })
     }
 
     /// Vault path of the KV v2 data endpoint (`{mount}/data/{path}`), as
@@ -128,7 +154,7 @@ impl VaultConfig {
         namespace: Option<String>,
         root_certs: &[Certificate],
     ) -> Result<Self> {
-        let addr = check_addr(addr.as_ref())?;
+        let (addr, pinned) = check_addr_pinned(addr.as_ref())?;
         let mut token = header_value(&token.into(), "VAULT_TOKEN")?;
         token.set_sensitive(true);
         let namespace = namespace
@@ -138,7 +164,7 @@ impl VaultConfig {
             addr,
             token,
             namespace,
-            client: build_client(root_certs)?,
+            client: build_client(root_certs, &pinned)?,
         })
     }
 
@@ -225,11 +251,16 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// Certificate verification is never disabled.  Redirects are never
 /// followed: a 307/308 would replay the token and the password to whatever
 /// host the `Location` header names, bypassing the loopback rule of
-/// `check_addr`.  A redirect is reported as an error instead.
-fn build_client(root_certs: &[Certificate]) -> Result<reqwest::Client> {
+/// `check_addr`.  A redirect is reported as an error instead.  `pinned`
+/// (`http://localhost`) replaces the resolution of that name by the loopback
+/// addresses checked by `check_addr_pinned`.
+fn build_client(root_certs: &[Certificate], pinned: &Pinned) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none());
+    if let Some((host, addrs)) = pinned {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
     for cert in root_certs {
         builder = builder.add_root_certificate(cert.clone());
     }
@@ -237,11 +268,26 @@ fn build_client(root_certs: &[Certificate]) -> Result<reqwest::Client> {
 }
 
 /// Checks `VAULT_ADDR` and returns it parsed: a URL whose scheme is `https`,
-/// or `http` when the host is loopback (`127.0.0.0/8`, `::1`, `localhost`),
-/// without query string, fragment or credentials.  Plain HTTP to a remote
-/// host would send the token and the password in clear; a query or a
-/// fragment would be carried over to (or truncate) every endpoint URL.
+/// or `http` when the host is loopback, without query string, fragment or
+/// credentials.  Plain HTTP to a remote host would send the token and the
+/// password in clear; a query or a fragment would be carried over to (or
+/// truncate) every endpoint URL.  See `check_addr_pinned` for the loopback
+/// rule.
 pub fn check_addr(addr: &str) -> Result<Url> {
+    Ok(check_addr_pinned(addr)?.0)
+}
+
+/// Host name of an `http://` address with the loopback addresses it was
+/// resolved to; the HTTP client is pinned to them.
+type Pinned = Option<(String, Vec<SocketAddr>)>;
+
+/// [`check_addr`], returning in addition the resolution of `localhost`.
+/// With `http://`, the host must be a literal loopback address
+/// (`127.0.0.0/8`, `[::1]`), or `localhost` provided that every address it
+/// resolves to (`/etc/hosts`, DNS) is loopback: a name can be made to point
+/// anywhere.  The HTTP client then connects to those addresses only, so
+/// that a later resolution cannot send the request elsewhere.
+fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
     // (`user:pw@`) that are only detected once the URL is parsed.
     let url = Url::parse(addr).context("VAULT_ADDR is not a valid URL")?;
@@ -252,26 +298,48 @@ pub fn check_addr(addr: &str) -> Result<Url> {
         bail!("VAULT_ADDR: a query string (?) or a fragment (#) is not allowed");
     }
     match url.scheme() {
-        "https" => Ok(url),
+        "https" => Ok((url, None)),
         "http" => {
+            // `url` lower-cases the host and normalises IPv4 (`127.1`)
             let host = url.host_str().unwrap_or("");
             let bare = host.trim_start_matches('[').trim_end_matches(']');
-            let local = bare.eq_ignore_ascii_case("localhost")
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback());
-            if local {
-                Ok(url)
-            } else {
+            if bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+                return Ok((url, None));
+            }
+            if host != "localhost" {
                 bail!(
                     "VAULT_ADDR: plain http:// is only accepted for a loopback host \
-                     (127.0.0.0/8, ::1, localhost); use https:// (set VAULT_CACERT or \
+                     (127.0.0.0/8, [::1], localhost); use https:// (set VAULT_CACERT or \
                      VAULT_CAPATH for a private CA)"
-                )
+                );
             }
+            let port = url.port_or_known_default().unwrap_or(80);
+            let addrs = (host, port)
+                .to_socket_addrs()
+                .context("VAULT_ADDR: cannot resolve localhost")?
+                .collect();
+            let addrs = require_loopback(addrs)?;
+            let host = host.to_string();
+            Ok((url, Some((host, addrs))))
         }
         other => bail!("VAULT_ADDR: unsupported scheme {other:?} (use https://)"),
     }
+}
+
+/// Accepts the resolution of `localhost` only when it is not empty and
+/// every address is loopback.
+fn require_loopback(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
+    if addrs.is_empty() {
+        bail!("VAULT_ADDR: localhost does not resolve to any address");
+    }
+    if let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback()) {
+        bail!(
+            "VAULT_ADDR: localhost resolves to the non-loopback address {} (check \
+             /etc/hosts); plain http:// is refused, use http://127.0.0.1 or https://",
+            a.ip()
+        );
+    }
+    Ok(addrs)
 }
 
 /// Extra root certificates: `VAULT_CACERT` (one PEM file, possibly a bundle)
@@ -454,12 +522,15 @@ async fn error_body(resp: reqwest::Response) -> String {
 
 /// Writes the payload.  Errors (network, HTTP status) are reported with the
 /// status and the response body, which Vault fills with its own error list;
-/// the payload itself is never included.
+/// the payload itself is never included.  The body is serialised into a
+/// buffer wiped when reqwest drops it (see [`zeroizing_json`]).
 pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
     let url = target.url(&cfg.addr);
+    let body = zeroizing_json(payload)?;
     let resp = cfg
         .request(reqwest::Method::POST, url.clone())
-        .json(payload)
+        .header(CONTENT_TYPE, "application/json")
+        .body(reqwest::Body::from(Bytes::from_owner(body)))
         .send()
         .await
         .with_context(|| format!("Vault request to {url} failed"))?;
@@ -474,6 +545,28 @@ pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Val
         );
     }
     Ok(())
+}
+
+/// JSON text of `payload` in a buffer allocated once at its exact size (a
+/// growing `Vec` would leave unwiped copies behind each reallocation) and
+/// wiped when dropped.  Copies made further down (hyper's write buffer,
+/// rustls' TLS records) are not under the control of pgpp.
+pub fn zeroizing_json(payload: &Value) -> Result<Zeroizing<Vec<u8>>> {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, payload).context("cannot serialise the Vault payload")?;
+    let mut buf = Zeroizing::new(Vec::with_capacity(count.0));
+    serde_json::to_writer(&mut *buf, payload).context("cannot serialise the Vault payload")?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -663,6 +756,80 @@ mod tests {
             assert!(check_addr(bad).is_err(), "{bad}");
         }
         assert!(VaultConfig::new("http://vault.example.net", "t", None).is_err());
+    }
+
+    #[test]
+    fn http_localhost_is_checked_by_resolution() {
+        // literal loopback addresses are not resolved
+        for addr in [
+            "http://127.0.0.1:8200",
+            "http://[::1]:8200",
+            "http://127.1:8200",
+        ] {
+            assert!(check_addr_pinned(addr).unwrap().1.is_none(), "{addr}");
+        }
+        // localhost (here resolved by the system to loopback addresses) is
+        // pinned to the checked addresses, whatever its case in the URL
+        for addr in ["http://localhost:8200", "http://LocalHost:8200/"] {
+            let (_, pinned) = check_addr_pinned(addr).unwrap();
+            let (host, addrs) = pinned.expect("localhost is pinned");
+            assert_eq!(host, "localhost");
+            assert!(!addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback()));
+        }
+        // https is never resolved nor restricted
+        assert!(check_addr_pinned("https://localhost:8200")
+            .unwrap()
+            .1
+            .is_none());
+        // other names are refused without resolution, even close ones
+        for bad in [
+            "http://localhost.:8200",
+            "http://localhost.example.net:8200",
+            "http://my-localhost:8200",
+            "http://[::ffff:127.0.0.1]:8200",
+            "http://0.0.0.0:8200",
+        ] {
+            assert!(check_addr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn localhost_must_resolve_to_loopback_only() {
+        let lo4: SocketAddr = "127.0.0.1:8200".parse().unwrap();
+        let lo6: SocketAddr = "[::1]:8200".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.10:8200".parse().unwrap();
+        assert_eq!(require_loopback(vec![lo4, lo6]).unwrap(), [lo4, lo6]);
+        let err = require_loopback(vec![lo4, remote]).unwrap_err().to_string();
+        assert!(
+            err.contains("192.0.2.10") && err.contains("/etc/hosts"),
+            "{err}"
+        );
+        assert!(require_loopback(vec![remote]).is_err());
+        assert!(require_loopback(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn warns_when_the_mount_is_repeated_in_the_path() {
+        let warn = |kv, mount| {
+            VaultTarget::parse(kv, Some(mount))
+                .unwrap()
+                .repeated_mount_warning()
+        };
+        let w = warn("kv/app", "kv").expect("repeated mount");
+        assert!(w.contains("kv/data/kv/app"), "{w}");
+        assert!(warn("kv", "kv").is_some());
+        assert!(warn("team/kv/app", "team/kv").is_some());
+        assert!(warn("app", "kv").is_none());
+        assert!(warn("kvx/app", "kv").is_none());
+        assert!(warn("db/kv/app", "kv").is_none());
+    }
+
+    #[test]
+    fn json_body_is_serialised_at_its_exact_size() {
+        let p = build_payload("app", "pw-é\"x", "now");
+        let body = zeroizing_json(&p).unwrap();
+        assert_eq!(body.as_slice(), serde_json::to_vec(&p).unwrap().as_slice());
+        assert_eq!(body.capacity(), body.len(), "no reallocation");
     }
 
     #[test]

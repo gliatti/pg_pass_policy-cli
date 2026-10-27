@@ -417,3 +417,25 @@ async fn path_prefix_of_vault_addr_is_kept() {
     caps.assert_async().await;
     write.assert_async().await;
 }
+
+/// `http://localhost` is accepted once resolved to loopback addresses only;
+/// the client then reaches the server through those pinned addresses.
+#[tokio::test]
+async fn http_localhost_reaches_the_pinned_loopback_address() {
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/kv/data/db/app")
+                .header("content-type", "application/json")
+                .json_body_partial(r#"{"data": {"username": "app", "password": "x"}}"#);
+            then.status(204);
+        })
+        .await;
+    let cfg = VaultConfig::new(format!("http://localhost:{}", server.port()), "tok", None).unwrap();
+    let target = VaultTarget::parse("db/app", Some("kv")).unwrap();
+    write_secret(&cfg, &target, &build_payload("app", "x", "now"))
+        .await
+        .unwrap();
+    mock.assert_async().await;
+}

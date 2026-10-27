@@ -53,15 +53,24 @@ pub struct RotateOpts {
 
     /// Run CMD through `sh -c`; the password is written on its stdin,
     /// PGPP_ROLE and PGPP_VALID_UNTIL are set in its environment
+    ///
+    /// CMD itself must read the whole password line from its stdin before it
+    /// exits (`cat`, `read -r pw`, `--from-file=/dev/stdin`): once CMD has
+    /// exited, pgpp checks that nothing is left in the pipe.  A reading left
+    /// to a background process that outlives CMD (`cat > file &`) is
+    /// therefore reported as a failed delivery, as is a CMD that ignores its
+    /// stdin or exits with a non-zero status.
     #[arg(long, value_name = "CMD", help_heading = DELIVERY_HEADING)]
     pub exec: Option<String>,
 
-    /// Write the credentials to HashiCorp Vault KV v2 at PATH
-    /// (first path component = mount unless --vault-mount is given)
+    /// Write the credentials to HashiCorp Vault KV v2 at PATH: <mount>/<path>
+    /// (first component = mount), or the path below the mount when
+    /// --vault-mount is given
     #[arg(long = "vault-kv", value_name = "PATH", help_heading = DELIVERY_HEADING)]
     pub vault_kv: Option<String>,
 
-    /// Vault KV v2 mount point (default: first component of --vault-kv)
+    /// Vault KV v2 mount point; --vault-kv is then the path below it, without
+    /// the mount (--vault-mount kv --vault-kv db/app writes kv/data/db/app)
     #[arg(long = "vault-mount", value_name = "MOUNT", requires = "vault_kv", help_heading = DELIVERY_HEADING)]
     pub vault_mount: Option<String>,
 
@@ -291,6 +300,19 @@ mod tests {
         let err = Cli::try_parse_from(["pgpp", "rotate", "app", "--vault-mount", "kv", "--show"])
             .unwrap_err();
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn help_documents_the_delivery_constraints() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let rotate = cmd.find_subcommand_mut("rotate").unwrap();
+        let long = rotate.render_long_help().to_string();
+        assert!(long.contains("background process"), "{long}");
+        assert!(long.contains("kv/data/db/app"), "{long}");
+        let short = rotate.render_help().to_string();
+        assert!(short.contains("path below it"), "{short}");
+        assert!(!short.contains("background process"), "{short}");
     }
 
     #[test]
