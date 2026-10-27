@@ -1,0 +1,813 @@
+//! End-to-end tests of the `pgpp` binary against a real database where
+//! pg_pass_policy is installed.  The database tests are `#[ignore]`d: run
+//! them with `cargo test --test integration -- --include-ignored` once
+//! `PGPP_TEST_URL` (connection URL of a member of pass_policy_admin with
+//! CREATEROLE; the password may come from PGPASSFILE) is set.  Without the
+//! variable they panic instead of passing silently.
+
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
+use std::str::FromStr;
+
+use httpmock::prelude::*;
+use httpmock::MockServer;
+use serde_json::Value;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection, Executor, PgConnection};
+
+fn test_url() -> Option<String> {
+    std::env::var("PGPP_TEST_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+macro_rules! db_url {
+    () => {
+        test_url().expect("PGPP_TEST_URL must be set to run the database integration tests")
+    };
+}
+
+fn pgpp(url: &str) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_pgpp"));
+    c.env("DATABASE_URL", url)
+        .env_remove("VAULT_ADDR")
+        .env_remove("VAULT_TOKEN")
+        .env_remove("VAULT_NAMESPACE");
+    c
+}
+
+fn run(url: &str, args: &[&str]) -> Output {
+    pgpp(url).args(args).output().expect("cannot run pgpp")
+}
+
+fn run_ok(url: &str, args: &[&str]) -> String {
+    let out = run(url, args);
+    assert!(
+        out.status.success(),
+        "pgpp {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn run_json(url: &str, args: &[&str]) -> Value {
+    let mut full = vec!["-f", "json"];
+    full.extend_from_slice(args);
+    let out = run_ok(url, &full);
+    serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("invalid JSON from pgpp {args:?}: {e}: {out}"))
+}
+
+async fn admin() -> PgConnection {
+    let url = test_url().unwrap();
+    PgConnection::connect(&url)
+        .await
+        .expect("cannot connect with PGPP_TEST_URL")
+}
+
+/// Runs a statement, ignoring its error (idempotent fixtures).
+async fn exec_lenient(conn: &mut PgConnection, sql: &str) {
+    let _ = conn.execute(sql).await;
+}
+
+/// (Re)creates an empty login role; names are test constants, not user input.
+async fn fresh_login_role(conn: &mut PgConnection, name: &str) {
+    exec_lenient(conn, &format!("DROP ROLE IF EXISTS {name}")).await;
+    conn.execute(format!("CREATE ROLE {name} LOGIN").as_str())
+        .await
+        .unwrap_or_else(|e| panic!("cannot create role {name}: {e}"));
+}
+
+/// Checks that `role` can authenticate with `password` (SCRAM over TCP).
+async fn can_login(role: &str, password: &str) -> bool {
+    let opts = PgConnectOptions::from_str(&test_url().unwrap())
+        .unwrap()
+        .username(role)
+        .password(password);
+    match PgConnection::connect_with(&opts).await {
+        Ok(c) => {
+            let _ = c.close().await;
+            true
+        }
+        Err(e) => {
+            eprintln!("login as {role} failed: {e}");
+            false
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn status_lists_login_roles() {
+    let url = db_url!();
+    let all = run_json(&url, &["status"]);
+    let rows = all.as_array().expect("array");
+    assert!(rows
+        .iter()
+        .any(|r| r["status"].is_string() && r["profile"].is_string()));
+    let table = run_ok(&url, &["status"]);
+    assert!(table.contains("role_name") && table.contains("status"));
+
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_status").await;
+    let one = run_json(&url, &["status", "--role", "pgpp_t_status"]);
+    assert_eq!(one.as_array().unwrap().len(), 1);
+    assert_eq!(one[0]["role_name"], "pgpp_t_status");
+    assert_eq!(one[0]["status"], "unknown");
+
+    let missing = run(&url, &["status", "--role", "pgpp_t_does_not_exist"]);
+    assert_eq!(missing.status.code(), Some(1));
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn rotate_show_returns_a_working_password() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_rot").await;
+
+    let out = run_json(&url, &["rotate", "pgpp_t_rot", "--length", "30", "--show"]);
+    assert_eq!(out["role"], "pgpp_t_rot");
+    let pw = out["password"].as_str().expect("password shown");
+    assert_eq!(pw.chars().count(), 30);
+    assert!(out["valid_until"].is_string(), "{out}");
+    assert!(can_login("pgpp_t_rot", pw).await, "new password must work");
+
+    // without --show the password is not printed
+    let hidden = run_ok(&url, &["rotate", "pgpp_t_rot", "--exec", "cat >/dev/null"]);
+    assert!(hidden.contains("delivered_to: exec"), "{hidden}");
+    assert!(hidden.contains("not shown"), "{hidden}");
+    assert!(!hidden.contains(pw));
+
+    // status now knows the change date
+    let st = run_json(&url, &["status", "--role", "pgpp_t_rot"]);
+    assert_eq!(st[0]["status"], "ok");
+}
+
+/// Asserts that a refused rotation did not happen: exit 2, nothing that looks
+/// like a password on stdout, no `password_rotated` event for the role.
+fn assert_refused_before_rotation(url: &str, role: &str, out: Output) {
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stdout.contains("password"), "{stdout}");
+    assert!(stdout.trim().is_empty(), "{stdout}");
+    let audit = run_json(
+        url,
+        &["audit", "--role", role, "--type", "password_rotated"],
+    );
+    assert_eq!(audit, serde_json::json!([]), "no rotation for {role}");
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn rotation_is_refused_before_anything_is_rotated() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_rot2").await;
+
+    // no delivery option at all
+    let out = run(&url, &["-f", "json", "rotate", "pgpp_t_rot2"]);
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+    let out = run(&url, &["switch-pair", "pgpp_t_pair"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    // Vault requested but not configured / badly configured
+    let out = run(&url, &["rotate", "pgpp_t_rot2", "--vault-kv", "secret/app"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("VAULT_ADDR"));
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+    let out = pgpp(&url)
+        .args(["rotate", "pgpp_t_rot2", "--vault-kv", "secret"])
+        .env("VAULT_ADDR", "https://127.0.0.1:9")
+        .env("VAULT_TOKEN", "t")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expected <mount>/<path>"));
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+    let out = pgpp(&url)
+        .args(["rotate", "pgpp_t_rot2", "--vault-kv", "secret/db/app#prod"])
+        .env("VAULT_ADDR", "https://127.0.0.1:9")
+        .env("VAULT_TOKEN", "t")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid path segment"));
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+    let out = pgpp(&url)
+        .args(["rotate", "pgpp_t_rot2", "--vault-kv", ""])
+        .env("VAULT_ADDR", "https://127.0.0.1:9")
+        .env("VAULT_TOKEN", "t")
+        .output()
+        .unwrap();
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+    let out = pgpp(&url)
+        .args(["rotate", "pgpp_t_rot2", "--vault-kv", "secret/app"])
+        .env("VAULT_ADDR", "http://vault.example.invalid:8200")
+        .env("VAULT_TOKEN", "t")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"));
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+    let out = pgpp(&url)
+        .args(["rotate", "pgpp_t_rot2", "--vault-kv", "secret/app"])
+        .env("VAULT_ADDR", "https://127.0.0.1:9")
+        .env("VAULT_TOKEN", "t")
+        .env("VAULT_CACERT", "/nonexistent/ca.pem")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("VAULT_CACERT"));
+    assert_refused_before_rotation(&url, "pgpp_t_rot2", out);
+
+    // the role is still usable: a valid request rotates it
+    let st = run_json(&url, &["status", "--role", "pgpp_t_rot2"]);
+    assert_eq!(st[0]["status"], "unknown");
+    run_ok(&url, &["rotate", "pgpp_t_rot2", "--exec", "cat >/dev/null"]);
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn exec_receives_password_on_stdin_and_env() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_exec").await;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(dir).unwrap();
+    let pw_file = dir.join(format!("pgpp_exec_{}.pw", std::process::id()));
+    let env_file = dir.join(format!("pgpp_exec_{}.env", std::process::id()));
+    let cmd = format!(
+        "umask 077; cat > '{}'; printf '%s|%s\\n' \"$PGPP_ROLE\" \"$PGPP_VALID_UNTIL\" > '{}'",
+        pw_file.display(),
+        env_file.display()
+    );
+    let out = run_json(&url, &["rotate", "pgpp_t_exec", "--exec", &cmd]);
+    assert_eq!(out["delivered_to"], serde_json::json!(["exec"]));
+    assert!(
+        out.get("password").is_none(),
+        "password must not be printed: {out}"
+    );
+
+    let pw = std::fs::read_to_string(&pw_file).unwrap();
+    let pw = pw.trim_end_matches('\n');
+    assert!(pw.len() >= 12);
+    let env = std::fs::read_to_string(&env_file).unwrap();
+    let (role, valid_until) = env.trim().split_once('|').unwrap();
+    assert_eq!(role, "pgpp_t_exec");
+    assert_eq!(Some(valid_until), out["valid_until"].as_str());
+    assert!(can_login("pgpp_t_exec", pw).await);
+    let _ = std::fs::remove_file(&pw_file);
+    let _ = std::fs::remove_file(&env_file);
+
+    // a failing command is reported and the password is not printed
+    let failed = run(
+        &url,
+        &["rotate", "pgpp_t_exec", "--exec", "cat >/dev/null; exit 3"],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(stderr.contains("exit status: 3"), "{stderr}");
+}
+
+fn vault_body_from_cli(req: &HttpMockRequest) -> bool {
+    let Some(body) = &req.body else { return false };
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    v["data"]["username"] == "pgpp_t_vault"
+        && v["data"]["password"]
+            .as_str()
+            .is_some_and(|p| p.chars().count() == 24)
+        && v["data"]["rotated_at"]
+            .as_str()
+            .is_some_and(|t| t.ends_with('Z'))
+        && v["data"].as_object().unwrap().len() == 3
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn rotate_writes_to_vault_mock() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_vault").await;
+
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/secret/data/pgpp/test")
+                .header("X-Vault-Token", "t-cli-token")
+                .header("X-Vault-Namespace", "ns1")
+                .matches(vault_body_from_cli);
+            then.status(200)
+                .json_body(serde_json::json!({"data": {"version": 1}}));
+        })
+        .await;
+
+    let out = pgpp(&url)
+        .args([
+            "-f",
+            "json",
+            "rotate",
+            "pgpp_t_vault",
+            "--vault-kv",
+            "secret/pgpp/test",
+        ])
+        .env("VAULT_ADDR", server.base_url())
+        .env("VAULT_TOKEN", "t-cli-token")
+        .env("VAULT_NAMESPACE", "ns1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["delivered_to"], serde_json::json!(["vault"]));
+    assert!(v.get("password").is_none());
+    mock.assert_async().await;
+
+    // Vault failure: exit 1, password not shown, rotation still happened
+    let fail = pgpp(&url)
+        .args(["rotate", "pgpp_t_vault", "--vault-kv", "secret/other"])
+        .env("VAULT_ADDR", server.base_url())
+        .env("VAULT_TOKEN", "t-cli-token")
+        .output()
+        .unwrap();
+    assert_eq!(fail.status.code(), Some(1));
+    let stderr = String::from_utf8(fail.stderr).unwrap();
+    assert!(stderr.contains("Vault delivery failed"), "{stderr}");
+    assert!(stderr.contains("404"), "{stderr}");
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn lock_and_unlock() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_lock").await;
+
+    let out = run_json(
+        &url,
+        &[
+            "lock",
+            "pgpp_t_lock",
+            "--for",
+            "30m",
+            "--reason",
+            "integration test",
+        ],
+    );
+    assert_eq!(out["ok"], true);
+    assert!(out["locked_until"]
+        .as_str()
+        .is_some_and(|s| s != "infinity"));
+
+    let locked = run_json(&url, &["locked"]);
+    let row = locked
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["role_name"] == "pgpp_t_lock")
+        .expect("role listed as locked");
+    assert_eq!(row["locked_by"], "manual");
+    assert_eq!(row["lock_reason"], "integration test");
+    let st = run_json(&url, &["status", "--role", "pgpp_t_lock"]);
+    assert_eq!(st[0]["status"], "locked");
+
+    run_ok(&url, &["unlock", "pgpp_t_lock"]);
+    let locked = run_json(&url, &["locked"]);
+    assert!(!locked
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["role_name"] == "pgpp_t_lock"));
+
+    // manual lock without duration
+    let out = run_json(&url, &["lock", "pgpp_t_lock"]);
+    assert_eq!(out["locked_until"], "infinity");
+    run_ok(&url, &["unlock", "pgpp_t_lock"]);
+
+    let missing = run(&url, &["lock", "pgpp_t_missing_role"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("does not exist"));
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn profile_create_assign_unassign_drop() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_prof").await;
+    exec_lenient(
+        &mut conn,
+        "SELECT pass_policy.drop_profile('pgpp_t_profile')",
+    )
+    .await;
+
+    let out = run_json(
+        &url,
+        &[
+            "profile",
+            "create",
+            "pgpp_t_profile",
+            "--set",
+            "min_length=16",
+            "--set",
+            "max_age=30 days",
+            "--set",
+            "max_failures=3",
+            "--set",
+            "reject_username=false",
+        ],
+    );
+    assert_eq!(out["profile"], "pgpp_t_profile");
+    assert!(out["profile_id"].is_number());
+
+    let shown = run_json(&url, &["profile", "show", "pgpp_t_profile"]);
+    assert_eq!(shown["min_length"], 16);
+    assert_eq!(shown["max_age"], "30 days");
+    assert_eq!(shown["max_failures"], 3);
+    assert_eq!(shown["reject_username"], false);
+
+    run_ok(
+        &url,
+        &[
+            "profile",
+            "alter",
+            "pgpp_t_profile",
+            "--set",
+            "min_length=20",
+            "--set",
+            "lock_duration=null",
+        ],
+    );
+    let shown = run_json(&url, &["profile", "show", "pgpp_t_profile"]);
+    assert_eq!(shown["min_length"], 20);
+    assert!(shown["lock_duration"].is_null());
+
+    let list = run_json(&url, &["profile", "list"]);
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "pgpp_t_profile"));
+
+    run_ok(
+        &url,
+        &["profile", "assign", "pgpp_t_prof", "pgpp_t_profile"],
+    );
+    let st = run_json(&url, &["status", "--role", "pgpp_t_prof"]);
+    assert_eq!(st[0]["profile"], "pgpp_t_profile");
+
+    // profile in use cannot be dropped
+    let busy = run(&url, &["profile", "drop", "pgpp_t_profile"]);
+    assert_eq!(busy.status.code(), Some(1));
+
+    run_ok(&url, &["profile", "unassign", "pgpp_t_prof"]);
+    let st = run_json(&url, &["status", "--role", "pgpp_t_prof"]);
+    assert_eq!(st[0]["profile"], "default");
+    run_ok(&url, &["profile", "drop", "pgpp_t_profile"]);
+
+    let bad = run(
+        &url,
+        &["profile", "create", "pgpp_t_bad", "--set", "nope=1"],
+    );
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown profile setting"));
+    let usage = run(&url, &["profile", "create", "pgpp_t_bad", "--set", "nokv"]);
+    assert_eq!(usage.status.code(), Some(2));
+    let dup = run(
+        &url,
+        &[
+            "profile",
+            "create",
+            "pgpp_t_bad",
+            "--set",
+            "min_length=1",
+            "--set",
+            "min_length=2",
+        ],
+    );
+    assert_eq!(dup.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&dup.stderr).contains("given twice"));
+}
+
+fn check_with_stdin(url: &str, role: &str, password: &str, json: bool) -> (i32, String) {
+    let mut c = pgpp(url);
+    if json {
+        c.args(["-f", "json"]);
+    }
+    let mut child = c
+        .args(["check", role])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{password}\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stdout).unwrap(),
+    )
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn check_reads_password_from_stdin() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_chk").await;
+
+    let (code, out) = check_with_stdin(&url, "pgpp_t_chk", "short", false);
+    assert_eq!(code, 3);
+    assert!(out.contains("REFUSED") && out.contains("PPP-010"), "{out}");
+
+    let (code, out) = check_with_stdin(&url, "pgpp_t_chk", "pgpp_t_chk-Zq7!vLm2", true);
+    assert_eq!(code, 3);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["reason"].as_str().unwrap().starts_with("PPP-017"),
+        "{out}"
+    );
+
+    let (code, out) = check_with_stdin(&url, "pgpp_t_chk", "Zq7!vLm2#pRw9xKt", true);
+    assert_eq!(code, 0, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(v["reason"].is_null());
+
+    let (code, _) = check_with_stdin(&url, "pgpp_t_chk", "", false);
+    assert_eq!(code, 1, "an empty password is an error, not a refusal");
+    let (code, _) = check_with_stdin("postgres://u@127.0.0.1:9/db", "pgpp_t_chk", "x", false);
+    assert_eq!(code, 1, "a connection failure is an error, not a refusal");
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn switch_pair_rotates_the_inactive_role() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    exec_lenient(&mut conn, "CREATE ROLE pgpp_t_grp").await;
+    exec_lenient(
+        &mut conn,
+        "SELECT pass_policy.create_rotation_pair('pgpp_t_pair', 'pgpp_t_pa', 'pgpp_t_pb', 'pgpp_t_grp')",
+    )
+    .await;
+
+    let first = run_json(&url, &["switch-pair", "pgpp_t_pair", "--show"]);
+    let active = first["role"].as_str().unwrap().to_string();
+    assert!(active == "pgpp_t_pa" || active == "pgpp_t_pb", "{first}");
+    assert_eq!(first["pair"], "pgpp_t_pair");
+    let pw = first["password"].as_str().unwrap();
+    assert!(can_login(&active, pw).await, "new active role must log in");
+
+    let second = run_json(
+        &url,
+        &["switch-pair", "pgpp_t_pair", "--show", "--length", "28"],
+    );
+    assert_ne!(second["role"], active);
+    assert_eq!(second["previous_role"], active);
+    assert!(second["previous_valid_until"].is_string(), "{second}");
+    assert_eq!(second["password"].as_str().unwrap().chars().count(), 28);
+
+    // table output, with --exec receiving the pair variables
+    let out = run_ok(
+        &url,
+        &[
+            "switch-pair", "pgpp_t_pair",
+            "--exec", "read -r pw; test -n \"$pw\" && test \"$PGPP_PAIR\" = pgpp_t_pair && test -n \"$PGPP_PREVIOUS_ROLE\"",
+        ],
+    );
+    assert!(
+        out.contains("pair: pgpp_t_pair") && out.contains("delivered_to: exec"),
+        "{out}"
+    );
+
+    let audit = run_json(
+        &url,
+        &[
+            "audit",
+            "--type",
+            "pair_switched",
+            "--since",
+            "10m",
+            "--limit",
+            "5",
+        ],
+    );
+    assert!(audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["details"]["pair"] == "pgpp_t_pair"));
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn audit_filters() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_audit").await;
+    run_ok(
+        &url,
+        &["rotate", "pgpp_t_audit", "--exec", "cat >/dev/null"],
+    );
+    run_ok(&url, &["expire", "pgpp_t_audit"]);
+
+    let rows = run_json(&url, &["audit", "--since", "1h", "--role", "pgpp_t_audit"]);
+    let rows = rows.as_array().unwrap();
+    assert!(rows.iter().any(|r| r["event_type"] == "password_rotated"));
+    assert!(rows.iter().any(|r| r["event_type"] == "password_expired"));
+    assert!(rows.iter().all(|r| r["role_name"] == "pgpp_t_audit"));
+    assert!(rows
+        .iter()
+        .all(|r| r["actor"].is_string() && r["event_time"].is_string()));
+    for r in rows {
+        let text = r.to_string();
+        assert!(
+            !text.contains("\"password\":"),
+            "no password in audit: {text}"
+        );
+    }
+
+    let typed = run_json(
+        &url,
+        &[
+            "audit",
+            "--type",
+            "password_expired",
+            "--role",
+            "pgpp_t_audit",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(typed.as_array().unwrap().len(), 1);
+    assert_eq!(typed[0]["event_type"], "password_expired");
+
+    let exp = run_json(&url, &["expiring"]);
+    assert!(exp
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["role_name"] == "pgpp_t_audit" && r["status"] == "expired"));
+    let within = run_json(&url, &["expiring", "--within", "365d"]);
+    assert!(within.as_array().unwrap().len() >= exp.as_array().unwrap().len());
+
+    let bad = run(&url, &["audit", "--limit", "0"]);
+    assert_eq!(bad.status.code(), Some(2));
+}
+
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn maintenance_worker_status_and_failed_attempts() {
+    let url = db_url!();
+    let out = run(&url, &["maintenance"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = run_json(&url, &["maintenance"]);
+    assert!(json.is_array());
+
+    let ws = run_json(&url, &["worker-status"]);
+    assert!(ws["pid"].is_number() || ws["pid"].is_null(), "{ws}");
+    assert!(ws.get("tracked_roles").is_some());
+
+    let fa = run_json(&url, &["failed-attempts"]);
+    assert!(fa.is_array());
+    assert!(!run_ok(&url, &["failed-attempts"]).is_empty());
+}
+
+#[test]
+fn usage_errors_exit_with_2() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .arg("bogus")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .args(["lock", "x", "--for", "soon"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    for args in [
+        vec!["rotate", "x"],
+        vec!["switch-pair", "x", "--length", "20"],
+        vec!["audit", "--limit", "0"],
+        vec!["profile", "create", "p", "--set", "nokv"],
+        vec!["profile", "alter", "p"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+            .args(&args)
+            .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("cannot connect"), "{args:?}: {stderr}");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .args(["rotate", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("choose at least one"));
+    let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Delivery options are validated before the connection, so a bad Vault
+/// setup never reaches the server (nor rotates anything).
+#[test]
+fn bad_vault_setup_is_refused_before_connecting() {
+    let unreachable = "postgres://u@127.0.0.1:9/db";
+    type Case = (
+        Vec<&'static str>,
+        Vec<(&'static str, &'static str)>,
+        &'static str,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            vec!["rotate", "x", "--vault-kv", "secret/app"],
+            vec![("VAULT_TOKEN", "t")],
+            "VAULT_ADDR is not set",
+        ),
+        (
+            vec!["rotate", "x", "--vault-kv", "secret/app"],
+            vec![("VAULT_ADDR", "https://127.0.0.1:9")],
+            "VAULT_TOKEN is not set",
+        ),
+        (
+            vec!["switch-pair", "x", "--vault-kv", "secret/app"],
+            vec![
+                ("VAULT_ADDR", "http://vault.example.invalid:8200"),
+                ("VAULT_TOKEN", "t"),
+            ],
+            "loopback",
+        ),
+        (
+            vec!["rotate", "x", "--vault-kv", "secret/../app"],
+            vec![("VAULT_ADDR", "https://127.0.0.1:9"), ("VAULT_TOKEN", "t")],
+            "invalid path segment",
+        ),
+        (
+            vec!["rotate", "x", "--vault-kv", "secret/app"],
+            vec![
+                ("VAULT_ADDR", "https://127.0.0.1:9"),
+                ("VAULT_TOKEN", "t"),
+                ("VAULT_CAPATH", "/nonexistent-dir"),
+            ],
+            "VAULT_CAPATH",
+        ),
+    ];
+    for (args, env, expected) in cases {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_pgpp"));
+        c.args(&args)
+            .env("DATABASE_URL", unreachable)
+            .env_remove("VAULT_ADDR")
+            .env_remove("VAULT_TOKEN")
+            .env_remove("VAULT_NAMESPACE")
+            .env_remove("VAULT_CACERT")
+            .env_remove("VAULT_CAPATH");
+        for (k, v) in &env {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+        assert!(!stderr.contains("cannot connect"), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("\"t\""),
+            "token must not be echoed: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn connection_failure_exits_with_1_without_leaking_the_url() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .env("DATABASE_URL", "postgres://u:hidden-secret@127.0.0.1:9/db")
+        .env_remove("PGPASSWORD")
+        .arg("locked")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("cannot connect"), "{stderr}");
+    assert!(!stderr.contains("hidden-secret"), "{stderr}");
+}

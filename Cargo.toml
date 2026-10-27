@@ -1,0 +1,30 @@
+[package]
+name = "pgpp"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line client for the pg_pass_policy PostgreSQL extension"
+license = "PostgreSQL"
+rust-version = "1.80"
+
+[[bin]]
+name = "pgpp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+comfy-table = "7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "chrono", "json", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util"] }
+zeroize = { version = "1", features = ["std"] }
+
+[dev-dependencies]
+httpmock = "0.7"
+
+[profile.release]
+strip = true
