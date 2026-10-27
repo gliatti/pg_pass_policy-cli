@@ -65,22 +65,28 @@ impl ResultSet {
         Ok(rs)
     }
 
+    /// One row as a JSON object.
+    fn record(&self, row: &[Value]) -> Map<String, Value> {
+        self.columns
+            .iter()
+            .cloned()
+            .zip(row.iter().cloned())
+            .collect()
+    }
+
     /// Rows as JSON objects.
     pub fn to_json(&self) -> Value {
         Value::Array(
             self.rows
                 .iter()
-                .map(|r| {
-                    Value::Object(
-                        self.columns
-                            .iter()
-                            .cloned()
-                            .zip(r.iter().cloned())
-                            .collect::<Map<_, _>>(),
-                    )
-                })
+                .map(|r| Value::Object(self.record(r)))
                 .collect(),
         )
+    }
+
+    /// First row as a JSON object, if any.
+    pub fn first_record(&self) -> Option<Map<String, Value>> {
+        self.rows.first().map(|r| self.record(r))
     }
 
     /// Prints the result set in the requested format.  `empty` is the text
@@ -155,6 +161,11 @@ mod tests {
             rs.to_json(),
             json!([{"a": 1, "b": null}, {"a": "x", "b": true}])
         );
+        assert_eq!(
+            Value::Object(rs.first_record().unwrap()),
+            json!({"a": 1, "b": null})
+        );
+        assert!(ResultSet::default().first_record().is_none());
     }
 
     #[test]

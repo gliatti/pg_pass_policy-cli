@@ -4,13 +4,14 @@
 //! interpolate user input.  Timestamps and intervals are cast to text on the
 //! server so that special values (`infinity`) render faithfully.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
+use std::os::fd::AsFd;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sqlx::{Connection, Executor, PgConnection, Row};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -59,10 +60,19 @@ pub async fn expiring(
     Ok(())
 }
 
+/// Same columns as the view `v_locked`, but `locked_by` / `lock_reason` are
+/// read from `role_state` by OID: the view joins `role_state` on `role_name`,
+/// which the maintenance refreshes only, so that after an
+/// `ALTER ROLE ... RENAME` the view would show the lock without its origin
+/// and reason.
 pub async fn locked(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     let rows = sqlx::query(
-        "SELECT role_name, locked_until::text, locked_by, lock_reason, failed_count \
-         FROM pass_policy.v_locked ORDER BY role_name",
+        "SELECT v.role_name, v.locked_until::text, s.locked_by, s.lock_reason, v.failed_count \
+           FROM pass_policy.v_role_status v \
+           JOIN pg_catalog.pg_roles r ON r.rolname = v.role_name \
+           LEFT JOIN pass_policy.role_state s ON s.role_oid = r.oid \
+          WHERE v.status = 'locked' \
+          ORDER BY v.role_name",
     )
     .fetch_all(conn)
     .await?;
@@ -94,7 +104,8 @@ async fn valid_until_after_rotation(conn: &mut PgConnection, role: &str) -> Opti
 /// Delivery channels of a rotation, resolved and validated before the
 /// password is rotated: the Vault environment (`VAULT_ADDR`, `VAULT_TOKEN`,
 /// certificates), the `--vault-kv` path, the availability of `sh`, and
-/// finally the Vault token itself (preflight request).
+/// finally the Vault token itself and its permission on the target path
+/// (preflight requests).
 pub struct Delivery {
     pub length: Option<i32>,
     pub show: bool,
@@ -104,8 +115,9 @@ pub struct Delivery {
 
 impl Delivery {
     /// Validates `--exec` and `--vault-kv` / `--vault-mount`, then checks
-    /// that Vault accepts the token (`lookup-self`); an error here is a usage
-    /// error, reported before any connection to PostgreSQL.
+    /// that Vault accepts the token and lets it write the target
+    /// ([`vault::preflight`]); an error here is a usage error, reported
+    /// before any connection to PostgreSQL.
     pub async fn prepare(opts: &RotateOpts) -> Result<Self> {
         let vault = match &opts.vault_kv {
             Some(kv) => {
@@ -118,8 +130,10 @@ impl Delivery {
         if opts.exec.is_some() {
             check_shell()?;
         }
-        if let Some((cfg, _)) = &vault {
-            vault::preflight(cfg).await?;
+        if let Some((cfg, target)) = &vault {
+            for w in vault::preflight(cfg, target).await? {
+                eprintln!("pgpp: warning: {w}");
+            }
         }
         Ok(Delivery {
             length: opts.length,
@@ -523,33 +537,68 @@ fn read_password() -> Result<Secret> {
         let pw = rpassword::read_password().context("cannot read the password")?;
         return Ok(Zeroizing::new(pw));
     }
-    read_first_line(&mut stdin.lock()).context("cannot read the password from stdin")
+    // Read on a duplicate of descriptor 0, unbuffered: `StdinLock` would keep
+    // a copy of the password in the internal buffer of `std::io::stdin()`,
+    // which is never wiped.
+    let fd = stdin
+        .as_fd()
+        .try_clone_to_owned()
+        .context("cannot read the password from stdin")?;
+    read_first_line(&mut std::fs::File::from(fd)).context("cannot read the password from stdin")
 }
 
-/// Reads one line (the rest of the input is left unread, so that a writer
-/// that keeps its end of the pipe open does not block pgpp) and strips the
-/// final `\n` / `\r\n`.
-fn read_first_line(input: &mut impl BufRead) -> std::io::Result<Secret> {
-    // pre-allocated so that a usual password never makes the buffer grow
-    // (a reallocation would leave an unwiped copy behind)
-    let mut line = Zeroizing::new(String::with_capacity(1024));
-    input.read_line(&mut line)?;
-    if line.ends_with('\n') {
-        line.pop();
-        if line.ends_with('\r') {
-            line.pop();
+/// Reads one line byte by byte (nothing after the `\n` is consumed, so that a
+/// writer that keeps its end of the pipe open does not block pgpp) and strips
+/// the final `\n` / `\r\n`.  `input` must be unbuffered, or its own buffer
+/// keeps a copy.  The bytes are kept in a zeroised buffer that is replaced
+/// (old one wiped) instead of being reallocated in place, so that no
+/// unwiped copy is left behind whatever the length.
+fn read_first_line(input: &mut impl Read) -> std::io::Result<Secret> {
+    let mut line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(256));
+    let mut byte = Zeroizing::new([0u8; 1]);
+    loop {
+        match input.read(&mut byte[..]) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                if line.len() == line.capacity() {
+                    let mut bigger = Zeroizing::new(Vec::with_capacity(line.capacity() * 2));
+                    bigger.extend_from_slice(&line);
+                    line = bigger;
+                }
+                line.push(byte[0]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-    Ok(line)
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    match String::from_utf8(std::mem::take(&mut *line)) {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        Err(e) => {
+            e.into_bytes().zeroize();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the password is not valid UTF-8",
+            ))
+        }
+    }
 }
 
 /// Keeps the candidate password out of the server log.  A bound parameter is
 /// written in the DETAIL line of `log_statement = 'all'` /
 /// `log_min_duration_statement` unless `log_parameter_max_length` is 0; that
 /// setting is superuser-only by default, so a refusal (42501) is downgraded
-/// to a warning.  The SET LOCAL runs under a savepoint so that the transaction
-/// stays usable after a refusal.
+/// to a warning, printed only when the value in force for the session
+/// (`ALTER ROLE ... SET`, for instance) is not already 0.  The SET LOCAL runs
+/// under a savepoint so that the transaction stays usable after a refusal.
+/// `log_parameter_max_length_on_error` (any user may set it) is also set to
+/// 0, for the case where `check_password` raises an error.
 async fn mask_parameters(tx: &mut PgConnection) -> Result<()> {
+    tx.execute("SET LOCAL log_parameter_max_length_on_error = 0")
+        .await?;
     tx.execute("SAVEPOINT pgpp_mask").await?;
     match tx.execute("SET LOCAL log_parameter_max_length = 0").await {
         Ok(_) => {
@@ -558,13 +607,19 @@ async fn mask_parameters(tx: &mut PgConnection) -> Result<()> {
         }
         Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42501") => {
             tx.execute("ROLLBACK TO SAVEPOINT pgpp_mask").await?;
-            eprintln!(
-                "pgpp: warning: cannot disable parameter logging (log_parameter_max_length); \
-                 the candidate password may appear in the server log if log_statement or \
-                 log_min_duration_statement are enabled. Ask a superuser for \
-                 \"ALTER ROLE <admin> SET log_parameter_max_length = 0\" or \
-                 \"GRANT SET ON PARAMETER log_parameter_max_length TO <admin>\""
-            );
+            let current: String =
+                sqlx::query_scalar("SELECT current_setting('log_parameter_max_length')")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if current.trim() != "0" {
+                eprintln!(
+                    "pgpp: warning: cannot disable parameter logging (log_parameter_max_length \
+                     = {current}); the candidate password may appear in the server log if \
+                     log_statement or log_min_duration_statement are enabled. Ask a superuser \
+                     for \"ALTER ROLE <admin> SET log_parameter_max_length = 0\" or \
+                     \"GRANT SET ON PARAMETER log_parameter_max_length TO <admin>\""
+                );
+            }
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -629,13 +684,9 @@ pub async fn worker_status(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     )
     .fetch_one(conn)
     .await?;
-    let rs = ResultSet::from_rows(std::slice::from_ref(&row))?;
-    let mut record = Map::new();
-    if let Some(values) = rs.rows.first() {
-        for (k, v) in rs.columns.iter().zip(values) {
-            record.insert(k.clone(), v.clone());
-        }
-    }
+    let record = ResultSet::from_rows(std::slice::from_ref(&row))?
+        .first_record()
+        .unwrap_or_default();
     print_record(&record, fmt);
     Ok(())
 }
@@ -662,5 +713,13 @@ mod tests {
         assert_eq!(read_first_line(&mut input).unwrap().as_str(), "");
         let mut input: &[u8] = b"\nnext";
         assert_eq!(read_first_line(&mut input).unwrap().as_str(), "");
+        let mut input: &[u8] = b"\xff\xfe\n";
+        assert!(read_first_line(&mut input).is_err(), "invalid UTF-8");
+        // longer than the initial capacity: the buffer is replaced, not grown
+        let long = "é".repeat(700);
+        let data = format!("{long}\nrest");
+        let mut input: &[u8] = data.as_bytes();
+        assert_eq!(read_first_line(&mut input).unwrap().as_str(), long);
+        assert_eq!(input, b"rest");
     }
 }

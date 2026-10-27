@@ -64,7 +64,7 @@ les listes sont des tableaux d'objets et les actions renvoient un objet
 |---|---|
 | 0 | succès (pour `check` : mot de passe conforme) |
 | 1 | erreur (base injoignable, réseau, refus de l'extension, échec de remise du mot de passe après rotation) |
-| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé ou Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation |
+| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé ou sans droit d'écriture sur le chemin, Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation |
 | 3 | mot de passe refusé par `check` (motif `PPP-xxx`) |
 
 Les durées (`--within`, `--for`, `--since`) s'écrivent `45s`, `30m`, `12h`,
@@ -82,7 +82,7 @@ pgpp status --role app_user      # un seul rôle (erreur si absent)
 pgpp status -f json | jq '.[] | select(.status != "ok")'
 pgpp expiring                    # status warning / grace / expired
 pgpp expiring --within 14d       # idem + expiration dans moins de 14 jours
-pgpp locked                      # rôles verrouillés (vue v_locked)
+pgpp locked                      # rôles verrouillés (mêmes colonnes que la vue v_locked)
 pgpp failed-attempts             # compteurs d'échecs en mémoire partagée
 pgpp worker-status               # pid, dernier passage et rechargement du worker
 ```
@@ -114,8 +114,9 @@ Politique d'affichage :
 - les options de remise sont vérifiées avant la connexion et avant la
   rotation : variables `VAULT_ADDR` / `VAULT_TOKEN` présentes, certificat
   `VAULT_CACERT` / `VAULT_CAPATH` lisible, chemin `--vault-kv` bien formé,
-  `sh` disponible pour `--exec`, puis jeton accepté par Vault (requête
-  `GET /v1/auth/token/lookup-self`). Une erreur à ce stade sort avec le code 2
+  `sh` disponible pour `--exec`, puis jeton accepté par Vault et autorisé à
+  écrire le chemin (requêtes `lookup-self` et `capabilities-self`, voir
+  « Intégration HashiCorp Vault »). Une erreur à ce stade sort avec le code 2
   sans rien changer côté serveur ;
 - si une remise (`--exec`, Vault) échoue malgré cela (Vault devenu
   injoignable, droits insuffisants sur le chemin, commande en erreur ou qui
@@ -152,6 +153,12 @@ pgpp lock app_user                 # jusqu'à unlock explicite (locked_until = i
 pgpp unlock app_user               # déverrouille et remet le compteur d'échecs à zéro
 pgpp expire app_user               # must_change + VALID UNTIL now()
 ```
+
+`lock` et `locked` retrouvent l'état de verrouillage par l'OID du rôle : la
+colonne `role_name` de `pass_policy.role_state` (et donc la vue `v_locked`,
+qui la joint par nom) n'est mise à jour qu'au passage suivant de la
+maintenance après un `ALTER ROLE … RENAME`. Entre-temps, `pgpp locked`
+affiche bien `locked_by` et `lock_reason`, que la vue laisse vides.
 
 ### Profils de politique
 
@@ -211,13 +218,16 @@ requête, mais PostgreSQL l'écrit dans la ligne `DETAIL:  parameters: …` dès
 que `log_statement = 'all'` ou `log_min_duration_statement >= 0` est actif,
 selon `log_parameter_max_length` (défaut -1 : tout). Pour
 l'éviter, `pgpp check` exécute `SET LOCAL log_parameter_max_length = 0` dans
-sa transaction avant d'appeler `check_password`. Ce réglage est réservé au
-superutilisateur par défaut : si le serveur le refuse, `pgpp` continue et
-affiche un avertissement sur la sortie d'erreur. Deux parades côté serveur, à
-poser une fois par un superutilisateur :
+sa transaction avant d'appeler `check_password` (ainsi que
+`SET LOCAL log_parameter_max_length_on_error = 0`, permis à tout rôle, pour le
+cas où l'appel échoue). Le premier réglage est réservé au superutilisateur par
+défaut : si le serveur le refuse, `pgpp` continue, lit la valeur en vigueur
+pour la session et n'affiche un avertissement sur la sortie d'erreur que si
+elle n'est pas déjà 0. Deux parades côté serveur, à poser une fois par un
+superutilisateur :
 
 ```sql
-ALTER ROLE pgpp_admin SET log_parameter_max_length = 0;              -- s'applique à toutes les sessions du rôle
+ALTER ROLE pgpp_admin SET log_parameter_max_length = 0;              -- toutes les sessions du rôle ; plus d'avertissement
 GRANT SET ON PARAMETER log_parameter_max_length TO pgpp_admin;       -- PostgreSQL 15+ : pgpp le fait lui-même
 ```
 
@@ -341,14 +351,34 @@ est une erreur (code 1). Suivre une redirection rejouerait le jeton et le mot
 de passe vers l'hôte indiqué par `Location`, ce qui contournerait la règle
 ci-dessus. `VAULT_ADDR` doit donc pointer sur l'adresse finale de Vault.
 
+`VAULT_TOKEN` et `VAULT_NAMESPACE` sont débarrassés des blancs en début et
+en fin (un `\n` final recopié d'un fichier de jeton, par exemple), puis
+doivent ne contenir que des caractères ASCII visibles : sinon la commande est
+refusée (code 2) par un message qui nomme la variable sans jamais afficher
+sa valeur. De même, aucun message d'erreur sur `VAULT_ADDR` ne reprend
+l'adresse saisie, qui peut contenir des identifiants.
+
 Toute cette configuration (variables, certificats, chemin) est validée avant
-la connexion à PostgreSQL, puis `pgpp` vérifie le jeton par
-`GET {VAULT_ADDR}/v1/auth/token/lookup-self` (autorisé par la politique
-`default` de Vault), avec le même client HTTP que pour l'écriture
-(redirections refusées). Un jeton expiré ou révoqué, un Vault injoignable ou
-une redirection sortent donc avec le code 2 avant toute rotation. Restent
-possibles après la rotation : un refus d'écriture sur le chemin (politique
-du jeton) ou une panne survenue entre les deux requêtes (code 1, voir
+la connexion à PostgreSQL, puis `pgpp` interroge Vault avec le même client
+HTTP que pour l'écriture (redirections refusées) :
+
+1. `GET {VAULT_ADDR}/v1/auth/token/lookup-self` (autorisé par la politique
+   `default`) : une erreur réseau, une redirection, un 401, un 5xx ou tout
+   autre statut non 2xx sortent avec le code 2. Un 403 n'est qu'un
+   avertissement : un jeton créé avec `-no-default-policy` ne peut pas
+   s'inspecter lui-même mais peut avoir le droit d'écrire ;
+2. `POST {VAULT_ADDR}/v1/sys/capabilities-self` avec
+   `{"paths": ["{mount}/data/{chemin}"]}` : si les droits du jeton sur ce
+   chemin ne comprennent ni `create`, ni `update`, ni `root`, la commande est
+   refusée (code 2). Si cette requête est elle-même refusée (403) ou que la
+   réponse est illisible, `pgpp` avertit et tente l'écriture après la
+   rotation.
+
+Un jeton expiré ou révoqué, un jeton sans droit d'écriture sur le chemin, un
+Vault injoignable ou une redirection sortent donc avec le code 2 avant toute
+rotation. Restent possibles après la rotation : un refus d'écriture que la
+vérification n'a pas pu prévoir (jeton non inspectable, politique modifiée
+entre-temps) ou une panne survenue entre les requêtes (code 1, voir
 « Politique d'affichage »).
 
 ## Sécurité
@@ -374,8 +404,11 @@ du jeton) ou une panne survenue entre les deux requêtes (code 1, voir
   rotation.
 - Le mot de passe reçu est conservé dans un tampon `zeroize` effacé dès que
   la commande n'en a plus besoin (y compris la copie du corps JSON envoyé à
-  Vault et la sortie JSON formatée). Les tampons internes des bibliothèques
-  (réponse réseau de sqlx, requête HTTP de reqwest) ne sont pas sous
+  Vault et la sortie JSON formatée). Le mot de passe candidat de `check` est
+  lu octet par octet sur une copie du descripteur 0, sans le tampon interne
+  de `std::io::stdin()` qui en garderait une copie non effacée. Les tampons
+  internes des bibliothèques (réponse réseau et paramètres liés de sqlx,
+  requête HTTP de reqwest, saisie sans écho de rpassword) ne sont pas sous
   contrôle de `pgpp`.
 - Le mot de passe d'un `--exec` passe par un tube vers l'entrée standard du
   processus enfant, jamais par `argv` ni par l'environnement. Le processus
@@ -408,8 +441,8 @@ Les tests d'intégration créent des rôles `pgpp_t_*`, un profil
 `pgpp_t_profile` et une paire `pgpp_t_pair` (rôles `pgpp_t_pa`, `pgpp_t_pb`,
 groupe `pgpp_t_grp`) dans la base désignée : à n'utiliser que sur une
 instance de test. Le test Vault utilise un serveur HTTP simulé (`httpmock`)
-qui vérifie le chemin, les en-têtes `X-Vault-Token` / `X-Vault-Namespace` et
-le corps envoyé.
+qui vérifie le chemin, les en-têtes `X-Vault-Token` / `X-Vault-Namespace`, le
+corps envoyé et les deux requêtes de vérification préalable.
 
 ## Choix techniques
 

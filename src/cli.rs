@@ -37,7 +37,7 @@ pub struct Cli {
 /// Options shared by `rotate` and `switch-pair`.  At least one delivery
 /// (`--show`, `--exec`, `--vault-kv`) is required: the server returns the new
 /// password once, so a rotation without delivery would lose it.
-#[derive(Debug, Args, Default)]
+#[derive(Debug, Args)]
 #[command(group = ArgGroup::new("delivery")
     .required(true)
     .multiple(true)
