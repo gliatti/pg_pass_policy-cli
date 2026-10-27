@@ -17,14 +17,15 @@ use anyhow::Result;
 use sqlx::postgres::PgDatabaseError;
 
 use cli::{Cli, Command, ProfileCommand, RotateOpts};
-use commands::Delivery;
+use commands::{Delivery, PrepareError};
 
 /// Exit code of a successful run.
 pub const EXIT_OK: i32 = 0;
 /// Exit code of a failed run (database, network, policy refusal, ...).
 pub const EXIT_ERROR: i32 = 1;
 /// Exit code of a usage error (clap uses it on its own; `run` uses it for a
-/// delivery configuration refused before any rotation).
+/// delivery configuration refused by the local validation, before any
+/// rotation; a failed Vault preflight request exits with [`EXIT_ERROR`]).
 pub const EXIT_USAGE: i32 = 2;
 /// Exit code of `check` when the candidate password is refused by the policy.
 pub const EXIT_REFUSED: i32 = 3;
@@ -59,16 +60,18 @@ pub fn format_error(err: &anyhow::Error) -> String {
 /// Validates the delivery options of `rotate` / `switch-pair` before any
 /// connection: a bad Vault configuration or path, a token refused by Vault,
 /// an unreachable Vault or a missing shell must not be discovered after the
-/// password has been rotated.  Returns `None`
-/// (usage error, already printed) when they are refused.
-async fn prepare_delivery(opts: &RotateOpts) -> Option<Delivery> {
-    match Delivery::prepare(opts).await {
-        Ok(d) => Some(d),
-        Err(e) => {
-            eprintln!("pgpp: error: {}", format_error(&e));
-            None
+/// password has been rotated.  On a refusal the error is printed and the
+/// exit code returned: [`EXIT_USAGE`] for the local validation (path,
+/// environment, certificates, `sh`), [`EXIT_ERROR`] for a failed preflight
+/// request (network, TLS, HTTP status, refused token or permission).
+async fn prepare_delivery(opts: &RotateOpts) -> std::result::Result<Delivery, i32> {
+    Delivery::prepare(opts).await.map_err(|e| {
+        eprintln!("pgpp: error: {}", format_error(e.error()));
+        match e {
+            PrepareError::Invalid(_) => EXIT_USAGE,
+            PrepareError::Preflight(_) => EXIT_ERROR,
         }
-    }
+    })
 }
 
 /// Prints a usage error detected before the connection and returns its exit
@@ -104,8 +107,8 @@ pub async fn run(cli: Cli) -> Result<i32> {
     let delivery = match &cli.command {
         Command::Rotate { opts, .. } | Command::SwitchPair { opts, .. } => {
             match prepare_delivery(opts).await {
-                Some(d) => Some(d),
-                None => return Ok(EXIT_USAGE),
+                Ok(d) => Some(d),
+                Err(code) => return Ok(code),
             }
         }
         _ => None,

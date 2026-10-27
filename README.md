@@ -63,8 +63,8 @@ les listes sont des tableaux d'objets et les actions renvoient un objet
 | code | signification |
 |---|---|
 | 0 | succès (pour `check` : mot de passe conforme) |
-| 1 | erreur (base injoignable, réseau, refus de l'extension, échec de remise du mot de passe après rotation) |
-| 2 | erreur d'usage : option inconnue, durée invalide ou nulle, `--set` invalide ou clé répétée, `--limit` < 1, mot de passe de `check` vide ou illisible, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé (401 ou 403, y compris un jeton expiré, révoqué ou inconnu) ou sans droit d'écriture sur le chemin, Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation (sauf la validité du jeton avec `--vault-skip-preflight`, voir « Intégration HashiCorp Vault ») |
+| 1 | erreur (base injoignable, réseau, refus de l'extension, échec de remise du mot de passe après rotation) ; aussi l'échec d'une requête de vérification Vault avant la rotation (Vault injoignable, erreur TLS, redirection, 5xx ou autre statut non 2xx, jeton refusé par 401 ou 403, y compris un jeton expiré, révoqué ou inconnu, jeton sans droit d'écriture sur le chemin), détecté avant la connexion et sans rien changer côté serveur |
+| 2 | erreur d'usage : option inconnue, durée invalide ou nulle, `--set` invalide ou clé répétée, `--limit` < 1, mot de passe de `check` vide ou illisible, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), `sh` introuvable pour `--exec` ; validation locale, toujours faite avant la connexion et avant toute rotation |
 | 3 | mot de passe refusé par `check` (motif `PPP-xxx`) |
 
 Les durées (`--within`, `--for`, `--since`) s'écrivent `45s`, `30m`, `12h`,
@@ -125,16 +125,18 @@ Politique d'affichage :
   `sh` disponible pour `--exec`, puis jeton accepté par Vault et autorisé à
   écrire le chemin (requêtes `lookup-self` et `capabilities-self`, voir
   « Intégration HashiCorp Vault » ; `--vault-skip-preflight` les supprime).
-  Une erreur à ce stade sort avec le code 2 sans rien changer côté serveur ;
+  Une erreur à ce stade ne change rien côté serveur : code 2 pour une
+  erreur de validation locale (chemin, variables, certificats, `sh`), code 1
+  pour l'échec d'une requête de vérification vers Vault ;
 - si une remise (`--exec`, Vault) échoue malgré cela (Vault devenu
   injoignable, droits insuffisants sur le chemin, commande en erreur ou qui
   n'a pas lu le mot de passe), le mot de passe a déjà été changé côté serveur ; il
   n'est pas affiché sauf `--show`, le code de retour est 1 et le message
   invite à relancer la rotation ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
-  coupée), un avertissement est émis, `valid_until` reste vide (`null` en
-  JSON, avec `valid_until_known: false` pour le distinguer d'un rôle
-  illimité), `PGPP_VALID_UNTIL` n'est pas définie pour `--exec` et la remise a
+  coupée), un avertissement est émis, `valid_until` vaut `(unknown)` en
+  table (une valeur vide y signifie « illimité ») et `null` en JSON, avec
+  `valid_until_known: false` pour le distinguer d'un rôle illimité, `PGPP_VALID_UNTIL` n'est pas définie pour `--exec` et la remise a
   lieu quand même : le mot de passe n'est jamais perdu de ce fait.
 
 ### Rotation sans coupure d'une paire
@@ -196,7 +198,13 @@ valeur optionnelle (`max_age`, `lock_duration`), le reste est transmis tel
 quel (intervalles PostgreSQL : `"30 days"`, `"1 hour"`). Les mots-clés `true`,
 `false`, `on`, `off`, `yes`, `no` et `null` sont insensibles à la casse (`TRUE`,
 `Off`, `NULL` conviennent aussi) ; les autres
-valeurs sont transmises sans changement de casse. L'ensemble est
+valeurs sont transmises sans changement de casse. Une valeur entre
+guillemets doubles est toujours une chaîne, transmise sans les guillemets et
+sans autre traitement (ni séquence d'échappement, ni suppression des blancs
+intérieurs) : `--set 'max_age="90"'` envoie la chaîne `"90"` là où
+`--set max_age=90` envoie le nombre 90, et `"null"` ou `"true"` restent des
+chaînes. Les guillemets doivent arriver jusqu'à `pgpp` : les protéger du
+shell par des apostrophes, comme dans l'exemple. L'ensemble est
 envoyé en jsonb à `create_profile()` / `alter_profile()`, qui valident les
 clés.
 
@@ -304,12 +312,25 @@ reconnue.
 
 L'écriture du mot de passe et l'attente du processus sont menées en
 parallèle : un processus qui se termine sans lire ne peut pas bloquer `pgpp`
-sur l'écriture. Celle-ci est en outre bornée à 30 s : au-delà, le processus
-`sh` (toujours en vie et qui ne lit pas) reçoit `SIGKILL` et la remise
-échoue ; un sous-processus qu'il aurait lancé n'est pas visé. Ce délai ne
+sur l'écriture. Celle-ci est en outre bornée à 30 s : au-delà, le groupe de
+processus du hook (`sh` et les sous-processus qu'il a lancés) reçoit
+`SIGKILL` et la remise échoue. Ce délai ne
 peut être atteint que si la ligne dépasse la capacité du tube (64 Kio sous
 Linux), ce que la longueur maximale du serveur exclut ; une fois la ligne
 écrite, le hook peut durer aussi longtemps que nécessaire.
+
+Quelle que soit l'issue (succès, délai dépassé, erreur d'écriture, code de
+retour non nul), `pgpp` vide le tube (octets effacés) avant de rendre la
+main : un sous-processus ayant hérité de l'entrée standard et qui survit au
+hook n'y trouve plus le mot de passe. Un sous-processus qui a quitté le
+groupe (`setsid`) échappe au `SIGKILL`, pas à ce vidage.
+
+Le hook est lancé dans son propre groupe de processus. Conséquences : un
+Ctrl-C tapé dans le terminal de `pgpp` ne lui parvient pas (il continue si
+`pgpp` est interrompu), et il ne peut pas lire le terminal : un programme qui
+y demande une saisie (invite de mot de passe de `sudo`, par exemple) est
+suspendu par `SIGTTIN` et `pgpp` attend indéfiniment. Le hook doit donc
+s'exécuter sans interaction (`sudo -n`, authentification par clé).
 
 Conséquence de l'héritage : un hook fourni par un tiers (script de
 déploiement d'une autre équipe) reçoit les identifiants de l'opérateur
@@ -404,19 +425,24 @@ la connexion à PostgreSQL, puis `pgpp` interroge Vault avec le même client
 HTTP que pour l'écriture (redirections refusées) :
 
 1. `GET {VAULT_ADDR}/v1/auth/token/lookup-self` (autorisé par la politique
-   `default`) : une erreur réseau, une redirection, un 401, un 403, un 5xx ou
-   tout autre statut non 2xx sortent avec le code 2. Vault répond en effet
+   `default`) : une erreur réseau ou TLS, une redirection, un 401, un 403, un
+   5xx ou tout autre statut non 2xx sortent avec le code 1. Vault répond en effet
    403 « permission denied » (jamais 401) à un jeton expiré, révoqué ou
    inconnu : un 403 est donc un refus ;
 2. `POST {VAULT_ADDR}/v1/sys/capabilities-self` avec
    `{"paths": ["{mount}/data/{chemin}"]}` : un refus de cette requête (403
    compris) ou des droits sur ce chemin qui ne comprennent ni `create`, ni
-   `update`, ni `root` sortent avec le code 2. Si la réponse est illisible,
+   `update`, ni `root` sortent avec le code 1. Si la réponse est illisible,
    `pgpp` avertit et tente l'écriture après la rotation.
 
+La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
+première est gardée volontairement : elle désigne le jeton lui-même comme
+cause de l'échec, au prix d'un aller-retour de plus.
+
 Un jeton expiré, révoqué ou inconnu, un jeton sans droit d'écriture sur le
-chemin, un Vault injoignable ou une redirection sortent donc avec le code 2
-avant toute rotation. Restent possibles après la rotation : un refus
+chemin, un Vault injoignable ou une redirection sortent donc avec le code 1
+avant toute rotation et avant la connexion à PostgreSQL (le code 2 reste
+réservé à la validation locale de la configuration, décrite plus haut). Restent possibles après la rotation : un refus
 d'écriture que la vérification n'a pas pu prévoir (réponse illisible de
 `capabilities-self`, politique modifiée entre-temps) ou une panne survenue
 entre les requêtes (code 1, voir « Politique d'affichage »).
@@ -458,8 +484,10 @@ secours) ou relancer la rotation après correction du jeton.
 - Le mot de passe reçu est conservé dans un tampon `zeroize` effacé dès que
   la commande n'en a plus besoin, de même que la valeur JSON du secret Vault,
   le corps HTTP sérialisé (alloué une fois à sa taille exacte, effacé quand
-  reqwest le libère), la ligne écrite vers `--exec` et la sortie JSON
-  formatée. Le mot de passe candidat de `check` est
+  reqwest le libère), la ligne écrite vers `--exec` et la sortie de
+  `--show` (texte JSON alloué lui aussi à sa taille exacte, ligne
+  `password:` en table), écrite directement sur le descripteur 1 sans
+  passer par le tampon de `std::io::stdout()`. Le mot de passe candidat de `check` est
   lu sur une copie du descripteur 0, sans le tampon interne de
   `std::io::stdin()` qui en garderait une copie non effacée : octet par
   octet depuis un tube ou un terminal, par blocs dans un tampon effacé depuis
@@ -467,16 +495,27 @@ secours) ou relancer la rotation après correction du jeton.
   ramenée juste après le premier `\n`.
 - Limite de cet effacement : les copies faites par les bibliothèques ne sont
   pas sous le contrôle de `pgpp` et restent en mémoire jusqu'à leur
-  réutilisation. Ce sont, pour `rotate` / `switch-pair`, le tampon de
-  réception de sqlx et la ligne `PgRow` qui contient le mot de passe renvoyé
-  par le serveur (la `String` décodée en est une copie, aussitôt placée dans
-  un tampon effacé, mais l'original n'est pas effacé) ; pour Vault, le tampon
-  d'écriture de hyper et les enregistrements TLS de rustls (la requête
-  chiffrée ou, en `http://` local, en clair) ; pour `check`, le paramètre
-  lié sérialisé par sqlx et, sur un terminal, la saisie de rpassword ; pour
-  `--show`, le tampon de la sortie standard. Un vidage mémoire (core dump,
-  swap) du processus peut donc contenir le mot de passe : désactiver les
-  core dumps (`ulimit -c 0`) sur les machines qui lancent des rotations.
+  réutilisation. Ce sont :
+  - pour `rotate` / `switch-pair`, le tampon de réception de sqlx et la
+    ligne `PgRow` qui contient le mot de passe renvoyé par le serveur
+    (`PgRow` partage ce tampon en lecture seule, `pgpp` ne peut pas
+    l'effacer). La colonne est lue telle quelle (`try_get_raw`) et copiée
+    une seule fois, à sa taille exacte, dans un tampon effacé ;
+  - pour `check`, la ligne `PgRow` ne contient que le motif de refus, mais
+    le mot de passe candidat est copié par sqlx dans les arguments liés
+    (`PgArguments`, tampon susceptible de grandir par réallocations) puis dans son
+    tampon d'envoi, sans effacement ; sur un terminal s'y ajoute la saisie
+    de rpassword ;
+  - pour Vault, le tampon d'écriture de hyper et les enregistrements TLS de
+    rustls (la requête chiffrée ou, en `http://` local, en clair) ; côté
+    PostgreSQL, de même, les enregistrements TLS de rustls quand la
+    connexion est chiffrée ;
+  - pour `--show`, les tampons du terminal ou du tube qui reçoit la sortie,
+    hors du processus.
+
+  Un vidage mémoire (core dump, swap) du processus peut donc contenir le mot
+  de passe : désactiver les core dumps (`ulimit -c 0`) sur les machines qui
+  lancent des rotations.
 - Le mot de passe d'un `--exec` passe par un tube vers l'entrée standard du
   processus enfant, jamais par `argv` ni par l'environnement. Le processus
   enfant hérite en revanche de l'environnement de `pgpp` (voir la section

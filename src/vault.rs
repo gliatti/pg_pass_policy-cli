@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::{Certificate, StatusCode, Url};
+use serde::Serialize;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -420,6 +421,11 @@ pub fn build_payload(username: &str, password: &str, rotated_at: &str) -> Value 
 pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
+    // Two requests on purpose: `capabilities-self` alone would also refuse
+    // an expired, revoked or unknown token, but its error does not tell a
+    // bad token from a token without permission on `sys/capabilities-self`.
+    // `lookup-self` first pins the failure on the token itself; the extra
+    // round trip is accepted for that more precise message.
     let url = endpoint(&cfg.addr, ["v1", "auth", "token", "lookup-self"]);
     send_checked(cfg.request(reqwest::Method::GET, url.clone()), &url).await?;
 
@@ -549,9 +555,10 @@ pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Val
 
 /// JSON text of `payload` in a buffer allocated once at its exact size (a
 /// growing `Vec` would leave unwiped copies behind each reallocation) and
-/// wiped when dropped.  Copies made further down (hyper's write buffer,
-/// rustls' TLS records) are not under the control of pgpp.
-pub fn zeroizing_json(payload: &Value) -> Result<Zeroizing<Vec<u8>>> {
+/// wiped when dropped.  Used for the Vault body and for the JSON output of
+/// a rotation with `--show`.  Copies made further down (hyper's write
+/// buffer, rustls' TLS records) are not under the control of pgpp.
+pub fn zeroizing_json<T: Serialize + ?Sized>(payload: &T) -> Result<Zeroizing<Vec<u8>>> {
     struct Count(usize);
     impl Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -563,9 +570,9 @@ pub fn zeroizing_json(payload: &Value) -> Result<Zeroizing<Vec<u8>>> {
         }
     }
     let mut count = Count(0);
-    serde_json::to_writer(&mut count, payload).context("cannot serialise the Vault payload")?;
+    serde_json::to_writer(&mut count, payload).context("cannot serialise the JSON text")?;
     let mut buf = Zeroizing::new(Vec::with_capacity(count.0));
-    serde_json::to_writer(&mut *buf, payload).context("cannot serialise the Vault payload")?;
+    serde_json::to_writer(&mut *buf, payload).context("cannot serialise the JSON text")?;
     Ok(buf)
 }
 

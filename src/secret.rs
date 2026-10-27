@@ -70,6 +70,15 @@ pub fn check_shell() -> Result<()> {
 /// block pgpp.  The write is bounded by [`EXEC_WRITE_TIMEOUT`]; past it the
 /// command (still running, not reading) is killed and the delivery fails.
 /// Once the line is written, the command may run as long as it needs.
+///
+/// `sh` runs in its own process group, so that the delay kills `sh` and every
+/// sub-process it started (unless one moved to another group or session).
+/// Whatever the outcome (success, delay, write error, non-zero exit), the
+/// pipe is drained (and the bytes wiped) before returning: a sub-process
+/// that inherited stdin and outlives `sh` cannot read the password left in
+/// it.  Being in its own group, the command does not receive the `SIGINT`
+/// of a Ctrl-C typed in the terminal of pgpp, and it cannot read that
+/// terminal (`SIGTTIN`): its input is the pipe anyway.
 pub async fn run_exec(
     cmd: &str,
     password: &Secret,
@@ -113,7 +122,9 @@ async fn run_exec_with_timeout(
         .arg(cmd)
         .env("PGPP_ROLE", role)
         .stdin(Stdio::from(child_stdin))
-        .stdout(Stdio::from(std::io::stderr()));
+        .stdout(Stdio::from(std::io::stderr()))
+        // own process group, killed as a whole when the write times out
+        .process_group(0);
     match valid_until {
         Some(v) => command.env("PGPP_VALID_UNTIL", v),
         None => command.env_remove("PGPP_VALID_UNTIL"),
@@ -155,17 +166,21 @@ async fn run_exec_with_timeout(
             }
         }
     };
+    // From here on the write end is closed (owned by the dropped future).
+    // On a delay, kill the whole process group of `sh`: a sub-process it
+    // started (still holding the read end) must not read the line later.
+    if exited.is_none() && matches!(written, Written::TimedOut) {
+        kill_group(&child);
+    }
     let status = match exited {
         Some(status) => status,
-        None => {
-            if matches!(written, Written::TimedOut) {
-                // the line is not written and the command does not read it
-                let _ = child.start_kill();
-            }
-            child.wait().await
-        }
-    }
-    .context("--exec command failed")?;
+        None => child.wait().await,
+    };
+    // Drain the pipe on every path, before any error is reported: a
+    // sub-process that inherited stdin and outlives `sh` (or escaped the
+    // process group) must not find the password there.
+    let unread = unread_bytes(probe);
+    let status = status.context("--exec command failed")?;
     match written {
         Written::Failed(e) => {
             bail!("cannot write the password to the stdin of the --exec command: {e}")
@@ -180,7 +195,7 @@ async fn run_exec_with_timeout(
     if !status.success() {
         bail!("--exec command exited with {status}");
     }
-    let unread = unread_bytes(probe).context("cannot check the stdin of the --exec command")?;
+    let unread = unread.context("cannot check the stdin of the --exec command")?;
     if matches!(written, Written::Incomplete) {
         bail!(
             "--exec command exited without reading the password from its stdin \
@@ -194,6 +209,18 @@ async fn run_exec_with_timeout(
         );
     }
     Ok(())
+}
+
+/// Sends `SIGKILL` to the process group of `child` (its own group, see
+/// `process_group(0)`); nothing when `child` was already reaped.
+fn kill_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        // SAFETY: plain system call on the process group created for `sh`
+        // (its id is the pid of `sh`, not reaped yet).
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
 }
 
 /// Number of bytes still buffered in the pipe (drained and wiped).  Called
@@ -348,6 +375,77 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pgpp-{tag}-{}", std::process::id()))
+    }
+
+    /// Waits (up to 10 s) for `path` to appear.
+    async fn wait_for(path: &std::path::Path) -> bool {
+        for _ in 0..200 {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A sub-process that inherited stdin and reads it after `sh` exited
+    /// with an error finds the pipe empty: it was drained before the error.
+    #[tokio::test]
+    async fn the_pipe_is_drained_after_a_non_zero_exit() {
+        let out = temp_path("drain-exit");
+        let done = temp_path("drain-exit-done");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&done);
+        // fd 3: an asynchronous list gets /dev/null on its fd 0
+        let cmd = format!(
+            "exec 3<&0; (sleep 0.5; cat <&3 > '{}'; touch '{}') & exit 4",
+            out.display(),
+            done.display()
+        );
+        let err = exec(&cmd).await.unwrap_err();
+        assert!(format!("{err:#}").contains("exit status: 4"), "{err:#}");
+        assert!(wait_for(&done).await, "the sub-process did not finish");
+        let read = std::fs::read(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&done);
+        assert!(read.is_empty(), "password left in the pipe: {read:?}");
+    }
+
+    /// Past the write delay the whole process group of `sh` is killed, not
+    /// only `sh`; the pipe is drained as well.
+    #[tokio::test]
+    async fn the_process_group_is_killed_after_the_delay() {
+        let pidfile = temp_path("group-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let big = secret(&"p".repeat(256 * 1024));
+        let cmd = format!(
+            "exec 3<&0; sleep 30 <&3 & echo $! > '{}'; exec sleep 30",
+            pidfile.display()
+        );
+        let err = run_exec_with_timeout(&cmd, &big, "app", None, &[], Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("command killed"), "{err:#}");
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let _ = std::fs::remove_file(&pidfile);
+        let stat = format!("/proc/{}/stat", pid.trim());
+        let mut alive = true;
+        for _ in 0..100 {
+            // gone, or a zombie waiting for its new parent to reap it
+            alive = std::fs::read_to_string(&stat)
+                .ok()
+                .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().to_string()))
+                .is_some_and(|r| !r.starts_with('Z'));
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "sub-process {} survived the delay", pid.trim());
     }
 
     #[tokio::test]

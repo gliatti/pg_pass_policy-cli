@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use sqlx::{Connection, Executor, PgConnection, Row};
+use sqlx::postgres::PgRow;
+use sqlx::{Connection, Executor, PgConnection, Row, ValueRef};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::RotateOpts;
@@ -113,27 +114,47 @@ pub struct Delivery {
     pub vault: Option<(VaultConfig, VaultTarget)>,
 }
 
+/// Why [`Delivery::prepare`] refused the delivery options.  Both are
+/// reported before any connection to PostgreSQL; they differ by exit code.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// Local validation: `--vault-kv` path, Vault environment and
+    /// certificates, `sh` for `--exec` (usage error, exit code 2).
+    Invalid(anyhow::Error),
+    /// A preflight request to Vault failed: network, TLS, redirect, refused
+    /// token, HTTP status, missing write permission (exit code 1).
+    Preflight(anyhow::Error),
+}
+
+impl PrepareError {
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            PrepareError::Invalid(e) | PrepareError::Preflight(e) => e,
+        }
+    }
+}
+
 impl Delivery {
     /// Validates `--exec` and `--vault-kv` / `--vault-mount`, then checks
     /// that Vault accepts the token and lets it write the target
-    /// ([`vault::preflight`]); an error here is a usage error, reported
-    /// before any connection to PostgreSQL.
-    pub async fn prepare(opts: &RotateOpts) -> Result<Self> {
+    /// ([`vault::preflight`]), before any connection to PostgreSQL.
+    pub async fn prepare(opts: &RotateOpts) -> std::result::Result<Self, PrepareError> {
         let vault = match &opts.vault_kv {
             Some(kv) => {
-                let target = VaultTarget::parse(kv, opts.vault_mount.as_deref())?;
+                let target = VaultTarget::parse(kv, opts.vault_mount.as_deref())
+                    .map_err(PrepareError::Invalid)?;
                 if opts.vault_mount.is_some() {
                     if let Some(w) = target.repeated_mount_warning() {
                         eprintln!("pgpp: warning: {w}");
                     }
                 }
-                let cfg = VaultConfig::from_env()?;
+                let cfg = VaultConfig::from_env().map_err(PrepareError::Invalid)?;
                 Some((cfg, target))
             }
             None => None,
         };
         if opts.exec.is_some() {
-            check_shell()?;
+            check_shell().map_err(PrepareError::Invalid)?;
         }
         if let Some((cfg, target)) = &vault {
             if opts.vault_skip_preflight {
@@ -143,7 +164,10 @@ impl Delivery {
                      write, after the rotation"
                 );
             } else {
-                for w in vault::preflight(cfg, target).await? {
+                let warnings = vault::preflight(cfg, target)
+                    .await
+                    .map_err(PrepareError::Preflight)?;
+                for w in warnings {
                     eprintln!("pgpp: warning: {w}");
                 }
             }
@@ -179,6 +203,16 @@ impl Rotation {
     fn set_valid_until(&mut self, read: Option<Option<String>>) {
         self.valid_until_known = read.is_some();
         self.valid_until = read.flatten();
+    }
+
+    /// `valid_until` in table format: empty for an unbounded role,
+    /// `(unknown)` when the value could not be read after the rotation.
+    fn valid_until_display(&self) -> &str {
+        if self.valid_until_known {
+            self.valid_until.as_deref().unwrap_or("")
+        } else {
+            "(unknown)"
+        }
     }
 
     /// Value of `PGPP_VALID_UNTIL`: empty for an unbounded role, unset when
@@ -248,9 +282,11 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
                 delivered_to: &delivered,
                 password: show.then_some(password.as_str()),
             };
-            let mut text = serde_json::to_string(&out)?;
-            println!("{text}");
-            text.zeroize();
+            // exact-size, wiped buffer (no reallocation copies of the
+            // password with --show), written past the stdout buffer
+            let mut text = vault::zeroizing_json(&out)?;
+            text.push(b'\n');
+            write_stdout_unbuffered(&text)?;
         }
         Format::Table => {
             if let Some(p) = &rot.pair {
@@ -266,12 +302,16 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
                     rot.previous_valid_until.as_deref().unwrap_or("")
                 );
             }
-            println!("valid_until: {}", rot.valid_until.as_deref().unwrap_or(""));
+            println!("valid_until: {}", rot.valid_until_display());
             if !delivered.is_empty() {
                 println!("delivered_to: {}", delivered.join(", "));
             }
             if show {
-                println!("password: {}", password.as_str());
+                let mut line = Zeroizing::new(Vec::with_capacity(password.len() + 11));
+                line.extend_from_slice(b"password: ");
+                line.extend_from_slice(password.as_bytes());
+                line.push(b'\n');
+                write_stdout_unbuffered(&line)?;
             } else if failures.is_empty() {
                 println!("password: (not shown; use --show to print it)");
             } else {
@@ -290,6 +330,42 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
     }
 }
 
+/// Writes `bytes` to the standard output without going through the buffer of
+/// `std::io::stdout()` (which would keep an unwiped copy of a password): the
+/// buffer is flushed first, then the bytes go to a duplicate of descriptor 1.
+fn write_stdout_unbuffered(bytes: &[u8]) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    lock.flush()
+        .context("cannot write to the standard output")?;
+    let fd = lock
+        .as_fd()
+        .try_clone_to_owned()
+        .context("cannot write to the standard output")?;
+    std::fs::File::from(fd)
+        .write_all(bytes)
+        .context("cannot write to the standard output")
+}
+
+/// Copies a text column holding a password straight from the raw value of
+/// the row into a [`Secret`] allocated at its exact size; a NULL is an
+/// error.  The row itself (and the receive buffer of sqlx it was cut from)
+/// is not wiped: see the README, « Limite de cet effacement ».
+fn secret_column(row: &PgRow, index: usize) -> Result<Secret> {
+    let raw = row
+        .try_get_raw(index)
+        .context("cannot read the generated password")?;
+    if raw.is_null() {
+        bail!("the server returned no password");
+    }
+    let text = raw
+        .as_str()
+        .map_err(|e| anyhow::anyhow!("cannot read the generated password: {e}"))?;
+    let mut secret = Zeroizing::new(String::with_capacity(text.len()));
+    secret.push_str(text);
+    Ok(secret)
+}
+
 pub async fn rotate(
     conn: &mut PgConnection,
     role: &str,
@@ -301,7 +377,7 @@ pub async fn rotate(
         .bind(opts.length)
         .fetch_one(&mut *conn)
         .await?;
-    let password: Secret = Zeroizing::new(row.get::<String, _>(0));
+    let password = secret_column(&row, 0)?;
     drop(row);
     let mut rot = Rotation {
         role: role.to_string(),
@@ -326,7 +402,7 @@ pub async fn switch_pair(
     .fetch_one(&mut *conn)
     .await?;
     let active: String = row.get(0);
-    let password: Secret = Zeroizing::new(row.get::<String, _>(1));
+    let password = secret_column(&row, 1)?;
     let previous_role: Option<String> = row.get(2);
     let previous_valid_until: Option<String> = row.get(3);
     drop(row);
@@ -876,5 +952,41 @@ mod tests {
         assert_eq!(unknown["valid_until_known"], false);
         assert_eq!(env, None);
         assert!(unknown.get("password").is_none());
+    }
+
+    #[test]
+    fn table_shows_an_unknown_valid_until() {
+        let display = |read: Option<Option<String>>| {
+            let mut rot = Rotation::default();
+            rot.set_valid_until(read);
+            rot.valid_until_display().to_string()
+        };
+        assert_eq!(display(Some(Some("infinity".into()))), "infinity");
+        assert_eq!(display(Some(None)), "", "unbounded");
+        assert_eq!(display(None), "(unknown)", "read failed");
+    }
+
+    #[test]
+    fn json_output_with_the_password_is_serialised_at_its_exact_size() {
+        let mut rot = Rotation {
+            role: "app".into(),
+            ..Rotation::default()
+        };
+        rot.set_valid_until(None);
+        let password = "pw-é\"x".repeat(100);
+        let out = RotationOutput {
+            rotation: &rot,
+            delivered_to: &["exec", "vault"],
+            password: Some(&password),
+        };
+        let text = vault::zeroizing_json(&out).unwrap();
+        assert_eq!(text.capacity(), text.len(), "no reallocation");
+        assert_eq!(
+            text.as_slice(),
+            serde_json::to_vec(&out).unwrap().as_slice()
+        );
+        let v: Value = serde_json::from_slice(&text).unwrap();
+        assert_eq!(v["password"], password.as_str());
+        assert_eq!(v["valid_until_known"], false);
     }
 }

@@ -9,6 +9,11 @@ use serde_json::{Map, Value};
 /// else stays a string (intervals such as `"30 days"`).  The keywords
 /// (`true`/`false`, `on`/`off`, `yes`/`no`, `null`) are case-insensitive, as
 /// in PostgreSQL (`TRUE`, `Off`, `NULL`).  A string is passed unchanged.
+///
+/// A value between double quotes is always a string, without the quotes
+/// and without any other processing (no escape sequence, inner blanks
+/// kept): `max_age="90"` sends the string `"90"` where `max_age=90` sends
+/// the number 90, and `"null"` / `"true"` stay strings.
 pub fn parse_kv(item: &str) -> Result<(String, Value)> {
     let Some((key, value)) = item.split_once('=') else {
         bail!("invalid setting \"{item}\": expected KEY=VALUE");
@@ -22,6 +27,9 @@ pub fn parse_kv(item: &str) -> Result<(String, Value)> {
         bail!("invalid setting key \"{key}\": expected a lower-case profile column name");
     }
     let value = value.trim();
+    if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return Ok((key.to_string(), Value::String(inner.to_string())));
+    }
     let json = match value.to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" => Value::Bool(true),
         "false" | "off" | "no" => Value::Bool(false),
@@ -93,6 +101,27 @@ mod tests {
         ] {
             assert_eq!(parse_kv(item).unwrap().1, expected, "{item}");
         }
+    }
+
+    #[test]
+    fn a_quoted_value_is_always_a_string() {
+        for (item, expected) in [
+            ("max_age=\"90\"", json!("90")),
+            ("max_age = \"90\" ", json!("90")),
+            ("reject_username=\"true\"", json!("true")),
+            ("max_age=\"null\"", json!("null")),
+            ("max_age=\" 30 days \"", json!(" 30 days ")),
+            ("max_age=\"\"", json!("")),
+            // no escape processing: inner quotes are kept
+            ("max_age=\"a\"b\"", json!("a\"b")),
+            // a lone or unbalanced quote is an ordinary string
+            ("max_age=\"", json!("\"")),
+            ("max_age=\"90", json!("\"90")),
+            ("max_age=90\"", json!("90\"")),
+        ] {
+            assert_eq!(parse_kv(item).unwrap().1, expected, "{item}");
+        }
+        assert_eq!(parse_kv("max_age=90").unwrap().1, json!(90));
     }
 
     #[test]

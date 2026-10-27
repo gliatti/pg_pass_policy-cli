@@ -146,14 +146,16 @@ async fn rotate_show_returns_a_working_password() {
     assert_eq!(st[0]["status"], "ok");
 }
 
-/// Asserts that a refused rotation did not happen: exit 2, nothing that looks
-/// like a password on stdout, no `password_rotated` event for the role.
-fn assert_refused_before_rotation(url: &str, role: &str, out: Output) {
+/// Asserts that a refused rotation did not happen: exit `code` (2 for a
+/// local validation error, 1 for a failed Vault preflight request), nothing
+/// that looks like a password on stdout, no `password_rotated` event for the
+/// role.
+fn assert_refused_before_rotation_with(url: &str, role: &str, out: Output, code: i32) {
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(
         out.status.code(),
-        Some(2),
+        Some(code),
         "stdout: {stdout}\nstderr: {stderr}"
     );
     assert!(!stdout.contains("password"), "{stdout}");
@@ -163,6 +165,11 @@ fn assert_refused_before_rotation(url: &str, role: &str, out: Output) {
         &["audit", "--role", role, "--type", "password_rotated"],
     );
     assert_eq!(audit, serde_json::json!([]), "no rotation for {role}");
+}
+
+/// [`assert_refused_before_rotation_with`] for a usage error (exit 2).
+fn assert_refused_before_rotation(url: &str, role: &str, out: Output) {
+    assert_refused_before_rotation_with(url, role, out, 2);
 }
 
 #[tokio::test]
@@ -487,7 +494,8 @@ async fn vault_preflight_failure_rotates_nothing() {
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         assert!(stderr.contains(expected), "{addr}: {stderr}");
         assert!(!stderr.contains("t-expired"), "{stderr}");
-        assert_refused_before_rotation(&url, "pgpp_t_vpre", out);
+        // a failed preflight request is not a usage error
+        assert_refused_before_rotation_with(&url, "pgpp_t_vpre", out, 1);
     }
     assert_eq!(lookup.hits_async().await, 1);
     assert_eq!(denied_lookup.hits_async().await, 1);
@@ -549,7 +557,7 @@ async fn vault_token_without_introspection_still_rotates() {
     let out = rotate(&[], None);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(stderr.contains("--vault-skip-preflight"), "{stderr}");
-    assert_refused_before_rotation(&url, "pgpp_t_vnodef", out);
+    assert_refused_before_rotation_with(&url, "pgpp_t_vnodef", out, 1);
     assert_eq!(introspection.hits_async().await, 1, "stops at lookup-self");
     assert_eq!(write.hits_async().await, 0);
 
@@ -590,7 +598,7 @@ async fn vault_token_without_introspection_still_rotates() {
 
     // a falsy value keeps the preflight: refused, no further rotation
     let out = rotate(&[], Some("0"));
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert_eq!(rotations(), before + 3);
     assert_eq!(introspection.hits_async().await, 2);
@@ -1385,19 +1393,20 @@ async fn repeated_vault_mount_is_warned_about() {
     };
     let out = run("kv/app");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("warning") && stderr.contains("kv/data/kv/app"),
         "{stderr}"
     );
     let out = run("app");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(!stderr.contains("starts with the mount"), "{stderr}");
     assert_eq!(lookup.hits_async().await, 2);
 }
 
-/// The Vault token preflight also runs before the PostgreSQL connection.
+/// The Vault token preflight also runs before the PostgreSQL connection.  A
+/// failed preflight request is not a usage error: exit code 1.
 #[tokio::test]
 async fn vault_token_refused_before_connecting() {
     let server = MockServer::start_async().await;
@@ -1409,7 +1418,7 @@ async fn vault_token_refused_before_connecting() {
         .await;
     let out = rotate_against_vault(&server);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("401") && stderr.contains("VAULT_TOKEN"),
         "{stderr}"
@@ -1436,7 +1445,7 @@ async fn vault_token_refused_before_connecting() {
         .await;
     let out = rotate_against_vault(&server);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("403") && stderr.contains("VAULT_TOKEN"),
         "{stderr}"
@@ -1444,6 +1453,46 @@ async fn vault_token_refused_before_connecting() {
     assert!(!stderr.contains("cannot connect"), "{stderr}");
     lookup.assert_async().await;
     assert_eq!(caps.hits_async().await, 0);
+}
+
+/// A Vault that cannot be reached, or that answers 5xx, during the preflight
+/// exits with 1 (not a usage error), before the PostgreSQL connection.
+#[tokio::test]
+async fn failed_vault_preflight_request_exits_with_1() {
+    let run = |addr: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pgpp"))
+            .args(["rotate", "x", "--vault-kv", "secret/app"])
+            .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+            .env("VAULT_ADDR", addr)
+            .env("VAULT_TOKEN", "t-preflight")
+            .env_remove("VAULT_NAMESPACE")
+            .env_remove("VAULT_CACERT")
+            .env_remove("VAULT_CAPATH")
+            .env_remove("PGPP_VAULT_SKIP_PREFLIGHT")
+            .output()
+            .unwrap()
+    };
+    // nothing listens on port 9: network error
+    let out = run("http://127.0.0.1:9");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("preflight request"), "{stderr}");
+    assert!(!stderr.contains("cannot connect"), "{stderr}");
+    // 503 on lookup-self
+    let server = MockServer::start_async().await;
+    let lookup = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(503);
+        })
+        .await;
+    let out = run(&server.base_url());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("503"), "{stderr}");
+    assert!(!stderr.contains("cannot connect"), "{stderr}");
+    assert!(!stderr.contains("t-preflight"), "{stderr}");
+    lookup.assert_async().await;
 }
 
 #[test]
