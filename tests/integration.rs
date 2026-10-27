@@ -782,7 +782,11 @@ async fn profile_create_assign_unassign_drop() {
             "min_length=2",
         ],
     );
-    assert_eq!(dup.status.code(), Some(1));
+    assert_eq!(
+        dup.status.code(),
+        Some(2),
+        "a repeated key is a usage error"
+    );
     assert!(String::from_utf8_lossy(&dup.stderr).contains("given twice"));
 }
 
@@ -915,7 +919,7 @@ async fn check_reads_password_from_stdin() {
     assert_eq!(v["ok"], true, "CRLF stripped: {v}");
 
     let (code, _) = check_with_stdin(&url, "pgpp_t_chk", "", false);
-    assert_eq!(code, 1, "an empty password is an error, not a refusal");
+    assert_eq!(code, 2, "an empty password is a usage error, not a refusal");
     let (code, _) = check_with_stdin("postgres://u@127.0.0.1:9/db", "pgpp_t_chk", "x", false);
     assert_eq!(code, 1, "a connection failure is an error, not a refusal");
 }
@@ -978,6 +982,72 @@ async fn switch_pair_rotates_the_inactive_role() {
         .unwrap()
         .iter()
         .any(|e| e["details"]["pair"] == "pgpp_t_pair"));
+}
+
+/// `expiring` sorts by the timestamp, not by its text.  sqlx forces
+/// `DateStyle = ISO` and `TimeZone = UTC` in the startup packet (they win
+/// over PGOPTIONS), so the text order differs from the time order only from
+/// year 10000 on: "10026-..." sorts before "2026-..." as text.  A huge
+/// `warn_before` puts both roles in the `warning` state.
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn expiring_sorts_by_time_not_by_text() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    let roles = [("pgpp_t_exp_a", "1 day"), ("pgpp_t_exp_b", "8000 years")];
+    for (role, max_age) in roles {
+        let profile = format!("{role}_p");
+        fresh_login_role(&mut conn, role).await;
+        exec_lenient(
+            &mut conn,
+            &format!("SELECT pass_policy.drop_profile('{profile}')"),
+        )
+        .await;
+        let max_age = format!("max_age={max_age}");
+        run_ok(
+            &url,
+            &[
+                "profile",
+                "create",
+                &profile,
+                "--set",
+                &max_age,
+                "--set",
+                "warn_before=9000 years",
+            ],
+        );
+        run_ok(&url, &["profile", "assign", role, &profile]);
+        run_ok(&url, &["rotate", role, "--exec", "cat >/dev/null"]);
+    }
+
+    let v = run_json(&url, &["expiring"]);
+    let ours: Vec<&Value> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["role_name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("pgpp_t_exp_"))
+        })
+        .collect();
+    let names: Vec<&str> = ours
+        .iter()
+        .map(|r| r["role_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["pgpp_t_exp_a", "pgpp_t_exp_b"], "{v}");
+    let a = ours[0]["expires_at"].as_str().unwrap();
+    let b = ours[1]["expires_at"].as_str().unwrap();
+    assert!(
+        a > b,
+        "the fixture must sort the other way as text: {a} / {b}"
+    );
+
+    for (role, _) in roles {
+        run_ok(&url, &["profile", "unassign", role]);
+        run_ok(&url, &["profile", "drop", &format!("{role}_p")]);
+        exec_lenient(&mut conn, &format!("DROP ROLE IF EXISTS {role}")).await;
+    }
 }
 
 #[tokio::test]
@@ -1105,20 +1175,74 @@ fn usage_errors_exit_with_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     for args in [
+        vec!["lock", "x", "--for", "0s"],
+        vec!["expiring", "--within", "0d"],
+        vec!["audit", "--since", "0m0s"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("greater than zero"),
+            "{args:?}"
+        );
+    }
+    for args in [
         vec!["rotate", "x"],
         vec!["switch-pair", "x", "--length", "20"],
         vec!["audit", "--limit", "0"],
         vec!["profile", "create", "p", "--set", "nokv"],
         vec!["profile", "alter", "p"],
+        // a repeated key is refused before the connection
+        vec![
+            "profile",
+            "create",
+            "p",
+            "--set",
+            "min_length=1",
+            "--set",
+            "min_length=2",
+        ],
+        vec![
+            "profile",
+            "alter",
+            "p",
+            "--set",
+            "max_age=null",
+            "--set",
+            "max_age=1 day",
+        ],
+        // empty password for check (stdin is /dev/null)
+        vec!["check", "x"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
             .args(&args)
             .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+            .stdin(Stdio::null())
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!stderr.contains("cannot connect"), "{args:?}: {stderr}");
+    }
+    // check: an empty first line (or invalid UTF-8) is refused before the
+    // connection too
+    for input in [&b"\n"[..], b"\r\nrest\n", b"\xff\xfe\n"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+            .args(["check", "x"])
+            .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{input:?}: {stderr}");
+        assert!(!stderr.contains("cannot connect"), "{input:?}: {stderr}");
     }
     let out = Command::new(env!("CARGO_BIN_EXE_pgpp"))
         .args(["rotate", "--help"])

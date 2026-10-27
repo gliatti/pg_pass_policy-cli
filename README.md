@@ -64,13 +64,14 @@ les listes sont des tableaux d'objets et les actions renvoient un objet
 |---|---|
 | 0 | succès (pour `check` : mot de passe conforme) |
 | 1 | erreur (base injoignable, réseau, refus de l'extension, échec de remise du mot de passe après rotation) |
-| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé (401 ou 403, y compris un jeton expiré, révoqué ou inconnu) ou sans droit d'écriture sur le chemin, Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation (sauf la validité du jeton avec `--vault-skip-preflight`, voir « Intégration HashiCorp Vault ») |
+| 2 | erreur d'usage : option inconnue, durée invalide ou nulle, `--set` invalide ou clé répétée, `--limit` < 1, mot de passe de `check` vide ou illisible, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé (401 ou 403, y compris un jeton expiré, révoqué ou inconnu) ou sans droit d'écriture sur le chemin, Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation (sauf la validité du jeton avec `--vault-skip-preflight`, voir « Intégration HashiCorp Vault ») |
 | 3 | mot de passe refusé par `check` (motif `PPP-xxx`) |
 
 Les durées (`--within`, `--for`, `--since`) s'écrivent `45s`, `30m`, `12h`,
-`14d`, `2w`, ou combinées (`1h30m`). L'unité est obligatoire et le total est
-borné à 100 ans (`36500d`) : au-delà, la durée est refusée (code 2) au lieu
-d'être tronquée en silence.
+`14d`, `2w`, ou combinées (`1h30m`). L'unité est obligatoire, une durée
+nulle (`0s`, `0d0h`) est refusée (code 2) et le total est borné à 100 ans
+(`36500d`) : au-delà, la durée est refusée (code 2) au lieu d'être tronquée
+en silence.
 
 ## Commandes
 
@@ -124,7 +125,8 @@ Politique d'affichage :
   n'est pas affiché sauf `--show`, le code de retour est 1 et le message
   invite à relancer la rotation ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
-  coupée), un avertissement est émis, `valid_until` reste vide et la remise a
+  coupée), un avertissement est émis, `valid_until` reste vide (`null` en
+  JSON), `PGPP_VALID_UNTIL` n'est pas définie pour `--exec` et la remise a
   lieu quand même : le mot de passe n'est jamais perdu de ce fait.
 
 ### Rotation sans coupure d'une paire
@@ -154,11 +156,12 @@ pgpp unlock app_user               # déverrouille et remet le compteur d'échec
 pgpp expire app_user               # must_change + VALID UNTIL now()
 ```
 
-`lock` lit la fin du verrouillage dans `v_role_status` et `locked` lit la
-vue `v_locked` : toutes deux joignent `pass_policy.role_state` par l'OID du
-rôle. La colonne `role_name` de `role_state` n'est en effet mise à jour qu'au
-passage suivant de la maintenance après un `ALTER ROLE … RENAME` ; avec une
-version de l'extension antérieure à cette jointure (vue jointe par nom),
+`lock` affiche la fin du verrouillage renvoyée par `lock_role()`
+(`infinity` pour un verrouillage manuel) et `locked` lit la vue `v_locked`,
+qui joint `pass_policy.role_state` par l'OID du rôle. La colonne `role_name`
+de `role_state` n'est en effet mise à jour qu'au passage suivant de la
+maintenance après un `ALTER ROLE … RENAME` ; avec une version de l'extension
+antérieure à cette jointure (vue jointe par nom),
 `pgpp locked` laisse `locked_by` et `lock_reason` vides pour un rôle renommé
 jusqu'à ce passage.
 
@@ -212,7 +215,9 @@ attendre la fin de l'entrée ; le `\n` ou `\r\n` final est retiré) ou demandé
 sans écho sur un terminal, puis envoyé en paramètre lié à
 `pass_policy.check_password(role, password)`. Code 0 si conforme, 3 avec le
 motif `PPP-xxx` sinon ; le code 1 est réservé aux erreurs (base injoignable,
-entrée vide), ce qui permet à un script de distinguer un refus d'une panne.
+erreur de l'extension), ce qui permet à un script de distinguer un refus d'une
+panne. Le mot de passe est lu avant la connexion : une première ligne vide ou
+qui n'est pas de l'UTF-8 valide sort avec le code 2 sans se connecter.
 Il n'est jamais passé en argument de ligne de commande.
 
 Journal du serveur : un paramètre lié n'apparaît pas dans le texte de la
@@ -260,7 +265,8 @@ déverrouillages automatiques, purge des rôles disparus.
 ## Intégration `--exec`
 
 Le mot de passe est écrit sur l'entrée standard du processus lancé par
-`sh -c CMD`, suivi d'un saut de ligne, puis l'entrée est fermée. La sortie
+`sh -c -- CMD` (le `--` évite qu'une commande commençant par `-` soit prise
+pour une option de `sh`), suivi d'un saut de ligne, puis l'entrée est fermée. La sortie
 standard du hook est renvoyée sur la sortie d'erreur de `pgpp` (sa sortie
 d'erreur aussi, inchangée) : elle ne se mélange jamais au résultat de `pgpp`,
 en particulier au JSON de `-f json`. Il n'est
@@ -272,7 +278,7 @@ variables suivantes :
 | variable | contenu |
 |---|---|
 | `PGPP_ROLE` | rôle dont le mot de passe vient d'être changé (rôle actif pour `switch-pair`) |
-| `PGPP_VALID_UNTIL` | nouveau `rolvaliduntil` (texte PostgreSQL, vide si illimité) |
+| `PGPP_VALID_UNTIL` | nouveau `rolvaliduntil` (texte PostgreSQL, vide si illimité ; non définie si sa relecture a échoué après la rotation, même si `pgpp` en a hérité une) |
 | `PGPP_PAIR`, `PGPP_PREVIOUS_ROLE` | uniquement pour `switch-pair` |
 
 Sont des erreurs de remise (code 1, `delivered_to` sans `exec`) : un code de

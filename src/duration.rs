@@ -15,7 +15,8 @@ pub const MAX_DURATION_SECS: u64 = 36_500 * 86_400;
 /// Units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
 /// Groups may be concatenated (`1h30m`, `1d12h`) or separated by spaces.
 /// A bare number is refused: the unit is mandatory to avoid ambiguity.
-/// The total is bounded by [`MAX_DURATION_SECS`] (100 years).
+/// The total must be positive (`0s` is refused) and is bounded by
+/// [`MAX_DURATION_SECS`] (100 years).
 pub fn parse_duration(input: &str) -> Result<Duration> {
     let s = input.trim();
     if s.is_empty() {
@@ -61,6 +62,9 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
     }
     if !seen_group {
         bail!("invalid duration \"{input}\"");
+    }
+    if total == 0 {
+        bail!("invalid duration \"{input}\": must be greater than zero");
     }
     if total > MAX_DURATION_SECS {
         bail!("invalid duration \"{input}\": at most 36500d (100 years)");
@@ -115,7 +119,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_values() {
-        for bad in ["", "14", "d", "14x", "1h30", "abc", "-5m", "1.5h"] {
+        for bad in [
+            "", "14", "d", "14x", "1h30", "abc", "-5m", "1.5h", "0s", "0d0h", "00m",
+        ] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be refused");
         }
     }

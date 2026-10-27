@@ -34,6 +34,10 @@ pub fn check_shell() -> Result<()> {
 /// environment variable.  The child inherits the whole environment of pgpp
 /// (hence VAULT_ADDR / VAULT_TOKEN, DATABASE_URL, PG*...) and receives in
 /// addition `PGPP_ROLE`, `PGPP_VALID_UNTIL` and the extra variables given.
+/// `valid_until` is `Some("")` for an unbounded role and `None` when the
+/// value is unknown (read failed after the rotation): `PGPP_VALID_UNTIL` is
+/// then left unset, even if pgpp itself inherited one.  `--` ends the options
+/// of `sh`, so that a command starting with `-` is not taken for one.
 /// Its standard output is sent to the standard error of pgpp, so that it
 /// never mixes with the result printed by pgpp (JSON with `-f json`).
 ///
@@ -63,11 +67,15 @@ pub async fn run_exec(
     let mut command = Command::new("sh");
     command
         .arg("-c")
+        .arg("--")
         .arg(cmd)
         .env("PGPP_ROLE", role)
-        .env("PGPP_VALID_UNTIL", valid_until.unwrap_or(""))
         .stdin(Stdio::from(child_stdin))
         .stdout(Stdio::from(std::io::stderr()));
+    match valid_until {
+        Some(v) => command.env("PGPP_VALID_UNTIL", v),
+        None => command.env_remove("PGPP_VALID_UNTIL"),
+    };
     for (k, v) in extra_env {
         command.env(k, v);
     }
@@ -159,6 +167,42 @@ mod tests {
             );
             assert!(!text.contains("pw-Test-123"), "{cmd}: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_command_starting_with_a_dash_is_not_an_option_of_sh() {
+        // without `--`, sh would reject "-pgpp..." as an invalid option
+        exec("-pgpp-no-such-command 2>/dev/null; cat >/dev/null")
+            .await
+            .unwrap_or_else(|e| panic!("{e:#}"));
+    }
+
+    #[tokio::test]
+    async fn valid_until_is_unset_when_unknown() {
+        let pw = secret("pw-Test-123");
+        let set = "cat >/dev/null; test \"${PGPP_VALID_UNTIL+set}\" = set";
+        let unset = "cat >/dev/null; test -z \"${PGPP_VALID_UNTIL+set}\"";
+        // unbounded role: set and empty
+        run_exec(
+            &format!("{set} && test -z \"$PGPP_VALID_UNTIL\""),
+            &pw,
+            "app",
+            Some(""),
+            &[],
+        )
+        .await
+        .unwrap();
+        run_exec(
+            &format!("{set} && test \"$PGPP_VALID_UNTIL\" = infinity"),
+            &pw,
+            "app",
+            Some("infinity"),
+            &[],
+        )
+        .await
+        .unwrap();
+        // unknown: unset
+        run_exec(unset, &pw, "app", None, &[]).await.unwrap();
     }
 
     #[tokio::test]

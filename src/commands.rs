@@ -11,25 +11,28 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sqlx::{Connection, Executor, PgConnection, Row};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::RotateOpts;
 use crate::duration::to_pg_interval;
-use crate::kv::parse_settings;
 use crate::output::{print_message, print_record, Format, ResultSet};
 use crate::secret::{check_shell, run_exec, Secret};
 use crate::vault::{self, build_payload, write_secret, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
 
-const STATUS_COLUMNS: &str = "role_name, profile, password_changed_at::text, expires_at::text, \
-     grace_until::text, days_left, locked_until::text, failed_count, status";
+/// Columns of `v_role_status`, read through the alias `v`.  The ORDER BY
+/// clauses must name `v.<column>`: an unqualified `expires_at` would resolve
+/// to the output column `expires_at::text` and sort as text.
+const STATUS_COLUMNS: &str = "v.role_name, v.profile, v.password_changed_at::text, \
+     v.expires_at::text, v.grace_until::text, v.days_left, v.locked_until::text, \
+     v.failed_count, v.status";
 
 pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) -> Result<()> {
     let sql = format!(
-        "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status \
-         WHERE $1::text IS NULL OR role_name = $1 ORDER BY role_name"
+        "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
+         WHERE $1::text IS NULL OR v.role_name = $1 ORDER BY v.role_name"
     );
     let rows = sqlx::query(&sql).bind(role).fetch_all(conn).await?;
     if rows.is_empty() {
@@ -47,10 +50,11 @@ pub async fn expiring(
     fmt: Format,
 ) -> Result<()> {
     let sql = format!(
-        "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status \
-         WHERE status IN ('warning', 'grace', 'expired') \
-            OR ($1::interval IS NOT NULL AND expires_at IS NOT NULL AND expires_at <= now() + $1) \
-         ORDER BY expires_at NULLS LAST, role_name"
+        "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
+         WHERE v.status IN ('warning', 'grace', 'expired') \
+            OR ($1::interval IS NOT NULL AND v.expires_at IS NOT NULL \
+                AND v.expires_at <= now() + $1) \
+         ORDER BY v.expires_at NULLS LAST, v.role_name"
     );
     let rows = sqlx::query(&sql)
         .bind(within.map(to_pg_interval).transpose()?)
@@ -86,9 +90,10 @@ async fn valid_until(conn: &mut PgConnection, role: &str) -> Result<Option<Strin
 
 /// Reads `rolvaliduntil` after a rotation; never fatal, since the password is
 /// already committed server-side and must reach `deliver()` whatever happens.
-async fn valid_until_after_rotation(conn: &mut PgConnection, role: &str) -> Option<String> {
+/// `None` when the read failed, `Some(None)` when the role is unbounded.
+async fn valid_until_after_rotation(conn: &mut PgConnection, role: &str) -> Option<Option<String>> {
     match valid_until(conn, role).await {
-        Ok(v) => v,
+        Ok(v) => Some(v),
         Err(e) => {
             eprintln!("pgpp: warning: password rotated but rolvaliduntil could not be read: {e:#}");
             None
@@ -158,6 +163,24 @@ struct Rotation {
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_valid_until: Option<String>,
     valid_until: Option<String>,
+    /// false when `rolvaliduntil` could not be read after the rotation
+    /// (`valid_until` is then None although the role may be bounded)
+    #[serde(skip)]
+    valid_until_read: bool,
+}
+
+impl Rotation {
+    fn set_valid_until(&mut self, read: Option<Option<String>>) {
+        self.valid_until_read = read.is_some();
+        self.valid_until = read.flatten();
+    }
+
+    /// Value of `PGPP_VALID_UNTIL`: empty for an unbounded role, unset when
+    /// the value could not be read.
+    fn valid_until_env(&self) -> Option<&str> {
+        self.valid_until_read
+            .then(|| self.valid_until.as_deref().unwrap_or(""))
+    }
 }
 
 #[derive(Serialize)]
@@ -205,15 +228,7 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
         if let Some(p) = &rot.previous_role {
             extra.push(("PGPP_PREVIOUS_ROLE", p.as_str()));
         }
-        match run_exec(
-            cmd,
-            &password,
-            &rot.role,
-            rot.valid_until.as_deref(),
-            &extra,
-        )
-        .await
-        {
+        match run_exec(cmd, &password, &rot.role, rot.valid_until_env(), &extra).await {
             Ok(()) => delivered.push("exec"),
             Err(e) => failures.push(format!("--exec delivery failed: {e:#}")),
         }
@@ -286,11 +301,11 @@ pub async fn rotate(
         .await?;
     let password: Secret = Zeroizing::new(row.get::<String, _>(0));
     drop(row);
-    let rot = Rotation {
+    let mut rot = Rotation {
         role: role.to_string(),
-        valid_until: valid_until_after_rotation(conn, role).await,
         ..Rotation::default()
     };
+    rot.set_valid_until(valid_until_after_rotation(conn, role).await);
     deliver(&rot, password, &opts, fmt).await
 }
 
@@ -313,13 +328,15 @@ pub async fn switch_pair(
     let previous_role: Option<String> = row.get(2);
     let previous_valid_until: Option<String> = row.get(3);
     drop(row);
-    let rot = Rotation {
-        valid_until: valid_until_after_rotation(conn, &active).await,
+    let read = valid_until_after_rotation(conn, &active).await;
+    let mut rot = Rotation {
         role: active,
         pair: Some(pair.to_string()),
         previous_role,
         previous_valid_until,
+        ..Rotation::default()
     };
+    rot.set_valid_until(read);
     deliver(&rot, password, &opts, fmt).await
 }
 
@@ -330,26 +347,17 @@ pub async fn lock(
     reason: Option<&str>,
     fmt: Format,
 ) -> Result<()> {
-    sqlx::query("SELECT pass_policy.lock_role($1::name, $2::interval, $3::text)")
-        .bind(role)
-        .bind(duration.map(to_pg_interval).transpose()?)
-        .bind(reason)
-        .execute(&mut *conn)
-        .await?;
-    // locked_until is read from v_role_status, which joins role_state by
-    // OID (robust to ALTER ROLE ... RENAME).  The return value of lock_role()
-    // is not used yet: older versions of the extension return void.
-    let until: Option<String> = sqlx::query(
-        "SELECT locked_until::text FROM pass_policy.v_role_status WHERE role_name = $1",
-    )
-    .bind(role)
-    .fetch_optional(conn)
-    .await?
-    .and_then(|r| r.get(0));
+    // lock_role() returns the end of the lock (infinity for a manual lock)
+    let until: Option<String> =
+        sqlx::query_scalar("SELECT pass_policy.lock_role($1::name, $2::interval, $3::text)::text")
+            .bind(role)
+            .bind(duration.map(to_pg_interval).transpose()?)
+            .bind(reason)
+            .fetch_one(conn)
+            .await?;
     let text = match until.as_deref() {
         Some("infinity") => format!("role \"{role}\" locked until manual unlock"),
         Some(u) => format!("role \"{role}\" locked until {u}"),
-        // not a login role (absent from v_role_status): end unknown here
         None => format!("role \"{role}\" locked"),
     };
     print_message(
@@ -420,10 +428,10 @@ pub async fn profile_show(conn: &mut PgConnection, name: &str, fmt: Format) -> R
 pub async fn profile_create(
     conn: &mut PgConnection,
     name: &str,
-    set: &[(String, Value)],
+    settings: Map<String, Value>,
     fmt: Format,
 ) -> Result<()> {
-    let settings = Value::Object(parse_settings(set)?);
+    let settings = Value::Object(settings);
     let id: i32 = sqlx::query("SELECT pass_policy.create_profile($1::text, $2::jsonb)")
         .bind(name)
         .bind(&settings)
@@ -441,10 +449,10 @@ pub async fn profile_create(
 pub async fn profile_alter(
     conn: &mut PgConnection,
     name: &str,
-    set: &[(String, Value)],
+    settings: Map<String, Value>,
     fmt: Format,
 ) -> Result<()> {
-    let settings = Value::Object(parse_settings(set)?);
+    let settings = Value::Object(settings);
     sqlx::query("SELECT pass_policy.alter_profile($1::text, $2::jsonb)")
         .bind(name)
         .bind(&settings)
@@ -528,6 +536,17 @@ pub async fn audit(
     .await?;
     ResultSet::from_rows(&rows)?.print(fmt, "no audit event");
     Ok(())
+}
+
+/// Reads the candidate password of `check` (before the connection): prompted
+/// without echo on a terminal, otherwise the first line of stdin.  An empty
+/// password is an error.
+pub fn read_candidate_password() -> Result<Secret> {
+    let password = read_password()?;
+    if password.is_empty() {
+        bail!("empty password");
+    }
+    Ok(password)
 }
 
 /// Reads the candidate password: prompted without echo on a terminal,
@@ -686,11 +705,13 @@ async fn mask_parameters(tx: &mut PgConnection) -> Result<()> {
 
 /// Returns the exit code: 0 when the password complies, 3 when refused
 /// (1 is left to real errors so that scripts can tell them apart).
-pub async fn check(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<i32> {
-    let password = read_password()?;
-    if password.is_empty() {
-        bail!("empty password");
-    }
+/// `password` comes from [`read_candidate_password`].
+pub async fn check(
+    conn: &mut PgConnection,
+    role: &str,
+    password: Secret,
+    fmt: Format,
+) -> Result<i32> {
     let mut tx = conn.begin().await?;
     mask_parameters(&mut tx).await?;
     let row = sqlx::query("SELECT pass_policy.check_password($1::text, $2::text)")

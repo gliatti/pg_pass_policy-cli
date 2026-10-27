@@ -71,9 +71,36 @@ async fn prepare_delivery(opts: &RotateOpts) -> Option<Delivery> {
     }
 }
 
+/// Prints a usage error detected before the connection and returns its exit
+/// code.
+fn usage_error(err: &anyhow::Error) -> i32 {
+    eprintln!("pgpp: error: {}", format_error(err));
+    EXIT_USAGE
+}
+
 /// Executes the parsed command and returns the process exit code.
 pub async fn run(cli: Cli) -> Result<i32> {
     let fmt = cli.format;
+    // Inputs that do not depend on the server are validated before the
+    // connection: a repeated `--set` key, the candidate password of `check`
+    // (read first, so that an empty or unreadable input is a usage error and
+    // the password is never awaited with an idle connection open).
+    let settings = match &cli.command {
+        Command::Profile {
+            action: ProfileCommand::Create { set, .. } | ProfileCommand::Alter { set, .. },
+        } => match kv::parse_settings(set) {
+            Ok(m) => Some(m),
+            Err(e) => return Ok(usage_error(&e)),
+        },
+        _ => None,
+    };
+    let password = match &cli.command {
+        Command::Check { .. } => match commands::read_candidate_password() {
+            Ok(p) => Some(p),
+            Err(e) => return Ok(usage_error(&e)),
+        },
+        _ => None,
+    };
     let delivery = match &cli.command {
         Command::Rotate { opts, .. } | Command::SwitchPair { opts, .. } => {
             match prepare_delivery(opts).await {
@@ -106,11 +133,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Profile { action } => match action {
             ProfileCommand::List => commands::profile_list(&mut conn, fmt).await?,
             ProfileCommand::Show { name } => commands::profile_show(&mut conn, &name, fmt).await?,
-            ProfileCommand::Create { name, set } => {
-                commands::profile_create(&mut conn, &name, &set, fmt).await?
+            ProfileCommand::Create { name, .. } => {
+                let settings = settings.expect("settings validated above");
+                commands::profile_create(&mut conn, &name, settings, fmt).await?
             }
-            ProfileCommand::Alter { name, set } => {
-                commands::profile_alter(&mut conn, &name, &set, fmt).await?
+            ProfileCommand::Alter { name, .. } => {
+                let settings = settings.expect("settings validated above");
+                commands::profile_alter(&mut conn, &name, settings, fmt).await?
             }
             ProfileCommand::Drop { name } => commands::profile_drop(&mut conn, &name, fmt).await?,
             ProfileCommand::Assign { role, profile } => {
@@ -136,7 +165,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
             )
             .await?
         }
-        Command::Check { role } => return commands::check(&mut conn, &role, fmt).await,
+        Command::Check { role } => {
+            let password = password.expect("password read above");
+            return commands::check(&mut conn, &role, password, fmt).await;
+        }
         Command::Maintenance => commands::maintenance(&mut conn, fmt).await?,
         Command::FailedAttempts => commands::failed_attempts(&mut conn, fmt).await?,
         Command::WorkerStatus => commands::worker_status(&mut conn, fmt).await?,
