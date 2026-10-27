@@ -66,19 +66,36 @@ pub enum Report {
     Warning,
 }
 
-/// Line printed by [`report`].
-fn report_line(kind: Report, err: &anyhow::Error) -> String {
+/// Line printed by [`report`], [`warn`] and [`report_text`]: the one place
+/// where the `pgpp: error:` / `pgpp: warning:` prefix is written.
+fn message_line(kind: Report, text: &str) -> String {
     let label = match kind {
         Report::Error => "error",
         Report::Warning => "warning",
     };
-    format!("pgpp: {label}: {}", format_error(err))
+    format!("pgpp: {label}: {text}")
+}
+
+/// Line printed by [`report`].
+fn report_line(kind: Report, err: &anyhow::Error) -> String {
+    message_line(kind, &format_error(err))
 }
 
 /// Prints an error chain on the standard error, as `pgpp: error: ...` or
 /// `pgpp: warning: ...` (see [`format_error`]).
 pub fn report(kind: Report, err: &anyhow::Error) {
     eprintln!("{}", report_line(kind, err));
+}
+
+/// Prints a message (not an error chain) on the standard error, with the
+/// prefix of [`report`].
+pub fn report_text(kind: Report, text: &str) {
+    eprintln!("{}", message_line(kind, text));
+}
+
+/// Prints `pgpp: warning: <text>` on the standard error.
+pub fn warn(text: &str) {
+    report_text(Report::Warning, text);
 }
 
 /// Exit code of a run that failed with `err`, reported on the standard
@@ -237,6 +254,16 @@ mod tests {
         assert_eq!(
             report_line(Report::Warning, &err),
             "pgpp: warning: outer: inner"
+        );
+        // the lines of `warn` / `report_text` (Vault preflight warnings,
+        // failed deliveries, parameter logging) use the same prefix
+        assert_eq!(
+            message_line(Report::Warning, "preflight skipped"),
+            "pgpp: warning: preflight skipped"
+        );
+        assert_eq!(
+            message_line(Report::Error, "Vault delivery failed: x"),
+            "pgpp: error: Vault delivery failed: x"
         );
     }
 

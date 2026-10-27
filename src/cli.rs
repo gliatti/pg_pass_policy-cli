@@ -93,10 +93,11 @@ pub struct RotateOpts {
     ///
     /// CMD itself must read the whole password line from its stdin before it
     /// exits (`cat`, `read -r pw`, `--from-file=/dev/stdin`): once CMD has
-    /// exited, pgpp checks that nothing is left in the pipe.  A reading left
-    /// to a background process that outlives CMD (`cat > file &`) is
-    /// therefore reported as a failed delivery, as is a CMD that ignores its
-    /// stdin or exits with a non-zero status.
+    /// exited, pgpp checks that nothing is left in the pipe.  A CMD that
+    /// ignores its stdin or exits with a non-zero status is a failed
+    /// delivery.  A CMD that leaves the reading to a background process
+    /// (`cat > file &`) gives a non-deterministic result (reported as
+    /// delivered or failed depending on timing): do not do that.
     #[arg(long, value_name = "CMD", help_heading = DELIVERY_HEADING)]
     pub exec: Option<String>,
 

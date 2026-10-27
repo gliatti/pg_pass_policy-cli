@@ -18,7 +18,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::RotateOpts;
 use crate::duration::to_pg_interval;
-use crate::output::{is_broken_pipe, print_message, print_record, write_line, Format, ResultSet};
+use crate::output::{
+    is_broken_pipe, map_stdout_error, print_message, print_record, write_line, Format, ResultSet,
+};
 use crate::secret::{check_shell, run_exec, Interrupt, Secret};
 use crate::vault::{self, build_payload, write_secret, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
@@ -83,7 +85,11 @@ async fn valid_until(conn: &mut PgConnection, role: &str) -> Result<Option<Strin
         .bind(role)
         .fetch_optional(conn)
         .await?;
-    Ok(row.and_then(|r| r.get::<Option<String>, _>(0)))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    row.try_get::<Option<String>, _>(0)
+        .context("cannot read rolvaliduntil")
 }
 
 /// Reads `rolvaliduntil` after a rotation; never fatal, since the password is
@@ -157,7 +163,7 @@ impl Delivery {
                     .map_err(PrepareError::Invalid)?;
                 if opts.vault_mount.is_some() {
                     if let Some(w) = target.repeated_mount_warning() {
-                        eprintln!("pgpp: warning: {w}");
+                        crate::warn(&w);
                     }
                 }
                 let cfg = VaultConfig::from_env().map_err(PrepareError::Invalid)?;
@@ -170,17 +176,17 @@ impl Delivery {
         }
         if let Some((cfg, target)) = &vault {
             if opts.vault_skip_preflight {
-                eprintln!(
-                    "pgpp: warning: Vault preflight skipped (--vault-skip-preflight): \
+                crate::warn(
+                    "Vault preflight skipped (--vault-skip-preflight): \
                      VAULT_TOKEN and its permission on the path are only checked by the \
-                     write, after the rotation"
+                     write, after the rotation",
                 );
             } else {
                 let warnings = vault::preflight(cfg, target)
                     .await
                     .map_err(PrepareError::Preflight)?;
                 for w in warnings {
-                    eprintln!("pgpp: warning: {w}");
+                    crate::warn(&w);
                 }
             }
         }
@@ -267,69 +273,131 @@ async fn deliver(
     let mut failures: Vec<String> = Vec::new();
 
     if let Some((cfg, target)) = &opts.vault {
-        let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let mut payload = build_payload(&rot.role, &password, &rotated_at);
-        // biased: a Ctrl-C already received wins before the request starts
-        let result = tokio::select! {
-            biased;
-            () = interrupt.wait() => Err(anyhow::anyhow!(
-                "interrupted (Ctrl-C); the secret may or may not have been written"
-            )),
-            r = write_secret(cfg, target, &payload) => r,
-        };
-        // wipe the copy of the password held by the JSON payload
-        if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
-            s.zeroize();
-        }
-        match result {
+        match vault_delivery(cfg, target, &rot.role, &password, interrupt).await {
             Ok(()) => delivered.push("vault"),
-            Err(e) => failures.push(format!("Vault delivery failed: {e:#}")),
+            Err(f) => failures.push(f),
         }
     }
 
-    if let Some(cmd) = opts.exec.as_ref().filter(|_| interrupt.received()) {
-        failures.push(format!(
-            "--exec delivery not attempted: interrupted (Ctrl-C); command: {cmd}"
-        ));
-    } else if let Some(cmd) = &opts.exec {
-        let mut extra: Vec<(&str, &str)> = Vec::new();
-        if let Some(p) = &rot.pair {
-            extra.push(("PGPP_PAIR", p.as_str()));
-        }
-        if let Some(p) = &rot.previous_role {
-            extra.push(("PGPP_PREVIOUS_ROLE", p.as_str()));
-        }
-        match run_exec(
-            cmd,
-            &password,
-            &rot.role,
-            rot.valid_until_env(),
-            &extra,
-            opts.exec_timeout,
-            interrupt,
-        )
-        .await
-        {
-            Ok(()) => delivered.push("exec"),
-            Err(e) => failures.push(format!("--exec delivery failed: {e:#}")),
+    if let Some(cmd) = &opts.exec {
+        if interrupt.received() {
+            failures.push(format!(
+                "--exec delivery not attempted: interrupted (Ctrl-C); command: {cmd}"
+            ));
+        } else {
+            let mut extra: Vec<(&str, &str)> = Vec::new();
+            if let Some(p) = &rot.pair {
+                extra.push(("PGPP_PAIR", p.as_str()));
+            }
+            if let Some(p) = &rot.previous_role {
+                extra.push(("PGPP_PREVIOUS_ROLE", p.as_str()));
+            }
+            match run_exec(
+                cmd,
+                &password,
+                &rot.role,
+                rot.valid_until_env(),
+                &extra,
+                opts.exec_timeout,
+                interrupt,
+            )
+            .await
+            {
+                Ok(()) => delivered.push("exec"),
+                Err(e) => failures.push(format!("--exec delivery failed: {e:#}")),
+            }
         }
     }
 
     for f in &failures {
-        eprintln!("pgpp: {f}");
+        crate::report_text(crate::Report::Error, f);
     }
-    let show = opts.show;
-    let printed = print_rotation(rot, &password, &delivered, failures.is_empty(), show, fmt);
+    let printed = print_rotation(
+        rot,
+        &password,
+        &delivered,
+        failures.is_empty(),
+        opts.show,
+        fmt,
+    );
     drop(password);
-    if !failures.is_empty() {
-        bail!(
-            "password rotated but {} delivery error(s) occurred",
-            failures.len()
-        )
+    delivery_outcome(failures.len(), opts.show, delivered.is_empty(), printed)
+}
+
+/// Writes the secret to Vault, the message of the failure otherwise.  A
+/// Ctrl-C received before the request is polled for the first time means
+/// the request was never sent (« not attempted »); one received while it
+/// runs abandons it, and the secret may or may not have been written.
+async fn vault_delivery(
+    cfg: &VaultConfig,
+    target: &VaultTarget,
+    role: &str,
+    password: &Secret,
+    interrupt: &mut Interrupt,
+) -> std::result::Result<(), String> {
+    let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut payload = build_payload(role, password, &rotated_at);
+    let started = std::cell::Cell::new(false);
+    let result = {
+        let write = async {
+            started.set(true);
+            write_secret(cfg, target, &payload).await
+        };
+        // biased: a Ctrl-C already received wins before the request starts
+        tokio::select! {
+            biased;
+            () = interrupt.wait() => None,
+            r = write => Some(r),
+        }
+    };
+    // wipe the copy of the password held by the JSON payload
+    if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
+        s.zeroize();
+    }
+    match result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(format!("Vault delivery failed: {e:#}")),
+        None if !started.get() => {
+            Err("Vault delivery not attempted: interrupted (Ctrl-C)".to_string())
+        }
+        None => Err(
+            "Vault delivery failed: interrupted (Ctrl-C); the secret may or may not have \
+             been written"
+                .to_string(),
+        ),
+    }
+}
+
+/// Result of a rotation once the deliveries are done (`failures` of them
+/// failed, none succeeded when `nothing_delivered`) and the outcome printed
+/// (`printed`).  With `--show` the standard output is a delivery too: its
+/// failure is reported (never silenced as a closed pipe, which would exit
+/// with 0) when it was the only delivery or when another one failed.
+fn delivery_outcome(
+    failures: usize,
+    show: bool,
+    nothing_delivered: bool,
+    printed: Result<()>,
+) -> Result<()> {
+    if failures > 0 {
+        match printed {
+            Err(e) if show => {
+                let cause = if is_broken_pipe(&e) {
+                    "the standard output was closed".to_string()
+                } else {
+                    format!("{e:#}")
+                };
+                bail!(
+                    "password rotated but {failures} delivery error(s) occurred and the \
+                     password could not be printed ({cause}): rotate again"
+                )
+            }
+            _ => bail!("password rotated but {failures} delivery error(s) occurred"),
+        }
     }
     // with --show alone the standard output is the only delivery: a closed
     // pipe loses the password and is reported (not silenced)
-    let lost = show && delivered.is_empty();
+    let lost = show && nothing_delivered;
     match printed {
         Err(e) if lost && is_broken_pipe(&e) => bail!(
             "password rotated but it could not be printed (the standard output was \
@@ -417,13 +485,7 @@ fn write_stdout_unbuffered(bytes: &[u8]) -> Result<()> {
         let fd = lock.as_fd().try_clone_to_owned()?;
         std::fs::File::from(fd).write_all(bytes)
     });
-    written.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            anyhow::Error::new(crate::output::BrokenPipe)
-        } else {
-            anyhow::Error::new(e).context("cannot write to the standard output")
-        }
-    })
+    written.map_err(map_stdout_error)
 }
 
 /// Copies a text column holding a password straight from the raw value of
@@ -452,6 +514,17 @@ fn secret_column(row: &PgRow, index: usize) -> Result<Secret> {
 fn text_column(row: &PgRow, index: usize, what: &str) -> Result<Option<String>> {
     row.try_get::<Option<String>, _>(index)
         .with_context(|| format!("cannot read {what}"))
+}
+
+/// Decodes column `index` of a row returned by a function of the
+/// extension: a missing column or a type other than expected (another
+/// version of pg_pass_policy) is an error, not a panic of `Row::get`.
+fn column<'r, T>(row: &'r PgRow, index: usize, what: &str) -> Result<T>
+where
+    T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    row.try_get::<T, _>(index)
+        .with_context(|| format!("cannot read {what} (incompatible extension version?)"))
 }
 
 /// `as_str()` reads any value as UTF-8 text, whatever its type: the binary
@@ -624,7 +697,7 @@ pub async fn profile_show(conn: &mut PgConnection, name: &str, fmt: Format) -> R
     let Some(row) = row else {
         bail!("profile \"{name}\" does not exist");
     };
-    let value: Value = row.get(0);
+    let value: Value = column(&row, 0, "the profile")?;
     let Value::Object(record) = value else {
         bail!("internal error: unexpected profile representation");
     };
@@ -638,12 +711,12 @@ pub async fn profile_create(
     fmt: Format,
 ) -> Result<()> {
     let settings = Value::Object(settings);
-    let id: i32 = sqlx::query("SELECT pass_policy.create_profile($1::text, $2::jsonb)")
+    let row = sqlx::query("SELECT pass_policy.create_profile($1::text, $2::jsonb)")
         .bind(name)
         .bind(&settings)
         .fetch_one(conn)
-        .await?
-        .get(0);
+        .await?;
+    let id: i32 = column(&row, 0, "the id of the new profile")?;
     print_message(
         fmt,
         &format!("profile \"{name}\" created (id {id})"),
@@ -889,13 +962,13 @@ async fn mask_parameters(tx: &mut PgConnection) -> Result<()> {
                     .fetch_one(&mut *tx)
                     .await?;
             if current.trim() != "0" {
-                eprintln!(
-                    "pgpp: warning: cannot disable parameter logging (log_parameter_max_length \
+                crate::warn(&format!(
+                    "cannot disable parameter logging (log_parameter_max_length \
                      = {current}); the candidate password may appear in the server log if \
                      log_statement or log_min_duration_statement are enabled. Ask a superuser \
                      for \"ALTER ROLE <admin> SET log_parameter_max_length = 0\" or \
                      \"GRANT SET ON PARAMETER log_parameter_max_length TO <admin>\""
-                );
+                ));
             }
             Ok(())
         }
@@ -919,7 +992,7 @@ pub async fn check(
         .bind(password.as_str())
         .fetch_one(&mut *tx)
         .await?;
-    let reason: Option<String> = row.get(0);
+    let reason: Option<String> = column(&row, 0, "the result of check_password")?;
     drop(password);
     tx.commit().await?;
     let (code, text) = match &reason {
@@ -1156,6 +1229,90 @@ mod tests {
         );
         let err = text_column(&row, 9, "the previous role").unwrap_err();
         assert!(format!("{err:#}").starts_with("cannot read the previous role"));
+    }
+
+    /// A Ctrl-C received before the Vault write: the request is never sent
+    /// (no server listens on the address), the message says so.
+    #[tokio::test]
+    async fn a_vault_write_after_a_ctrl_c_is_not_attempted() {
+        let cfg = VaultConfig::new("http://127.0.0.1:9", "t", None).unwrap();
+        let target = VaultTarget::parse("secret/db/app", None).unwrap();
+        let mut interrupt = Interrupt::already_received();
+        let password = Zeroizing::new("pw".to_string());
+        let err = vault_delivery(&cfg, &target, "app", &password, &mut interrupt)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Vault delivery not attempted: interrupted (Ctrl-C)");
+    }
+
+    #[test]
+    fn a_print_failure_after_a_failed_delivery_is_reported() {
+        let closed = || Err(anyhow::Error::new(crate::output::BrokenPipe));
+        let other = || Err(anyhow::anyhow!("disk full"));
+        let msg = |r: Result<()>| {
+            let e = r.unwrap_err();
+            assert!(!is_broken_pipe(&e), "must not exit quietly with 0: {e:#}");
+            format!("{e:#}")
+        };
+        // --show, a delivery failed and the password could not be printed
+        let m = msg(delivery_outcome(1, true, true, closed()));
+        assert!(m.contains("1 delivery error(s)"), "{m}");
+        assert!(
+            m.contains("password could not be printed (the standard output was closed)"),
+            "{m}"
+        );
+        assert!(m.ends_with("rotate again"), "{m}");
+        let m = msg(delivery_outcome(1, true, false, other()));
+        assert!(m.contains("could not be printed (disk full)"), "{m}");
+        // printed, or not shown: the delivery error alone
+        let m = msg(delivery_outcome(2, true, false, Ok(())));
+        assert_eq!(m, "password rotated but 2 delivery error(s) occurred");
+        let m = msg(delivery_outcome(1, false, true, closed()));
+        assert_eq!(m, "password rotated but 1 delivery error(s) occurred");
+        // no delivery error
+        assert!(delivery_outcome(0, true, false, Ok(())).is_ok());
+        let m = msg(delivery_outcome(0, true, true, closed()));
+        assert!(m.contains("could not be printed"), "{m}");
+        // delivered elsewhere: a closed stdout stays a quiet broken pipe
+        let e = delivery_outcome(0, true, false, closed()).unwrap_err();
+        assert!(is_broken_pipe(&e));
+    }
+
+    /// Columns read with [`column`] (profile show / create, check) are
+    /// decoded without panicking (PGPP_TEST_URL).
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn extension_columns_are_decoded_without_panicking() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        let row = sqlx::query("SELECT 42, 'x'::text, '{\"a\": 1}'::jsonb, NULL::text")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(column::<i32>(&row, 0, "the id").unwrap(), 42);
+        assert_eq!(
+            column::<Value>(&row, 2, "the profile").unwrap(),
+            json!({"a": 1})
+        );
+        assert_eq!(
+            column::<Option<String>>(&row, 3, "the reason").unwrap(),
+            None
+        );
+        for err in [
+            column::<i32>(&row, 1, "the id of the new profile").unwrap_err(),
+            column::<i64>(&row, 0, "the id of the new profile").unwrap_err(),
+            column::<Value>(&row, 1, "the id of the new profile").unwrap_err(),
+            column::<Option<String>>(&row, 0, "the id of the new profile").unwrap_err(),
+            column::<i32>(&row, 9, "the id of the new profile").unwrap_err(),
+        ] {
+            assert!(
+                format!("{err:#}").starts_with(
+                    "cannot read the id of the new profile (incompatible extension version?): "
+                ),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

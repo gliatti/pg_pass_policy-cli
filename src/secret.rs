@@ -41,7 +41,7 @@ enum Written {
 
 /// Why the command was killed while it was still running, besides a failed
 /// or timed-out write.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Stop {
     /// Ctrl-C (`SIGINT`) received by pgpp.
     Interrupted,
@@ -83,6 +83,12 @@ pub fn check_shell() -> Result<()> {
 /// end of the pipe and checks, once the command has exited, that no byte is
 /// left in it.  A command that ignores its stdin would otherwise be reported
 /// as a successful delivery while the password is lost.
+///
+/// The check is only meaningful when `cmd` itself reads the line.  A hook
+/// that leaves the reading to a background process (`cat > file &`) gives
+/// a non-deterministic result: depending on whether that process has read
+/// the line when `sh` exits, the delivery is reported as successful or as
+/// failed (and the drain below may take the line from it).  Do not do that.
 ///
 /// The write and the wait for the command run concurrently: a line larger
 /// than the pipe, sent to a command that exits without reading it, cannot
@@ -159,6 +165,15 @@ impl Interrupt {
         Interrupt {
             signal,
             received: false,
+        }
+    }
+
+    /// An `Interrupt` that has already received its Ctrl-C (tests).
+    #[cfg(test)]
+    pub(crate) fn already_received() -> Self {
+        Interrupt {
+            signal: None,
+            received: true,
         }
     }
 
@@ -271,10 +286,9 @@ async fn run_exec_with(
     let write_failed = matches!(written, Written::Failed(_) | Written::TimedOut);
     if exited.is_none() && stop.is_none() && !write_failed {
         // line written: wait for the command, within the same bounds
-        tokio::select! {
-            status = child.wait() => exited = Some(status),
-            () = &mut interrupt => stop = Some(Stop::Interrupted),
-            () = &mut deadline => stop = Some(Stop::TimedOut),
+        match wait_or_stop(child.wait(), &mut interrupt, &mut deadline).await {
+            Ok(status) => exited = Some(status),
+            Err(s) => stop = Some(s),
         }
     }
     if exited.is_none() {
@@ -330,6 +344,24 @@ async fn run_exec_with(
         );
     }
     Ok(())
+}
+
+/// Second wait of [`run_exec_with`], once the line is written: the end of
+/// the command, a Ctrl-C or `--exec-timeout`.  `biased`, the end of the
+/// command first: a command that exits at the instant the delay expires (or
+/// a Ctrl-C arrives) has finished and must not be reported as killed; an
+/// unbiased `select!` would pick one of the ready branches at random.
+async fn wait_or_stop<T>(
+    wait: impl std::future::Future<Output = T>,
+    interrupt: impl std::future::Future<Output = ()>,
+    deadline: impl std::future::Future<Output = ()>,
+) -> std::result::Result<T, Stop> {
+    tokio::select! {
+        biased;
+        status = wait => Ok(status),
+        () = interrupt => Err(Stop::Interrupted),
+        () = deadline => Err(Stop::TimedOut),
+    }
 }
 
 /// Result of a write that is given up: done if it ended at the same time
@@ -434,6 +466,28 @@ mod tests {
             std::future::pending(),
         )
         .await
+    }
+
+    /// The second wait prefers the end of the command to a delay or a
+    /// Ctrl-C ready at the same instant (`biased`): with every branch ready,
+    /// an unbiased `select!` would report « killed » about two times in
+    /// three.
+    #[tokio::test]
+    async fn an_exit_at_the_deadline_is_not_reported_as_killed() {
+        for _ in 0..200 {
+            let r = wait_or_stop(
+                std::future::ready(7),
+                std::future::ready(()),
+                std::future::ready(()),
+            )
+            .await;
+            assert_eq!(r, Ok(7));
+        }
+        let pending = std::future::pending::<i32>;
+        let r = wait_or_stop(pending(), std::future::ready(()), std::future::ready(())).await;
+        assert_eq!(r, Err(Stop::Interrupted));
+        let r = wait_or_stop(pending(), std::future::pending(), std::future::ready(())).await;
+        assert_eq!(r, Err(Stop::TimedOut));
     }
 
     #[tokio::test]

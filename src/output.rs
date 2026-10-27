@@ -49,13 +49,18 @@ pub fn write_line(text: impl Display) -> Result<()> {
 fn write_line_to(out: &mut impl Write, text: impl Display) -> Result<()> {
     writeln!(out, "{text}")
         .and_then(|()| out.flush())
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                anyhow::Error::new(BrokenPipe)
-            } else {
-                anyhow::Error::new(e).context("cannot write to the standard output")
-            }
-        })
+        .map_err(map_stdout_error)
+}
+
+/// Error of a failed write to the standard output: [`BrokenPipe`] for
+/// `EPIPE`, `cannot write to the standard output: ...` otherwise.  Shared
+/// by every writer of stdout, buffered or not.
+pub fn map_stdout_error(e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        anyhow::Error::new(BrokenPipe)
+    } else {
+        anyhow::Error::new(e).context("cannot write to the standard output")
+    }
 }
 
 /// A result set: column names plus rows of JSON values.
@@ -259,6 +264,11 @@ mod tests {
         let err = write_line_to(&mut Failing(std::io::ErrorKind::Other), "x").unwrap_err();
         assert!(!is_broken_pipe(&err));
         assert!(format!("{err:#}").contains("cannot write to the standard output"));
+        let err = map_stdout_error(std::io::ErrorKind::BrokenPipe.into());
+        assert!(is_broken_pipe(&err));
+        let err = map_stdout_error(std::io::ErrorKind::PermissionDenied.into());
+        assert!(!is_broken_pipe(&err));
+        assert!(format!("{err:#}").starts_with("cannot write to the standard output: "));
         let mut buf = Vec::new();
         write_line_to(&mut buf, json!({"a": 1})).unwrap();
         assert_eq!(buf, b"{\"a\":1}\n");

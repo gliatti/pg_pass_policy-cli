@@ -145,8 +145,14 @@ Politique d'affichage :
   (le serveur a pu changer le mot de passe : relancer la rotation) ; pendant
   la remise (relecture de `rolvaliduntil`, écriture Vault, hook `--exec`),
   la remise en cours est abandonnée, celles qui restent ne sont pas tentées
-  et `pgpp` termine comme pour une remise échouée (code 1, message « rotate
-  again », mot de passe affiché seulement avec `--show`) ;
+  (message « not attempted » ; une écriture Vault abandonnée en cours de
+  route a pu, ou non, aboutir) et `pgpp` termine comme pour une remise
+  échouée (code 1, message « rotate again », mot de passe affiché seulement
+  avec `--show`) ;
+- avec `--show`, l'affichage compte comme une remise : s'il échoue (sortie
+  standard fermée, par exemple) alors qu'il était la seule remise ou qu'une
+  autre remise a échoué, le message le dit (« password could not be
+  printed … rotate again ») et le code de retour est 1 ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
   coupée), un avertissement est émis, `valid_until` vaut `(unknown)` en
   table (une valeur vide y signifie « illimité ») et `null` en JSON, avec
@@ -327,9 +333,11 @@ exemple `--exec true`), un hook arrêté par `--exec-timeout` ou par un Ctrl-C
 (voir plus bas). `pgpp` garde pour cela sa propre copie de
 l'extrémité de lecture du tube et vérifie, une fois le processus terminé,
 qu'il n'y reste aucun octet. Le hook doit donc consommer la ligne avant de
-se terminer (`cat`, `read -r pw`, `--from-file=/dev/stdin`…) ; une lecture
-confiée à un processus lancé en arrière-plan qui survit au hook n'est pas
-reconnue.
+se terminer (`cat`, `read -r pw`, `--from-file=/dev/stdin`…). Un hook qui
+délègue la lecture à un processus d'arrière-plan (`cat > fichier &`) donne
+un résultat non déterministe : selon que ce processus a déjà lu la ligne ou
+non quand le hook se termine, la remise est déclarée réussie ou échouée (et
+le vidage décrit plus bas peut lui retirer la ligne). Ne le faites pas.
 
 Le hook est lancé dans son propre groupe de processus : `pgpp` peut ainsi
 tuer d'un coup `sh` et les sous-processus qu'il a lancés (sauf ceux qui ont
