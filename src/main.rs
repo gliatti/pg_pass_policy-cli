@@ -9,10 +9,7 @@ async fn main() {
     };
     let code = match pgpp::run(cli).await {
         Ok(code) => code,
-        Err(err) => {
-            eprintln!("pgpp: error: {}", pgpp::format_error(&err));
-            pgpp::EXIT_ERROR
-        }
+        Err(err) => pgpp::failure_code(&err),
     };
     std::process::exit(code);
 }

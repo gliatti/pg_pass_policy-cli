@@ -536,6 +536,132 @@ async fn rotate_writes_to_vault_mock() {
     assert_eq!(caps.hits_async().await, 2);
 }
 
+/// Ctrl-C (SIGINT sent to pgpp) while the new password is being written to
+/// Vault: pgpp does not die silently (the password would be lost without a
+/// word) but abandons the write, skips the deliveries still to come
+/// (`--exec`), and exits with 1 asking to rotate again.
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn interruption_during_the_vault_write_asks_to_rotate_again() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_vault_int").await;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(200)
+                .json_body(serde_json::json!({"data": {"ttl": 600}}));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/sys/capabilities-self");
+            then.status(200)
+                .json_body(serde_json::json!({"capabilities": ["create", "update"]}));
+        })
+        .await;
+    // slow write: the hit is recorded at once, the answer comes 20 s later
+    let write = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/secret/data/pgpp/int");
+            then.status(200)
+                .delay(std::time::Duration::from_secs(20))
+                .json_body(serde_json::json!({"data": {"version": 1}}));
+        })
+        .await;
+    let marker = std::env::temp_dir().join(format!("pgpp_vault_int_{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let cmd = format!("cat > '{}'", marker.display());
+
+    let started = std::time::Instant::now();
+    let child = pgpp(&url)
+        .args([
+            "rotate",
+            "pgpp_t_vault_int",
+            "--vault-kv",
+            "secret/pgpp/int",
+            "--exec",
+            &cmd,
+        ])
+        .env("VAULT_ADDR", server.base_url())
+        .env("VAULT_TOKEN", "t-cli-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cannot run pgpp");
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    let mut waited = 0;
+    while write.hits_async().await == 0 {
+        assert!(waited < 200, "the Vault write never started");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    // SAFETY: plain system call on the pgpp process started above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the write was not abandoned"
+    );
+    assert!(
+        stderr.contains("Vault delivery failed: interrupted (Ctrl-C)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--exec delivery not attempted: interrupted (Ctrl-C)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("2 delivery error(s)"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stdout.contains("delivery failed: rotate again"), "{stdout}");
+    assert!(!marker.exists(), "the --exec command must not run");
+    exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_vault_int").await;
+}
+
+/// A standard output closed by its reader (`pgpp status | head -0`) ends
+/// pgpp quietly with 0 instead of a panic; with `--show` the password is
+/// lost and the failure is reported (exit 1).
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn closed_stdout_is_not_a_panic() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_epipe").await;
+    let closed = |args: &[&str]| {
+        let mut child = pgpp(&url)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot run pgpp");
+        // the read end is closed before pgpp has connected and printed
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        (out.status.code(), String::from_utf8(out.stderr).unwrap())
+    };
+    for args in [
+        &["status"][..],
+        &["-f", "json", "status"],
+        &["profile", "show", "default"],
+    ] {
+        let (code, stderr) = closed(args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+        assert_eq!(stderr, "", "{args:?}");
+    }
+    let (code, stderr) = closed(&["rotate", "pgpp_t_epipe", "--show"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("could not be printed") && stderr.contains("rotate again"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_epipe").await;
+}
+
 /// The token and its permission on the path are checked (lookup-self,
 /// capabilities-self) before the rotation: a refused token, a token that may
 /// not write the path, a redirect or an unreachable Vault exit with 2 and

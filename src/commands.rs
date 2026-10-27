@@ -18,8 +18,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::RotateOpts;
 use crate::duration::to_pg_interval;
-use crate::output::{print_message, print_record, Format, ResultSet};
-use crate::secret::{check_shell, run_exec, Secret};
+use crate::output::{is_broken_pipe, print_message, print_record, write_line, Format, ResultSet};
+use crate::secret::{check_shell, run_exec, Interrupt, Secret};
 use crate::vault::{self, build_payload, write_secret, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
 
@@ -41,8 +41,7 @@ pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) ->
             bail!("role \"{r}\" not found among login roles");
         }
     }
-    ResultSet::from_rows(&rows)?.print(fmt, "no login role");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "no login role")
 }
 
 pub async fn expiring(
@@ -61,8 +60,7 @@ pub async fn expiring(
         .bind(within.map(to_pg_interval).transpose()?)
         .fetch_all(conn)
         .await?;
-    ResultSet::from_rows(&rows)?.print(fmt, "no expiring role");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "no expiring role")
 }
 
 /// Rows of the view `v_locked`.  The view joins `role_state` by OID (it
@@ -76,8 +74,7 @@ pub async fn locked(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     )
     .fetch_all(conn)
     .await?;
-    ResultSet::from_rows(&rows)?.print(fmt, "no locked role");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "no locked role")
 }
 
 /// `rolvaliduntil` of a role, as text (NULL when unbounded).
@@ -91,12 +88,25 @@ async fn valid_until(conn: &mut PgConnection, role: &str) -> Result<Option<Strin
 
 /// Reads `rolvaliduntil` after a rotation; never fatal, since the password is
 /// already committed server-side and must reach `deliver()` whatever happens.
-/// `None` when the read failed, `Some(None)` when the role is unbounded.
-async fn valid_until_after_rotation(conn: &mut PgConnection, role: &str) -> Option<Option<String>> {
-    match valid_until(conn, role).await {
+/// `None` when the read failed or was interrupted (Ctrl-C), `Some(None)`
+/// when the role is unbounded.
+async fn valid_until_after_rotation(
+    conn: &mut PgConnection,
+    role: &str,
+    interrupt: &mut Interrupt,
+) -> Option<Option<String>> {
+    let read = tokio::select! {
+        biased;
+        () = interrupt.wait() => Err(anyhow::anyhow!("interrupted (Ctrl-C)")),
+        r = valid_until(conn, role) => r,
+    };
+    match read {
         Ok(v) => Some(v),
         Err(e) => {
-            eprintln!("pgpp: warning: password rotated but rolvaliduntil could not be read: {e:#}");
+            crate::report(
+                crate::Report::Warning,
+                &e.context("password rotated but rolvaliduntil could not be read"),
+            );
             None
         }
     }
@@ -241,14 +251,32 @@ struct RotationOutput<'a> {
 /// rotation without any of the three options before anything is rotated.  If
 /// a delivery (`--exec`, Vault) fails after the rotation, the password is NOT
 /// printed unless `--show` was given: the caller must rotate again.
-async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format) -> Result<()> {
+///
+/// A Ctrl-C ([`Interrupt`]) received before or during a delivery makes it
+/// fail (the Vault write or the `--exec` command in progress is abandoned,
+/// a delivery still to come is not attempted): it ends like any other
+/// failed delivery, with exit code 1 and « rotate again ».
+async fn deliver(
+    rot: &Rotation,
+    password: Secret,
+    opts: &Delivery,
+    fmt: Format,
+    interrupt: &mut Interrupt,
+) -> Result<()> {
     let mut delivered: Vec<&str> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
     if let Some((cfg, target)) = &opts.vault {
         let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         let mut payload = build_payload(&rot.role, &password, &rotated_at);
-        let result = write_secret(cfg, target, &payload).await;
+        // biased: a Ctrl-C already received wins before the request starts
+        let result = tokio::select! {
+            biased;
+            () = interrupt.wait() => Err(anyhow::anyhow!(
+                "interrupted (Ctrl-C); the secret may or may not have been written"
+            )),
+            r = write_secret(cfg, target, &payload) => r,
+        };
         // wipe the copy of the password held by the JSON payload
         if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
             s.zeroize();
@@ -259,7 +287,11 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
         }
     }
 
-    if let Some(cmd) = &opts.exec {
+    if let Some(cmd) = opts.exec.as_ref().filter(|_| interrupt.received()) {
+        failures.push(format!(
+            "--exec delivery not attempted: interrupted (Ctrl-C); command: {cmd}"
+        ));
+    } else if let Some(cmd) = &opts.exec {
         let mut extra: Vec<(&str, &str)> = Vec::new();
         if let Some(p) = &rot.pair {
             extra.push(("PGPP_PAIR", p.as_str()));
@@ -274,6 +306,7 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
             rot.valid_until_env(),
             &extra,
             opts.exec_timeout,
+            interrupt,
         )
         .await
         {
@@ -286,59 +319,91 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
         eprintln!("pgpp: {f}");
     }
     let show = opts.show;
+    let printed = print_rotation(rot, &password, &delivered, failures.is_empty(), show, fmt);
+    drop(password);
+    if !failures.is_empty() {
+        bail!(
+            "password rotated but {} delivery error(s) occurred",
+            failures.len()
+        )
+    }
+    // with --show alone the standard output is the only delivery: a closed
+    // pipe loses the password and is reported (not silenced)
+    let lost = show && delivered.is_empty();
+    match printed {
+        Err(e) if lost && is_broken_pipe(&e) => bail!(
+            "password rotated but it could not be printed (the standard output was \
+             closed): rotate again"
+        ),
+        Err(e) if lost => {
+            Err(e.context("password rotated but it could not be printed: rotate again"))
+        }
+        other => other,
+    }
+}
 
+/// Prints the outcome of a rotation (and the password with `--show`).
+fn print_rotation(
+    rot: &Rotation,
+    password: &Secret,
+    delivered: &[&str],
+    succeeded: bool,
+    show: bool,
+    fmt: Format,
+) -> Result<()> {
     match fmt {
         Format::Json => {
             let out = RotationOutput {
                 rotation: rot,
-                delivered_to: &delivered,
+                delivered_to: delivered,
                 password: show.then_some(password.as_str()),
             };
             // exact-size, wiped buffer, newline included (no reallocation
             // copies of the password with --show), written past the stdout
             // buffer
             let text = vault::zeroizing_json_line(&out)?;
-            write_stdout_unbuffered(&text)?;
+            write_stdout_unbuffered(&text)
         }
         Format::Table => {
             if let Some(p) = &rot.pair {
-                println!("pair: {p}");
-                println!("active_role: {}", rot.role);
+                write_line(format_args!("pair: {p}"))?;
+                write_line(format_args!("active_role: {}", rot.role))?;
             } else {
-                println!("role: {}", rot.role);
+                write_line(format_args!("role: {}", rot.role))?;
             }
             if let Some(p) = &rot.previous_role {
-                println!("previous_role: {p}");
-                println!(
+                write_line(format_args!("previous_role: {p}"))?;
+                write_line(format_args!(
                     "previous_valid_until: {}",
                     rot.previous_valid_until.as_deref().unwrap_or("")
-                );
+                ))?;
             }
-            println!("valid_until: {}", rot.valid_until_display());
+            write_line(format_args!("valid_until: {}", rot.valid_until_display()))?;
             if !delivered.is_empty() {
-                println!("delivered_to: {}", delivered.join(", "));
+                write_line(format_args!("delivered_to: {}", delivered.join(", ")))?;
             }
             if show {
                 let mut line = Zeroizing::new(Vec::with_capacity(password.len() + 11));
                 line.extend_from_slice(b"password: ");
                 line.extend_from_slice(password.as_bytes());
                 line.push(b'\n');
-                write_stdout_unbuffered(&line)?;
-            } else if failures.is_empty() {
-                println!("password: (not shown; use --show to print it)");
+                write_stdout_unbuffered(&line)
+            } else if succeeded {
+                write_line("password: (not shown; use --show to print it)")
             } else {
-                println!("password: (not shown and delivery failed: rotate again)");
+                write_line("password: (not shown and delivery failed: rotate again)")
             }
         }
     }
-    drop(password);
-    if failures.is_empty() {
+}
+
+/// `check` keeps its exit code (0 / 3) when the reader of the standard
+/// output is gone.
+fn ignore_broken_pipe(e: anyhow::Error) -> Result<()> {
+    if is_broken_pipe(&e) {
         Ok(())
     } else {
-        bail!(
-            "password rotated but {} delivery error(s) occurred",
-            failures.len()
-        )
+        Err(e)
     }
 }
 
@@ -348,15 +413,17 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
 fn write_stdout_unbuffered(bytes: &[u8]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    lock.flush()
-        .context("cannot write to the standard output")?;
-    let fd = lock
-        .as_fd()
-        .try_clone_to_owned()
-        .context("cannot write to the standard output")?;
-    std::fs::File::from(fd)
-        .write_all(bytes)
-        .context("cannot write to the standard output")
+    let written = lock.flush().and_then(|()| {
+        let fd = lock.as_fd().try_clone_to_owned()?;
+        std::fs::File::from(fd).write_all(bytes)
+    });
+    written.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            anyhow::Error::new(crate::output::BrokenPipe)
+        } else {
+            anyhow::Error::new(e).context("cannot write to the standard output")
+        }
+    })
 }
 
 /// Copies a text column holding a password straight from the raw value of
@@ -379,6 +446,14 @@ fn secret_column(row: &PgRow, index: usize) -> Result<Secret> {
     Ok(secret)
 }
 
+/// Decodes an optional text column of the result of a rotation, with the
+/// wording of [`secret_column`] (`cannot read <what>`): a type mismatch is
+/// an error, not a panic.
+fn text_column(row: &PgRow, index: usize, what: &str) -> Result<Option<String>> {
+    row.try_get::<Option<String>, _>(index)
+        .with_context(|| format!("cannot read {what}"))
+}
+
 /// `as_str()` reads any value as UTF-8 text, whatever its type: the binary
 /// form of an `int4` or a `bytea` would be taken for a password.  Only the
 /// text types decoded by sqlx as `&str` (text, varchar, name, bpchar,
@@ -395,25 +470,49 @@ fn check_text_type(ty: &PgTypeInfo) -> Result<()> {
     }
 }
 
+/// Runs the SQL call that rotates the password, Ctrl-C handler already
+/// installed: a Ctrl-C during the call abandons it (the connection is
+/// dropped) and is reported, since the server may have committed the new
+/// password all the same.
+async fn rotation_call(
+    query: impl std::future::Future<Output = std::result::Result<PgRow, sqlx::Error>>,
+    interrupt: &mut Interrupt,
+) -> Result<PgRow> {
+    tokio::select! {
+        biased;
+        () = interrupt.wait() => bail!(
+            "interrupted (Ctrl-C) during the rotation: the password may have been changed \
+             on the server and is not delivered: rotate again"
+        ),
+        r = query => Ok(r?),
+    }
+}
+
 pub async fn rotate(
     conn: &mut PgConnection,
     role: &str,
     opts: Delivery,
     fmt: Format,
 ) -> Result<()> {
-    let row = sqlx::query("SELECT pass_policy.rotate_password($1::name, $2::int)")
-        .bind(role)
-        .bind(opts.length)
-        .fetch_one(&mut *conn)
-        .await?;
+    // installed before the SQL call: from the rotation on, a Ctrl-C must
+    // not kill pgpp before the password is delivered
+    let mut interrupt = Interrupt::install();
+    let row = rotation_call(
+        sqlx::query("SELECT pass_policy.rotate_password($1::name, $2::int)")
+            .bind(role)
+            .bind(opts.length)
+            .fetch_one(&mut *conn),
+        &mut interrupt,
+    )
+    .await?;
     let password = secret_column(&row, 0)?;
     drop(row);
     let mut rot = Rotation {
         role: role.to_string(),
         ..Rotation::default()
     };
-    rot.set_valid_until(valid_until_after_rotation(conn, role).await);
-    deliver(&rot, password, &opts, fmt).await
+    rot.set_valid_until(valid_until_after_rotation(conn, role, &mut interrupt).await);
+    deliver(&rot, password, &opts, fmt, &mut interrupt).await
 }
 
 pub async fn switch_pair(
@@ -422,20 +521,25 @@ pub async fn switch_pair(
     opts: Delivery,
     fmt: Format,
 ) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT active_role, password, previous_role, previous_valid_until::text \
-         FROM pass_policy.switch_rotation_pair($1::text, $2::int)",
+    let mut interrupt = Interrupt::install();
+    let row = rotation_call(
+        sqlx::query(
+            "SELECT active_role, password, previous_role, previous_valid_until::text \
+             FROM pass_policy.switch_rotation_pair($1::text, $2::int)",
+        )
+        .bind(pair)
+        .bind(opts.length)
+        .fetch_one(&mut *conn),
+        &mut interrupt,
     )
-    .bind(pair)
-    .bind(opts.length)
-    .fetch_one(&mut *conn)
     .await?;
-    let active: String = row.get(0);
     let password = secret_column(&row, 1)?;
-    let previous_role: Option<String> = row.get(2);
-    let previous_valid_until: Option<String> = row.get(3);
+    let active = text_column(&row, 0, "the active role")?
+        .ok_or_else(|| anyhow::anyhow!("the server returned no active role"))?;
+    let previous_role = text_column(&row, 2, "the previous role")?;
+    let previous_valid_until = text_column(&row, 3, "the end of validity of the previous role")?;
     drop(row);
-    let read = valid_until_after_rotation(conn, &active).await;
+    let read = valid_until_after_rotation(conn, &active, &mut interrupt).await;
     let mut rot = Rotation {
         role: active,
         pair: Some(pair.to_string()),
@@ -444,7 +548,7 @@ pub async fn switch_pair(
         ..Rotation::default()
     };
     rot.set_valid_until(read);
-    deliver(&rot, password, &opts, fmt).await
+    deliver(&rot, password, &opts, fmt, &mut interrupt).await
 }
 
 pub async fn lock(
@@ -471,8 +575,7 @@ pub async fn lock(
         fmt,
         &text,
         json!({"ok": true, "role": role, "locked_until": until, "reason": reason}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn unlock(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<()> {
@@ -484,8 +587,7 @@ pub async fn unlock(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<
         fmt,
         &format!("role \"{role}\" unlocked"),
         json!({"ok": true, "role": role}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn expire(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<()> {
@@ -497,8 +599,7 @@ pub async fn expire(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<
         fmt,
         &format!("password of role \"{role}\" expired (must change)"),
         json!({"ok": true, "role": role}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn profile_list(conn: &mut PgConnection, fmt: Format) -> Result<()> {
@@ -512,8 +613,7 @@ pub async fn profile_list(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     )
     .fetch_all(conn)
     .await?;
-    ResultSet::from_rows(&rows)?.print(fmt, "no profile");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "no profile")
 }
 
 pub async fn profile_show(conn: &mut PgConnection, name: &str, fmt: Format) -> Result<()> {
@@ -528,8 +628,7 @@ pub async fn profile_show(conn: &mut PgConnection, name: &str, fmt: Format) -> R
     let Value::Object(record) = value else {
         bail!("internal error: unexpected profile representation");
     };
-    print_record(&record, fmt);
-    Ok(())
+    print_record(&record, fmt)
 }
 
 pub async fn profile_create(
@@ -549,8 +648,7 @@ pub async fn profile_create(
         fmt,
         &format!("profile \"{name}\" created (id {id})"),
         json!({"ok": true, "profile": name, "profile_id": id, "settings": settings}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn profile_alter(
@@ -569,8 +667,7 @@ pub async fn profile_alter(
         fmt,
         &format!("profile \"{name}\" altered"),
         json!({"ok": true, "profile": name, "settings": settings}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn profile_drop(conn: &mut PgConnection, name: &str, fmt: Format) -> Result<()> {
@@ -582,8 +679,7 @@ pub async fn profile_drop(conn: &mut PgConnection, name: &str, fmt: Format) -> R
         fmt,
         &format!("profile \"{name}\" dropped"),
         json!({"ok": true, "profile": name}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn profile_assign(
@@ -601,8 +697,7 @@ pub async fn profile_assign(
         fmt,
         &format!("profile \"{profile}\" assigned to role \"{role}\""),
         json!({"ok": true, "role": role, "profile": profile}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn profile_unassign(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<()> {
@@ -614,8 +709,7 @@ pub async fn profile_unassign(conn: &mut PgConnection, role: &str, fmt: Format) 
         fmt,
         &format!("role \"{role}\" now uses profile \"default\""),
         json!({"ok": true, "role": role, "profile": "default"}),
-    );
-    Ok(())
+    )
 }
 
 pub async fn audit(
@@ -641,8 +735,7 @@ pub async fn audit(
     .bind(limit)
     .fetch_all(conn)
     .await?;
-    ResultSet::from_rows(&rows)?.print(fmt, "no audit event");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "no audit event")
 }
 
 /// Reads the candidate password of `check` (before the connection): prompted
@@ -840,7 +933,8 @@ pub async fn check(
         fmt,
         &text,
         json!({"ok": reason.is_none(), "role": role, "reason": reason}),
-    );
+    )
+    .or_else(ignore_broken_pipe)?;
     Ok(code)
 }
 
@@ -848,8 +942,7 @@ pub async fn maintenance(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     let rows = sqlx::query("SELECT action, role_name, details FROM pass_policy.run_maintenance()")
         .fetch_all(conn)
         .await?;
-    ResultSet::from_rows(&rows)?.print(fmt, "maintenance run: nothing to do");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "maintenance run: nothing to do")
 }
 
 pub async fn failed_attempts(conn: &mut PgConnection, fmt: Format) -> Result<()> {
@@ -860,8 +953,7 @@ pub async fn failed_attempts(conn: &mut PgConnection, fmt: Format) -> Result<()>
     )
     .fetch_all(conn)
     .await?;
-    ResultSet::from_rows(&rows)?.print(fmt, "no tracked authentication failure");
-    Ok(())
+    ResultSet::from_rows(&rows)?.print(fmt, "no tracked authentication failure")
 }
 
 pub async fn worker_status(conn: &mut PgConnection, fmt: Format) -> Result<()> {
@@ -873,8 +965,7 @@ pub async fn worker_status(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     let record = ResultSet::from_rows(std::slice::from_ref(&row))?
         .first_record()
         .unwrap_or_default();
-    print_record(&record, fmt);
-    Ok(())
+    print_record(&record, fmt)
 }
 
 #[cfg(test)]
@@ -1039,6 +1130,32 @@ mod tests {
                 "column {i}: {err:#}"
             );
         }
+    }
+
+    /// The columns of `switch_rotation_pair` are decoded without panicking
+    /// (PGPP_TEST_URL): NULL, text, and a type that is not text.
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn text_columns_are_decoded_without_panicking() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        let row = sqlx::query("SELECT NULL::text, 'r'::text, 42")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(text_column(&row, 0, "the active role").unwrap(), None);
+        assert_eq!(
+            text_column(&row, 1, "the active role").unwrap().as_deref(),
+            Some("r")
+        );
+        let err = text_column(&row, 2, "the previous role").unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("cannot read the previous role: "),
+            "{err:#}"
+        );
+        let err = text_column(&row, 9, "the previous role").unwrap_err();
+        assert!(format!("{err:#}").starts_with("cannot read the previous role"));
     }
 
     #[test]

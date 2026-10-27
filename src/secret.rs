@@ -89,8 +89,8 @@ pub fn check_shell() -> Result<()> {
 /// block pgpp.  The write is bounded by [`EXEC_WRITE_TIMEOUT`], the whole
 /// run of the command by `timeout` (`--exec-timeout`, `None`: unbounded).
 /// `sh` runs in its own process group: when the write fails or times out,
-/// when `timeout` is reached, or when pgpp receives a Ctrl-C (`SIGINT`, which
-/// the terminal sends to the foreground group of pgpp only), the whole group
+/// when `timeout` is reached, or when `interrupt` reports a Ctrl-C (`SIGINT`,
+/// which the terminal sends to the foreground group of pgpp only), the whole group
 /// (`sh` and every sub-process that stayed in it) is killed with `SIGKILL`,
 /// waited for at most [`KILL_WAIT`], and the delivery fails.
 ///
@@ -111,13 +111,8 @@ pub async fn run_exec(
     valid_until: Option<&str>,
     extra_env: &[(&str, &str)],
     timeout: Option<Duration>,
+    interrupt: &mut Interrupt,
 ) -> Result<()> {
-    let interrupt = async {
-        // without a handler (error), Ctrl-C keeps its default action
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
     run_exec_with(
         cmd,
         password,
@@ -128,9 +123,66 @@ pub async fn run_exec(
         },
         EXEC_WRITE_TIMEOUT,
         timeout,
-        interrupt,
+        interrupt.wait(),
     )
     .await
+}
+
+/// Ctrl-C (`SIGINT`) during a rotation.  [`Interrupt::install`] is called
+/// before the SQL call that rotates the password: from then on a Ctrl-C no
+/// longer kills pgpp (which would lose the new password without a word) but
+/// is recorded, ends the step in progress (SQL call, Vault write, `--exec`
+/// command) and makes every delivery still to come fail, so that pgpp
+/// exits with code 1 and asks for a new rotation.  The handler stays
+/// installed until the end of the process.
+pub struct Interrupt {
+    /// `None` when the handler could not be installed (Ctrl-C then keeps
+    /// its default action).
+    signal: Option<tokio::signal::unix::Signal>,
+    received: bool,
+}
+
+impl Interrupt {
+    /// Installs the handler at once (not on the first wait).
+    pub fn install() -> Self {
+        let signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                crate::report(
+                    crate::Report::Warning,
+                    &anyhow::Error::new(e).context("cannot catch Ctrl-C during the rotation"),
+                );
+                None
+            }
+        };
+        Interrupt {
+            signal,
+            received: false,
+        }
+    }
+
+    /// True once a Ctrl-C was received.
+    pub fn received(&self) -> bool {
+        self.received
+    }
+
+    /// Ends when a Ctrl-C is received, at once if one already was.
+    /// Cancel-safe: a dropped wait loses no signal.
+    pub async fn wait(&mut self) {
+        if self.received {
+            return;
+        }
+        match &mut self.signal {
+            Some(s) => {
+                if s.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+        self.received = true;
+    }
 }
 
 /// Environment given to the command (see [`run_exec`]).

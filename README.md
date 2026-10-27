@@ -67,6 +67,13 @@ les listes sont des tableaux d'objets et les actions renvoient un objet
 | 2 | erreur d'usage : option inconnue, durée invalide ou nulle, `--set` invalide ou clé répétée, `--limit` < 1, mot de passe de `check` vide ou illisible, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), `sh` introuvable pour `--exec` ; validation locale, toujours faite avant la connexion et avant toute rotation |
 | 3 | mot de passe refusé par `check` (motif `PPP-xxx`) |
 
+Une sortie standard fermée par son lecteur (`pgpp audit | head -1`) n'est
+pas une erreur de `pgpp` : il s'arrête sans message, avec le code 0 (`check`
+garde son code 0 ou 3). Seule exception, `rotate` / `switch-pair --show`
+sans autre remise réussie (`--exec`, Vault) : la sortie standard est alors
+le seul canal de remise, le mot de passe est perdu et `pgpp` termine avec
+le code 1 en invitant à relancer la rotation.
+
 Les durées (`--within`, `--for`, `--since`) s'écrivent `45s`, `30m`, `12h`,
 `14d`, `2w`, ou combinées (`1h30m`). L'unité est obligatoire, une durée
 nulle (`0s`, `0d0h`) est refusée (code 2) et le total est borné à 100 ans
@@ -133,6 +140,13 @@ Politique d'affichage :
   n'a pas lu le mot de passe), le mot de passe a déjà été changé côté serveur ; il
   n'est pas affiché sauf `--show`, le code de retour est 1 et le message
   invite à relancer la rotation ;
+- un Ctrl-C (`SIGINT`) ne tue plus `pgpp` à partir de l'appel SQL de
+  rotation : pendant cet appel, `pgpp` l'abandonne et termine avec le code 1
+  (le serveur a pu changer le mot de passe : relancer la rotation) ; pendant
+  la remise (relecture de `rolvaliduntil`, écriture Vault, hook `--exec`),
+  la remise en cours est abandonnée, celles qui restent ne sont pas tentées
+  et `pgpp` termine comme pour une remise échouée (code 1, message « rotate
+  again », mot de passe affiché seulement avec `--show`) ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
   coupée), un avertissement est émis, `valid_until` vaut `(unknown)` en
   table (une valeur vide y signifie « illimité ») et `null` en JSON, avec
@@ -409,7 +423,7 @@ client Vault :
 | variable | contenu |
 |---|---|
 | `VAULT_CACERT` | un fichier PEM (un certificat ou une chaîne complète), prioritaire sur `VAULT_CAPATH` |
-| `VAULT_CAPATH` | un répertoire de fichiers `*.pem` / `*.crt` / `*.cer`, tous chargés |
+| `VAULT_CAPATH` | un répertoire de fichiers `*.pem` / `*.crt` / `*.cer`, tous chargés (contenu PEM attendu quelle que soit l'extension : un `.cer` binaire DER est refusé) |
 
 `VAULT_ADDR` est une URL sans paramètres (`?…`), sans fragment (`#…`) et
 sans identifiants (`user:pass@`), refusée sinon (code 2). Un préfixe de

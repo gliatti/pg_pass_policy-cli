@@ -1,6 +1,7 @@
 //! Rendering of query results as a text table or as JSON.
 
-use std::io::IsTerminal;
+use std::fmt::Display;
+use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Result};
 use clap::ValueEnum;
@@ -17,6 +18,44 @@ pub enum Format {
     Table,
     /// JSON (array of objects, or one object)
     Json,
+}
+
+/// The standard output was closed by its reader (`pgpp audit | head -1`):
+/// `EPIPE` on a write.  Rust ignores `SIGPIPE`, so that `println!` would
+/// panic; the writes of this module return this error instead, which
+/// [`crate::failure_code`] turns into a silent exit with code 0.
+#[derive(Debug)]
+pub struct BrokenPipe;
+
+impl Display for BrokenPipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the standard output was closed (broken pipe)")
+    }
+}
+
+impl std::error::Error for BrokenPipe {}
+
+/// True when `err` (or one of its causes) is [`BrokenPipe`].
+pub fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.is::<BrokenPipe>())
+}
+
+/// Writes `text` and a newline to the standard output, then flushes it so
+/// that a closed pipe is detected here and not at exit.
+pub fn write_line(text: impl Display) -> Result<()> {
+    write_line_to(&mut std::io::stdout().lock(), text)
+}
+
+fn write_line_to(out: &mut impl Write, text: impl Display) -> Result<()> {
+    writeln!(out, "{text}")
+        .and_then(|()| out.flush())
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                anyhow::Error::new(BrokenPipe)
+            } else {
+                anyhow::Error::new(e).context("cannot write to the standard output")
+            }
+        })
 }
 
 /// A result set: column names plus rows of JSON values.
@@ -93,13 +132,12 @@ impl ResultSet {
 
     /// Prints the result set in the requested format.  `empty` is the text
     /// shown by the table format when there is no row.
-    pub fn print(&self, fmt: Format, empty: &str) {
+    pub fn print(&self, fmt: Format, empty: &str) -> Result<()> {
         match fmt {
-            Format::Json => println!("{}", self.to_json()),
+            Format::Json => write_line(self.to_json()),
             Format::Table => {
                 if self.rows.is_empty() {
-                    println!("{empty}");
-                    return;
+                    return write_line(empty);
                 }
                 let mut t = CTable::new();
                 t.load_preset(UTF8_FULL_CONDENSED)
@@ -108,7 +146,7 @@ impl ResultSet {
                 for r in &self.rows {
                     t.add_row(r.iter().map(cell));
                 }
-                println!("{t}");
+                write_line(t)
             }
         }
     }
@@ -139,9 +177,9 @@ pub fn cell(v: &Value) -> String {
 }
 
 /// Prints one record (JSON object) as a key/value table or as JSON.
-pub fn print_record(record: &Map<String, Value>, fmt: Format) {
+pub fn print_record(record: &Map<String, Value>, fmt: Format) -> Result<()> {
     match fmt {
-        Format::Json => println!("{}", Value::Object(record.clone())),
+        Format::Json => write_line(Value::Object(record.clone())),
         Format::Table => {
             let mut t = CTable::new();
             t.load_preset(UTF8_FULL_CONDENSED)
@@ -150,16 +188,16 @@ pub fn print_record(record: &Map<String, Value>, fmt: Format) {
             for (k, v) in record {
                 t.add_row([k.clone(), cell(v)]);
             }
-            println!("{t}");
+            write_line(t)
         }
     }
 }
 
 /// Prints the outcome of an action: a sentence, or a JSON object.
-pub fn print_message(fmt: Format, text: &str, json: Value) {
+pub fn print_message(fmt: Format, text: &str, json: Value) -> Result<()> {
     match fmt {
-        Format::Json => println!("{json}"),
-        Format::Table => println!("{text}"),
+        Format::Json => write_line(json),
+        Format::Table => write_line(text),
     }
 }
 
@@ -200,6 +238,30 @@ mod tests {
         assert!(t.to_string().lines().any(|l| l.contains(&long)));
         t.set_content_arrangement(arrangement(true));
         assert!(!t.to_string().lines().any(|l| l.contains(&long)));
+    }
+
+    /// A writer whose reader is gone, or that fails otherwise.
+    struct Failing(std::io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_pipe_is_reported_as_broken_pipe() {
+        let err = write_line_to(&mut Failing(std::io::ErrorKind::BrokenPipe), "x").unwrap_err();
+        assert!(is_broken_pipe(&err), "{err:#}");
+        let err = write_line_to(&mut Failing(std::io::ErrorKind::Other), "x").unwrap_err();
+        assert!(!is_broken_pipe(&err));
+        assert!(format!("{err:#}").contains("cannot write to the standard output"));
+        let mut buf = Vec::new();
+        write_line_to(&mut buf, json!({"a": 1})).unwrap();
+        assert_eq!(buf, b"{\"a\":1}\n");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::duration::parse_duration;
 use crate::kv::parse_kv;
 use crate::output::Format;
+use crate::secret::EXEC_DEFAULT_TIMEOUT;
 
 fn duration_arg(s: &str) -> Result<Duration, String> {
     parse_duration(s).map_err(|e| e.to_string())
@@ -36,6 +37,18 @@ fn exec_timeout_arg(s: &str) -> Result<ExecTimeout, String> {
 /// Longest run time of the `--exec` command; `None`: unbounded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExecTimeout(pub Option<Duration>);
+
+/// Shown by `--help` as the default and parsed back by clap
+/// ([`exec_timeout_arg`]): `300s`, or `0` for no limit.  Sub-second parts
+/// are not rendered (the default is a whole number of seconds).
+impl std::fmt::Display for ExecTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(d) => write!(f, "{}s", d.as_secs()),
+            None => f.write_str("0"),
+        }
+    }
+}
 
 fn kv_arg(s: &str) -> Result<(String, Value), String> {
     parse_kv(s).map_err(|e| e.to_string())
@@ -93,7 +106,7 @@ pub struct RotateOpts {
     #[arg(
         long = "exec-timeout",
         value_name = "DELAY",
-        default_value = "300s",
+        default_value_t = ExecTimeout(Some(EXEC_DEFAULT_TIMEOUT)),
         value_parser = exec_timeout_arg,
         requires = "exec",
         help_heading = DELIVERY_HEADING
@@ -411,7 +424,14 @@ mod tests {
                 Err(e) => Err(e.exit_code()),
             }
         };
-        assert_eq!(parse(&[]), Ok(Some(Duration::from_secs(300))), "default");
+        assert_eq!(parse(&[]), Ok(Some(EXEC_DEFAULT_TIMEOUT)), "default");
+        assert_eq!(EXEC_DEFAULT_TIMEOUT, Duration::from_secs(300), "README");
+        // the default shown by --help is the one parsed
+        let help = Cli::try_parse_from(["pgpp", "rotate", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("[default: 300s]"), "{help}");
+        assert_eq!(ExecTimeout(None).to_string(), "0");
         assert_eq!(
             parse(&["--exec-timeout", "5m"]),
             Ok(Some(Duration::from_secs(300)))

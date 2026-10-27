@@ -343,35 +343,56 @@ fn require_loopback(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
+/// Extensions of the files of `VAULT_CAPATH` that are loaded (PEM content
+/// in every case; a DER `.cer` is refused as not PEM).
+const CAPATH_EXTENSIONS: [&str; 3] = ["pem", "crt", "cer"];
+
+/// `*.pem / *.crt / *.cer`, for the messages.
+fn capath_patterns() -> String {
+    CAPATH_EXTENSIONS
+        .iter()
+        .map(|e| format!("*.{e}"))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// Files of the `VAULT_CAPATH` directory that are loaded, sorted.
+fn capath_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("VAULT_CAPATH {dir:?}: cannot read the directory"))?;
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| CAPATH_EXTENSIONS.contains(&e))
+        })
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// Extra root certificates: `VAULT_CACERT` (one PEM file, possibly a bundle)
-/// takes precedence over `VAULT_CAPATH` (a directory of `*.pem` / `*.crt`
-/// files), as in the official Vault client.
+/// takes precedence over `VAULT_CAPATH` (a directory of `*.pem` / `*.crt` /
+/// `*.cer` files, see [`CAPATH_EXTENSIONS`]), as in the official Vault
+/// client.
 fn root_certs_from_env() -> Result<Vec<Certificate>> {
     if let Some(file) = env_path("VAULT_CACERT") {
         return load_pem_bundle(&file).with_context(|| format!("VAULT_CACERT {file:?}"));
     }
     if let Some(dir) = env_path("VAULT_CAPATH") {
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("VAULT_CAPATH {dir:?}: cannot read the directory"))?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.is_file()
-                    && matches!(
-                        p.extension().and_then(|e| e.to_str()),
-                        Some("pem" | "crt" | "cer")
-                    )
-            })
-            .collect();
-        paths.sort();
         let mut certs = Vec::new();
-        for p in &paths {
+        for p in &capath_files(&dir)? {
             certs.extend(
                 load_pem_bundle(p).with_context(|| format!("VAULT_CAPATH: {}", p.display()))?,
             );
         }
         if certs.is_empty() {
-            bail!("VAULT_CAPATH {dir:?}: no *.pem / *.crt certificate found");
+            bail!(
+                "VAULT_CAPATH {dir:?}: no certificate found ({})",
+                capath_patterns()
+            );
         }
         return Ok(certs);
     }
@@ -869,6 +890,25 @@ mod tests {
         );
         assert_eq!(line.last(), Some(&b'\n'));
         assert_eq!(&line[..line.len() - 1], body.as_slice());
+    }
+
+    #[test]
+    fn capath_loads_pem_crt_and_cer_files() {
+        let dir = std::env::temp_dir().join(format!("pgpp-capath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        for f in ["a.pem", "b.crt", "c.cer", "d.txt", "e.der", "pem"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::fs::create_dir(dir.join("f.pem")).unwrap();
+        let names: Vec<String> = capath_files(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.pem", "b.crt", "c.cer"]);
+        assert_eq!(capath_patterns(), "*.pem / *.crt / *.cer");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

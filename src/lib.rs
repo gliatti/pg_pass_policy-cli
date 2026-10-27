@@ -57,6 +57,42 @@ pub fn format_error(err: &anyhow::Error) -> String {
     parts.join(": ")
 }
 
+/// Kind of a message printed on the standard error by [`report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Report {
+    /// `pgpp: error: ...`
+    Error,
+    /// `pgpp: warning: ...`
+    Warning,
+}
+
+/// Line printed by [`report`].
+fn report_line(kind: Report, err: &anyhow::Error) -> String {
+    let label = match kind {
+        Report::Error => "error",
+        Report::Warning => "warning",
+    };
+    format!("pgpp: {label}: {}", format_error(err))
+}
+
+/// Prints an error chain on the standard error, as `pgpp: error: ...` or
+/// `pgpp: warning: ...` (see [`format_error`]).
+pub fn report(kind: Report, err: &anyhow::Error) {
+    eprintln!("{}", report_line(kind, err));
+}
+
+/// Exit code of a run that failed with `err`, reported on the standard
+/// error.  A standard output closed by its reader (`pgpp audit | head -1`,
+/// [`output::BrokenPipe`]) is not a failure of pgpp: nothing is printed and
+/// the exit code is [`EXIT_OK`].
+pub fn failure_code(err: &anyhow::Error) -> i32 {
+    if output::is_broken_pipe(err) {
+        return EXIT_OK;
+    }
+    report(Report::Error, err);
+    EXIT_ERROR
+}
+
 /// Validates the delivery options of `rotate` / `switch-pair` before any
 /// connection: a bad Vault configuration or path, a token refused by Vault,
 /// an unreachable Vault or a missing shell must not be discovered after the
@@ -66,7 +102,7 @@ pub fn format_error(err: &anyhow::Error) -> String {
 /// request (network, TLS, HTTP status, refused token or permission).
 async fn prepare_delivery(opts: &RotateOpts) -> std::result::Result<Delivery, i32> {
     Delivery::prepare(opts).await.map_err(|e| {
-        eprintln!("pgpp: error: {}", format_error(e.error()));
+        report(Report::Error, e.error());
         match e {
             PrepareError::Invalid(_) => EXIT_USAGE,
             PrepareError::Preflight(_) => EXIT_ERROR,
@@ -77,7 +113,7 @@ async fn prepare_delivery(opts: &RotateOpts) -> std::result::Result<Delivery, i3
 /// Prints a usage error detected before the connection and returns its exit
 /// code.
 fn usage_error(err: &anyhow::Error) -> i32 {
-    eprintln!("pgpp: error: {}", format_error(err));
+    report(Report::Error, err);
     EXIT_USAGE
 }
 
@@ -189,5 +225,26 @@ mod tests {
         assert_eq!(format_error(&err), "outer: inner");
         let err = anyhow::anyhow!("inner").context("outer");
         assert_eq!(format_error(&err), "outer: inner");
+    }
+
+    #[test]
+    fn reports_share_one_prefix() {
+        let err = anyhow::anyhow!("inner").context("outer");
+        assert_eq!(
+            report_line(Report::Error, &err),
+            "pgpp: error: outer: inner"
+        );
+        assert_eq!(
+            report_line(Report::Warning, &err),
+            "pgpp: warning: outer: inner"
+        );
+    }
+
+    #[test]
+    fn a_closed_stdout_exits_quietly_with_0() {
+        let pipe = anyhow::Error::new(output::BrokenPipe);
+        assert_eq!(failure_code(&pipe), EXIT_OK);
+        assert_eq!(failure_code(&pipe.context("printing")), EXIT_OK);
+        assert_eq!(failure_code(&anyhow::anyhow!("boom")), EXIT_ERROR);
     }
 }
