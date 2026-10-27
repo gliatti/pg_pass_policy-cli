@@ -10,10 +10,12 @@ use serde_json::{Map, Value};
 /// (`true`/`false`, `on`/`off`, `yes`/`no`, `null`) are case-insensitive, as
 /// in PostgreSQL (`TRUE`, `Off`, `NULL`).  A string is passed unchanged.
 ///
-/// A value between double quotes is always a string, without the quotes
-/// and without any other processing (no escape sequence, inner blanks
-/// kept): `max_age="90"` sends the string `"90"` where `max_age=90` sends
-/// the number 90, and `"null"` / `"true"` stay strings.
+/// A value between double quotes is always a string, without the quotes:
+/// `max_age="90"` sends the string `"90"` where `max_age=90` sends the
+/// number 90, and `"null"` / `"true"` stay strings.  Inside the quotes,
+/// `\"` gives a literal double quote and `\\` a literal backslash (so that
+/// a value may end with one: `"a\\"`); every other character, inner blanks,
+/// a bare `"` and any other backslash included, is kept as is.
 pub fn parse_kv(item: &str) -> Result<(String, Value)> {
     let Some((key, value)) = item.split_once('=') else {
         bail!("invalid setting \"{item}\": expected KEY=VALUE");
@@ -28,7 +30,7 @@ pub fn parse_kv(item: &str) -> Result<(String, Value)> {
     }
     let value = value.trim();
     if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        return Ok((key.to_string(), Value::String(inner.to_string())));
+        return Ok((key.to_string(), Value::String(unescape_quoted(inner))));
     }
     let json = match value.to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" => Value::Bool(true),
@@ -40,6 +42,26 @@ pub fn parse_kv(item: &str) -> Result<(String, Value)> {
         },
     };
     Ok((key.to_string(), json))
+}
+
+/// Content of a quoted value: `\"` becomes `"`, `\\` becomes `\`, anything
+/// else is copied unchanged.
+fn unescape_quoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next == '"' || next == '\\' {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Builds the JSON object from already parsed `--set` items; a repeated key
@@ -112,8 +134,18 @@ mod tests {
             ("max_age=\"null\"", json!("null")),
             ("max_age=\" 30 days \"", json!(" 30 days ")),
             ("max_age=\"\"", json!("")),
-            // no escape processing: inner quotes are kept
+            // a bare inner quote is kept
             ("max_age=\"a\"b\"", json!("a\"b")),
+            // \" and \\ are escapes inside the quotes
+            (r#"max_age="a\"b""#, json!("a\"b")),
+            (r#"max_age="\"quoted\"""#, json!("\"quoted\"")),
+            (r#"max_age="a\\""#, json!("a\\")),
+            (r#"max_age="a\\\"b""#, json!("a\\\"b")),
+            // any other backslash is kept, and so is a trailing lone one
+            (r#"max_age="a\nb""#, json!("a\\nb")),
+            (r#"max_age="a\""#, json!("a\\")),
+            // no escape processing outside quotes
+            (r#"max_age=a\"b"#, json!("a\\\"b")),
             // a lone or unbalanced quote is an ordinary string
             ("max_age=\"", json!("\"")),
             ("max_age=\"90", json!("\"90")),

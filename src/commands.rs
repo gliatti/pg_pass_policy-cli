@@ -12,8 +12,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use sqlx::postgres::PgRow;
-use sqlx::{Connection, Executor, PgConnection, Row, ValueRef};
+use sqlx::postgres::{PgRow, PgTypeInfo};
+use sqlx::{Connection, Executor, PgConnection, Row, TypeInfo, ValueRef};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::RotateOpts;
@@ -111,6 +111,8 @@ pub struct Delivery {
     pub length: Option<i32>,
     pub show: bool,
     pub exec: Option<String>,
+    /// `--exec-timeout` (`None`: no limit).
+    pub exec_timeout: Option<Duration>,
     pub vault: Option<(VaultConfig, VaultTarget)>,
 }
 
@@ -176,6 +178,7 @@ impl Delivery {
             length: opts.length,
             show: opts.show,
             exec: opts.exec.clone(),
+            exec_timeout: opts.exec_timeout.0,
             vault,
         })
     }
@@ -264,7 +267,16 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
         if let Some(p) = &rot.previous_role {
             extra.push(("PGPP_PREVIOUS_ROLE", p.as_str()));
         }
-        match run_exec(cmd, &password, &rot.role, rot.valid_until_env(), &extra).await {
+        match run_exec(
+            cmd,
+            &password,
+            &rot.role,
+            rot.valid_until_env(),
+            &extra,
+            opts.exec_timeout,
+        )
+        .await
+        {
             Ok(()) => delivered.push("exec"),
             Err(e) => failures.push(format!("--exec delivery failed: {e:#}")),
         }
@@ -282,10 +294,10 @@ async fn deliver(rot: &Rotation, password: Secret, opts: &Delivery, fmt: Format)
                 delivered_to: &delivered,
                 password: show.then_some(password.as_str()),
             };
-            // exact-size, wiped buffer (no reallocation copies of the
-            // password with --show), written past the stdout buffer
-            let mut text = vault::zeroizing_json(&out)?;
-            text.push(b'\n');
+            // exact-size, wiped buffer, newline included (no reallocation
+            // copies of the password with --show), written past the stdout
+            // buffer
+            let text = vault::zeroizing_json_line(&out)?;
             write_stdout_unbuffered(&text)?;
         }
         Format::Table => {
@@ -358,12 +370,29 @@ fn secret_column(row: &PgRow, index: usize) -> Result<Secret> {
     if raw.is_null() {
         bail!("the server returned no password");
     }
+    check_text_type(&raw.type_info())?;
     let text = raw
         .as_str()
         .map_err(|e| anyhow::anyhow!("cannot read the generated password: {e}"))?;
     let mut secret = Zeroizing::new(String::with_capacity(text.len()));
     secret.push_str(text);
     Ok(secret)
+}
+
+/// `as_str()` reads any value as UTF-8 text, whatever its type: the binary
+/// form of an `int4` or a `bytea` would be taken for a password.  Only the
+/// text types decoded by sqlx as `&str` (text, varchar, name, bpchar,
+/// citext) are accepted.
+fn check_text_type(ty: &PgTypeInfo) -> Result<()> {
+    if <str as sqlx::Type<sqlx::Postgres>>::compatible(ty) {
+        Ok(())
+    } else {
+        bail!(
+            "cannot read the generated password: the server returned a value of type {}, \
+             text expected (incompatible version of pg_pass_policy?)",
+            ty.name()
+        )
+    }
 }
 
 pub async fn rotate(
@@ -967,6 +996,52 @@ mod tests {
     }
 
     #[test]
+    fn only_text_columns_are_read_as_a_password() {
+        use sqlx::{Postgres, Type};
+        // (`with_oid` cannot be used here: sqlx matches it with any type
+        // declared by name, citext included)
+        check_text_type(&<String as Type<Postgres>>::type_info()).unwrap();
+        for name in ["varchar", "name", "bpchar"] {
+            check_text_type(&PgTypeInfo::with_name(name))
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        }
+        for ty in [
+            <i32 as Type<Postgres>>::type_info(),
+            <Vec<u8> as Type<Postgres>>::type_info(),
+            <Value as Type<Postgres>>::type_info(),
+        ] {
+            let err = check_text_type(&ty).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("text expected"),
+                "{ty}: {err:#}"
+            );
+        }
+    }
+
+    /// Same check on values sent by a real server (PGPP_TEST_URL).
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn secret_column_checks_the_type_sent_by_the_server() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        let row = sqlx::query("SELECT 'pw'::text, 'pw'::varchar, 'pw'::name, 42, '\\x7077'::bytea")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            assert_eq!(secret_column(&row, i).unwrap().as_str(), "pw", "column {i}");
+        }
+        for i in 3..5 {
+            let err = secret_column(&row, i).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("text expected"),
+                "column {i}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
     fn json_output_with_the_password_is_serialised_at_its_exact_size() {
         let mut rot = Rotation {
             role: "app".into(),
@@ -979,12 +1054,13 @@ mod tests {
             delivered_to: &["exec", "vault"],
             password: Some(&password),
         };
-        let text = vault::zeroizing_json(&out).unwrap();
+        // the line actually printed: JSON text and newline in one exact-size
+        // allocation (a push after the fact would reallocate)
+        let text = vault::zeroizing_json_line(&out).unwrap();
         assert_eq!(text.capacity(), text.len(), "no reallocation");
-        assert_eq!(
-            text.as_slice(),
-            serde_json::to_vec(&out).unwrap().as_slice()
-        );
+        let mut expected = serde_json::to_vec(&out).unwrap();
+        expected.push(b'\n');
+        assert_eq!(text.as_slice(), expected.as_slice());
         let v: Value = serde_json::from_slice(&text).unwrap();
         assert_eq!(v["password"], password.as_str());
         assert_eq!(v["valid_until_known"], false);

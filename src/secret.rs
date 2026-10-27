@@ -19,15 +19,34 @@ pub type Secret = Zeroizing<String>;
 /// (64 KiB on Linux) and the command does not read it.
 pub const EXEC_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default of `--exec-timeout`: longest run time of the `--exec` command.
+pub const EXEC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Longest wait for the command once its process group was killed
+/// (`SIGKILL`, normally immediate).
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
 /// Outcome of the write of the password line into the pipe.
 enum Written {
     /// Every byte is in the pipe (or already read).
     Complete,
-    /// The command exited before the line was entirely written.
+    /// The command exited (or was killed) before the line was entirely
+    /// written.
     Incomplete,
     /// The write did not end within the delay; the command was killed.
     TimedOut,
+    /// The write failed; the command was killed.
     Failed(std::io::Error),
+}
+
+/// Why the command was killed while it was still running, besides a failed
+/// or timed-out write.
+#[derive(Clone, Copy, PartialEq)]
+enum Stop {
+    /// Ctrl-C (`SIGINT`) received by pgpp.
+    Interrupted,
+    /// `--exec-timeout` reached.
+    TimedOut,
 }
 
 /// Checks that `sh` can be started, so that a missing shell is reported
@@ -67,43 +86,67 @@ pub fn check_shell() -> Result<()> {
 ///
 /// The write and the wait for the command run concurrently: a line larger
 /// than the pipe, sent to a command that exits without reading it, cannot
-/// block pgpp.  The write is bounded by [`EXEC_WRITE_TIMEOUT`]; past it the
-/// command (still running, not reading) is killed and the delivery fails.
-/// Once the line is written, the command may run as long as it needs.
+/// block pgpp.  The write is bounded by [`EXEC_WRITE_TIMEOUT`], the whole
+/// run of the command by `timeout` (`--exec-timeout`, `None`: unbounded).
+/// `sh` runs in its own process group: when the write fails or times out,
+/// when `timeout` is reached, or when pgpp receives a Ctrl-C (`SIGINT`, which
+/// the terminal sends to the foreground group of pgpp only), the whole group
+/// (`sh` and every sub-process that stayed in it) is killed with `SIGKILL`,
+/// waited for at most [`KILL_WAIT`], and the delivery fails.
 ///
-/// `sh` runs in its own process group, so that the delay kills `sh` and every
-/// sub-process it started (unless one moved to another group or session).
-/// Whatever the outcome (success, delay, write error, non-zero exit), the
-/// pipe is drained (and the bytes wiped) before returning: a sub-process
-/// that inherited stdin and outlives `sh` cannot read the password left in
-/// it.  Being in its own group, the command does not receive the `SIGINT`
-/// of a Ctrl-C typed in the terminal of pgpp, and it cannot read that
-/// terminal (`SIGTTIN`): its input is the pipe anyway.
+/// Whatever the outcome, the pipe is drained (and the bytes wiped) before
+/// returning: a sub-process that inherited stdin and outlives `sh` cannot
+/// read the bytes still in the pipe afterwards.  The drain only removes what
+/// is left in the pipe at that moment: it guarantees nothing against a
+/// reader that left the group (`setsid`) and already read, or reads first.
+///
+/// Being in a background group of the terminal, the command is stopped by
+/// `SIGTTIN` when it reads the terminal, and by `SIGTTOU` when it writes to
+/// it under `stty tostop` or changes its settings; `timeout` and Ctrl-C then
+/// still end the wait.
 pub async fn run_exec(
     cmd: &str,
     password: &Secret,
     role: &str,
     valid_until: Option<&str>,
     extra_env: &[(&str, &str)],
+    timeout: Option<Duration>,
 ) -> Result<()> {
-    run_exec_with_timeout(
+    let interrupt = async {
+        // without a handler (error), Ctrl-C keeps its default action
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    run_exec_with(
         cmd,
         password,
-        role,
-        valid_until,
-        extra_env,
+        Env {
+            role,
+            valid_until,
+            extra: extra_env,
+        },
         EXEC_WRITE_TIMEOUT,
+        timeout,
+        interrupt,
     )
     .await
 }
 
-async fn run_exec_with_timeout(
+/// Environment given to the command (see [`run_exec`]).
+struct Env<'a> {
+    role: &'a str,
+    valid_until: Option<&'a str>,
+    extra: &'a [(&'a str, &'a str)],
+}
+
+async fn run_exec_with(
     cmd: &str,
     password: &Secret,
-    role: &str,
-    valid_until: Option<&str>,
-    extra_env: &[(&str, &str)],
+    env: Env<'_>,
     write_timeout: Duration,
+    timeout: Option<Duration>,
+    interrupt: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let (tx, rx) = pipe::pipe().context("cannot create the pipe for --exec")?;
     // The child gets a blocking descriptor; pgpp keeps another one on the
@@ -120,16 +163,16 @@ async fn run_exec_with_timeout(
         .arg("-c")
         .arg("--")
         .arg(cmd)
-        .env("PGPP_ROLE", role)
+        .env("PGPP_ROLE", env.role)
         .stdin(Stdio::from(child_stdin))
         .stdout(Stdio::from(std::io::stderr()))
-        // own process group, killed as a whole when the write times out
+        // own process group, killed as a whole (delays, Ctrl-C)
         .process_group(0);
-    match valid_until {
+    match env.valid_until {
         Some(v) => command.env("PGPP_VALID_UNTIL", v),
         None => command.env_remove("PGPP_VALID_UNTIL"),
     };
-    for (k, v) in extra_env {
+    for (k, v) in env.extra {
         command.env(k, v);
     }
     let spawned = command.spawn();
@@ -137,10 +180,19 @@ async fn run_exec_with_timeout(
     drop(command);
     let mut child = spawned.with_context(|| format!("cannot run --exec command: {cmd}"))?;
 
+    let deadline = async {
+        match timeout {
+            Some(t) => tokio::time::sleep(t).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(deadline);
+    tokio::pin!(interrupt);
+
     let mut line = Zeroizing::new(Vec::with_capacity(password.len() + 1));
     line.extend_from_slice(password.as_bytes());
     line.push(b'\n');
-    let (written, exited) = {
+    let (written, mut exited, mut stop) = {
         // the future owns the write end: dropping it gives EOF to the child
         let write = async move {
             let mut tx = tx;
@@ -149,49 +201,66 @@ async fn run_exec_with_timeout(
         tokio::pin!(write);
         tokio::select! {
             r = tokio::time::timeout(write_timeout, &mut write) => match r {
-                Ok(Ok(())) => (Written::Complete, None),
-                Ok(Err(e)) => (Written::Failed(e), None),
-                Err(_) => (Written::TimedOut, None),
+                Ok(Ok(())) => (Written::Complete, None, None),
+                Ok(Err(e)) => (Written::Failed(e), None, None),
+                Err(_) => (Written::TimedOut, None, None),
             },
             status = child.wait() => {
                 // The child exited first: take a write that ended at the
                 // same time (a zero timeout still polls it once), give up
                 // the rest, nobody will read it.
-                let written = match tokio::time::timeout(Duration::ZERO, &mut write).await {
-                    Ok(Ok(())) => Written::Complete,
-                    Ok(Err(e)) => Written::Failed(e),
-                    Err(_) => Written::Incomplete,
-                };
-                (written, Some(status))
+                (poll_once(&mut write).await, Some(status), None)
             }
+            () = &mut interrupt => (poll_once(&mut write).await, None, Some(Stop::Interrupted)),
+            () = &mut deadline => (poll_once(&mut write).await, None, Some(Stop::TimedOut)),
         }
     };
     // From here on the write end is closed (owned by the dropped future).
-    // On a delay, kill the whole process group of `sh`: a sub-process it
-    // started (still holding the read end) must not read the line later.
-    if exited.is_none() && matches!(written, Written::TimedOut) {
-        kill_group(&child);
+    let write_failed = matches!(written, Written::Failed(_) | Written::TimedOut);
+    if exited.is_none() && stop.is_none() && !write_failed {
+        // line written: wait for the command, within the same bounds
+        tokio::select! {
+            status = child.wait() => exited = Some(status),
+            () = &mut interrupt => stop = Some(Stop::Interrupted),
+            () = &mut deadline => stop = Some(Stop::TimedOut),
+        }
     }
-    let status = match exited {
-        Some(status) => status,
-        None => child.wait().await,
-    };
+    if exited.is_none() {
+        // Write failure or delay, --exec-timeout, Ctrl-C: kill the whole
+        // process group of `sh`, a sub-process it started (still holding
+        // the read end) must not read the line later.  The wait for the
+        // killed group is bounded as well.
+        kill_group(&child);
+        exited = tokio::time::timeout(KILL_WAIT, child.wait()).await.ok();
+    }
     // Drain the pipe on every path, before any error is reported: a
     // sub-process that inherited stdin and outlives `sh` (or escaped the
-    // process group) must not find the password there.
+    // process group) must not find the password left there.
     let unread = unread_bytes(probe);
-    let status = status.context("--exec command failed")?;
-    match written {
-        Written::Failed(e) => {
-            bail!("cannot write the password to the stdin of the --exec command: {e}")
+    match stop {
+        Some(Stop::Interrupted) => {
+            bail!("interrupted (Ctrl-C) while the --exec command was running (command killed)")
         }
+        Some(Stop::TimedOut) => bail!(
+            "--exec command did not finish within {} (--exec-timeout; command killed)",
+            seconds(timeout.unwrap_or_default())
+        ),
+        None => {}
+    }
+    match written {
+        Written::Failed(e) => bail!(
+            "cannot write the password to the stdin of the --exec command: {e} (command killed)"
+        ),
         Written::TimedOut => bail!(
-            "--exec command did not read the password from its stdin within {} s \
+            "--exec command did not read the password from its stdin within {} \
              (command killed)",
-            write_timeout.as_secs_f32()
+            seconds(write_timeout)
         ),
         Written::Complete | Written::Incomplete => {}
     }
+    let status = exited
+        .context("--exec command did not exit")?
+        .context("--exec command failed")?;
     if !status.success() {
         bail!("--exec command exited with {status}");
     }
@@ -209,6 +278,23 @@ async fn run_exec_with_timeout(
         );
     }
     Ok(())
+}
+
+/// Result of a write that is given up: done if it ended at the same time
+/// (a zero timeout still polls it once), incomplete otherwise.
+async fn poll_once(
+    write: &mut std::pin::Pin<&mut impl std::future::Future<Output = std::io::Result<()>>>,
+) -> Written {
+    match tokio::time::timeout(Duration::ZERO, write).await {
+        Ok(Ok(())) => Written::Complete,
+        Ok(Err(e)) => Written::Failed(e),
+        Err(_) => Written::Incomplete,
+    }
+}
+
+/// `0.3 s`, `300 s`.
+fn seconds(d: Duration) -> String {
+    format!("{} s", d.as_secs_f32())
 }
 
 /// Sends `SIGKILL` to the process group of `child` (its own group, see
@@ -248,8 +334,54 @@ mod tests {
         Zeroizing::new(s.to_string())
     }
 
+    /// `run_exec` without the Ctrl-C handler (which would stay installed in
+    /// the test process), with the given delays and interruption.
+    async fn exec_with(
+        cmd: &str,
+        password: &Secret,
+        write_timeout: Duration,
+        timeout: Option<Duration>,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Result<()> {
+        let env = Env {
+            role: "app",
+            valid_until: None,
+            extra: &[],
+        };
+        run_exec_with(cmd, password, env, write_timeout, timeout, interrupt).await
+    }
+
+    async fn exec_pw(cmd: &str, password: &Secret) -> Result<()> {
+        exec_with(
+            cmd,
+            password,
+            EXEC_WRITE_TIMEOUT,
+            Some(EXEC_DEFAULT_TIMEOUT),
+            std::future::pending(),
+        )
+        .await
+    }
+
     async fn exec(cmd: &str) -> Result<()> {
-        run_exec(cmd, &secret("pw-Test-123"), "app", None, &[]).await
+        exec_pw(cmd, &secret("pw-Test-123")).await
+    }
+
+    async fn exec_env(cmd: &str, valid_until: Option<&str>) -> Result<()> {
+        let env = Env {
+            role: "app",
+            valid_until,
+            extra: &[],
+        };
+        let pw = secret("pw-Test-123");
+        run_exec_with(
+            cmd,
+            &pw,
+            env,
+            EXEC_WRITE_TIMEOUT,
+            None,
+            std::future::pending(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -291,30 +423,20 @@ mod tests {
 
     #[tokio::test]
     async fn valid_until_is_unset_when_unknown() {
-        let pw = secret("pw-Test-123");
         let set = "cat >/dev/null; test \"${PGPP_VALID_UNTIL+set}\" = set";
         let unset = "cat >/dev/null; test -z \"${PGPP_VALID_UNTIL+set}\"";
         // unbounded role: set and empty
-        run_exec(
-            &format!("{set} && test -z \"$PGPP_VALID_UNTIL\""),
-            &pw,
-            "app",
-            Some(""),
-            &[],
-        )
-        .await
-        .unwrap();
-        run_exec(
+        exec_env(&format!("{set} && test -z \"$PGPP_VALID_UNTIL\""), Some(""))
+            .await
+            .unwrap();
+        exec_env(
             &format!("{set} && test \"$PGPP_VALID_UNTIL\" = infinity"),
-            &pw,
-            "app",
             Some("infinity"),
-            &[],
         )
         .await
         .unwrap();
         // unknown: unset
-        run_exec(unset, &pw, "app", None, &[]).await.unwrap();
+        exec_env(unset, None).await.unwrap();
     }
 
     /// A line larger than the pipe capacity (64 KiB on Linux) cannot be
@@ -326,7 +448,7 @@ mod tests {
         let big = secret(&"p".repeat(256 * 1024));
         for cmd in ["true", "head -c 10 >/dev/null", "exec 0<&-; sleep 0.2"] {
             let started = std::time::Instant::now();
-            let err = run_exec(cmd, &big, "app", None, &[]).await.unwrap_err();
+            let err = exec_pw(cmd, &big).await.unwrap_err();
             let text = format!("{err:#}");
             assert!(
                 text.contains("without reading the password"),
@@ -336,12 +458,8 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "{cmd}");
         }
         // a command that reads it all succeeds
-        run_exec("cat >/dev/null", &big, "app", None, &[])
-            .await
-            .unwrap();
-        run_exec("test \"$(wc -c)\" -eq 262145", &big, "app", None, &[])
-            .await
-            .unwrap();
+        exec_pw("cat >/dev/null", &big).await.unwrap();
+        exec_pw("test \"$(wc -c)\" -eq 262145", &big).await.unwrap();
     }
 
     /// A command that neither reads nor exits is killed once the write delay
@@ -350,28 +468,26 @@ mod tests {
     async fn a_write_that_never_ends_is_bounded() {
         let big = secret(&"p".repeat(256 * 1024));
         let started = std::time::Instant::now();
-        let err = run_exec_with_timeout(
+        let err = exec_with(
             "exec sleep 30",
             &big,
-            "app",
-            None,
-            &[],
             Duration::from_millis(300),
+            None,
+            std::future::pending(),
         )
         .await
         .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("within 0.3 s"), "{text}");
         assert!(started.elapsed() < Duration::from_secs(10));
-        // a short line is written at once: the delay does not apply to the
-        // run time of the command
-        run_exec_with_timeout(
+        // a short line is written at once: the write delay does not apply
+        // to the run time of the command
+        exec_with(
             "sleep 0.5; cat >/dev/null",
             &secret("pw"),
-            "app",
-            None,
-            &[],
             Duration::from_millis(100),
+            None,
+            std::future::pending(),
         )
         .await
         .unwrap();
@@ -390,6 +506,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// Zombie state, read from /proc (a killed process reparented to init
+    /// may stay a zombie for a moment).
+    #[cfg(target_os = "linux")]
+    fn is_zombie(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().to_string()))
+            .is_some_and(|r| r.starts_with('Z'))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_zombie(_pid: libc::pid_t) -> bool {
+        false
+    }
+
+    /// Asserts that the process whose pid is in `pidfile` ends within 5 s.
+    /// The probe is `kill(pid, 0)`, available everywhere: `ESRCH` once the
+    /// process is gone (a zombie still counts as gone).
+    async fn assert_killed(pidfile: &std::path::Path) {
+        assert!(wait_for(pidfile).await, "no pid file");
+        // the file may exist before `echo` wrote into it
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(pidfile).unwrap_or_default();
+            if text.ends_with('\n') {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(pidfile);
+        let pid: libc::pid_t = text.trim().parse().expect("pid file");
+        assert!(pid > 1, "pid {pid}");
+        let mut alive = true;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only checks that the process exists.
+            let exists = unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            alive = exists && !is_zombie(pid);
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if alive {
+            // do not leave it behind
+            // SAFETY: plain system call on a process started by the test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(!alive, "sub-process {pid} survived");
     }
 
     /// A sub-process that inherited stdin and reads it after `sh` exited
@@ -418,7 +587,7 @@ mod tests {
     /// Past the write delay the whole process group of `sh` is killed, not
     /// only `sh`; the pipe is drained as well.
     #[tokio::test]
-    async fn the_process_group_is_killed_after_the_delay() {
+    async fn the_process_group_is_killed_after_the_write_delay() {
         let pidfile = temp_path("group-pid");
         let _ = std::fs::remove_file(&pidfile);
         let big = secret(&"p".repeat(256 * 1024));
@@ -426,26 +595,97 @@ mod tests {
             "exec 3<&0; sleep 30 <&3 & echo $! > '{}'; exec sleep 30",
             pidfile.display()
         );
-        let err = run_exec_with_timeout(&cmd, &big, "app", None, &[], Duration::from_millis(500))
+        let err = exec_with(
+            &cmd,
+            &big,
+            Duration::from_millis(500),
+            None,
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("command killed"), "{err:#}");
+        assert_killed(&pidfile).await;
+    }
+
+    /// A command that closed its stdin but keeps running (the line is
+    /// written, the pipe stays open on the side of pgpp) is bounded by
+    /// `--exec-timeout`: its whole group is killed and the delivery fails.
+    #[tokio::test]
+    async fn the_run_time_is_bounded_by_the_exec_timeout() {
+        let pidfile = temp_path("timeout-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let started = std::time::Instant::now();
+        let cmd = format!(
+            "sleep 100000 & echo $! > '{}'; exec 0<&-; sleep 100000",
+            pidfile.display()
+        );
+        let err = exec_with(
+            &cmd,
+            &secret("pw-Test-123"),
+            EXEC_WRITE_TIMEOUT,
+            Some(Duration::from_millis(500)),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("within 0.5 s (--exec-timeout"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_killed(&pidfile).await;
+        // the same without the sub-process
+        let err = exec_with(
+            "exec 0<&-; sleep 100000",
+            &secret("pw"),
+            EXEC_WRITE_TIMEOUT,
+            Some(Duration::from_millis(300)),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("--exec-timeout"), "{err:#}");
+        // a command that ends in time is not affected; None: no limit
+        for timeout in [Some(Duration::from_secs(30)), None] {
+            exec_with(
+                "sleep 0.5; cat >/dev/null",
+                &secret("pw"),
+                EXEC_WRITE_TIMEOUT,
+                timeout,
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// An interruption (Ctrl-C) while the command runs kills its group and
+    /// fails the delivery, whether the line is written or not.
+    #[tokio::test]
+    async fn an_interruption_kills_the_process_group() {
+        let big = secret(&"p".repeat(256 * 1024));
+        for (tag, password) in [("short", secret("pw")), ("big", big)] {
+            let pidfile = temp_path(&format!("intr-pid-{tag}"));
+            let _ = std::fs::remove_file(&pidfile);
+            let cmd = format!(
+                "sleep 100000 & echo $! > '{}'; exec sleep 100000",
+                pidfile.display()
+            );
+            let started = std::time::Instant::now();
+            let err = exec_with(
+                &cmd,
+                &password,
+                EXEC_WRITE_TIMEOUT,
+                None,
+                tokio::time::sleep(Duration::from_millis(500)),
+            )
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("command killed"), "{err:#}");
-        let pid = std::fs::read_to_string(&pidfile).unwrap();
-        let _ = std::fs::remove_file(&pidfile);
-        let stat = format!("/proc/{}/stat", pid.trim());
-        let mut alive = true;
-        for _ in 0..100 {
-            // gone, or a zombie waiting for its new parent to reap it
-            alive = std::fs::read_to_string(&stat)
-                .ok()
-                .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().to_string()))
-                .is_some_and(|r| !r.starts_with('Z'));
-            if !alive {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let text = format!("{err:#}");
+            assert!(text.contains("interrupted (Ctrl-C)"), "{tag}: {text}");
+            assert!(!text.contains("ppppp"), "{tag}: {text}");
+            assert!(started.elapsed() < Duration::from_secs(10), "{tag}");
+            assert_killed(&pidfile).await;
         }
-        assert!(!alive, "sub-process {} survived the delay", pid.trim());
     }
 
     #[tokio::test]

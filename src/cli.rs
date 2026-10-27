@@ -13,6 +13,30 @@ fn duration_arg(s: &str) -> Result<Duration, String> {
     parse_duration(s).map_err(|e| e.to_string())
 }
 
+/// `--exec-timeout`: a duration (`300s`, `5m`), a bare number of seconds,
+/// or `0` for no limit.
+fn exec_timeout_arg(s: &str) -> Result<ExecTimeout, String> {
+    let t = s.trim();
+    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+        let secs: u64 = t
+            .parse()
+            .map_err(|_| format!("invalid duration \"{s}\": number too large"))?;
+        if secs == 0 {
+            return Ok(ExecTimeout(None));
+        }
+        return parse_duration(&format!("{secs}s"))
+            .map(|d| ExecTimeout(Some(d)))
+            .map_err(|e| e.to_string());
+    }
+    parse_duration(s)
+        .map(|d| ExecTimeout(Some(d)))
+        .map_err(|e| e.to_string())
+}
+
+/// Longest run time of the `--exec` command; `None`: unbounded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExecTimeout(pub Option<Duration>);
+
 fn kv_arg(s: &str) -> Result<(String, Value), String> {
     parse_kv(s).map_err(|e| e.to_string())
 }
@@ -62,6 +86,19 @@ pub struct RotateOpts {
     /// stdin or exits with a non-zero status.
     #[arg(long, value_name = "CMD", help_heading = DELIVERY_HEADING)]
     pub exec: Option<String>,
+
+    /// Longest run time of the --exec command (e.g. 300s, 5m, 1h; a bare
+    /// number is in seconds; 0: no limit).  Past it, or on Ctrl-C, the
+    /// process group of the command is killed and the delivery fails
+    #[arg(
+        long = "exec-timeout",
+        value_name = "DELAY",
+        default_value = "300s",
+        value_parser = exec_timeout_arg,
+        requires = "exec",
+        help_heading = DELIVERY_HEADING
+    )]
+    pub exec_timeout: ExecTimeout,
 
     /// Write the credentials to HashiCorp Vault KV v2 at PATH: <mount>/<path>
     /// (first component = mount), or the path below the mount when
@@ -361,6 +398,41 @@ mod tests {
             ])
             .is_ok());
         }
+    }
+
+    #[test]
+    fn exec_timeout_values() {
+        let parse = |args: &[&str]| {
+            let mut full = vec!["pgpp", "rotate", "app", "--exec", "cat"];
+            full.extend_from_slice(args);
+            match Cli::try_parse_from(full).map(|c| c.command) {
+                Ok(Command::Rotate { opts, .. }) => Ok(opts.exec_timeout.0),
+                Ok(other) => panic!("unexpected command {other:?}"),
+                Err(e) => Err(e.exit_code()),
+            }
+        };
+        assert_eq!(parse(&[]), Ok(Some(Duration::from_secs(300))), "default");
+        assert_eq!(
+            parse(&["--exec-timeout", "5m"]),
+            Ok(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            parse(&["--exec-timeout", "45"]),
+            Ok(Some(Duration::from_secs(45)))
+        );
+        assert_eq!(
+            parse(&["--exec-timeout", "1h30m"]),
+            Ok(Some(Duration::from_secs(5400)))
+        );
+        assert_eq!(parse(&["--exec-timeout", "0"]), Ok(None), "unbounded");
+        assert_eq!(parse(&["--exec-timeout", "000"]), Ok(None), "unbounded");
+        for bad in ["", "-1", "5x", "0s", "99999999999999999999999"] {
+            assert_eq!(parse(&["--exec-timeout", bad]), Err(2), "{bad:?}");
+        }
+        // only with --exec
+        let err = Cli::try_parse_from(["pgpp", "rotate", "app", "--show", "--exec-timeout", "5m"])
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

@@ -322,6 +322,123 @@ async fn exec_receives_password_on_stdin_and_env() {
     assert!(stderr.contains("hook-stderr-line"), "{stderr}");
 }
 
+/// Waits (up to 10 s) for `path` to hold a complete line, returned trimmed.
+fn wait_for_line(path: &std::path::Path) -> String {
+    for _ in 0..200 {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if s.ends_with('\n') {
+                return s.trim().to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("{} not written", path.display());
+}
+
+/// Asserts that process `pid` ends within 5 s (`kill(pid, 0)`: `ESRCH`), and
+/// kills it otherwise so that the test leaves nothing behind.
+fn assert_gone(pid: libc::pid_t) {
+    for _ in 0..100 {
+        // SAFETY: signal 0 only checks that the process exists.
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit(')')
+                    .next()
+                    .map(|r| r.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false);
+        if gone || zombie {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // SAFETY: plain system call on a process started by the test.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    panic!("hook sub-process {pid} survived");
+}
+
+/// `--exec-timeout` and Ctrl-C (SIGINT sent to pgpp) end a hook that does
+/// not finish: its process group is killed, the delivery fails (exit 1).
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn exec_timeout_and_interruption_kill_the_hook() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    fresh_login_role(&mut conn, "pgpp_t_exec_stop").await;
+    let pidfile = std::env::temp_dir().join(format!("pgpp_exec_stop_{}.pid", std::process::id()));
+
+    // --exec-timeout: the hook closed its stdin and keeps running
+    let _ = std::fs::remove_file(&pidfile);
+    let cmd = format!(
+        "sleep 100000 & echo $! > '{}'; exec 0<&-; sleep 100000",
+        pidfile.display()
+    );
+    let started = std::time::Instant::now();
+    let out = run(
+        &url,
+        &[
+            "-f",
+            "json",
+            "rotate",
+            "pgpp_t_exec_stop",
+            "--exec",
+            &cmd,
+            "--exec-timeout",
+            "1",
+        ],
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
+    assert!(stderr.contains("within 1 s (--exec-timeout"), "{stderr}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["delivered_to"], serde_json::json!([]), "{stdout}");
+    assert_gone(wait_for_line(&pidfile).parse().unwrap());
+
+    // Ctrl-C: SIGINT to pgpp while the hook runs
+    let _ = std::fs::remove_file(&pidfile);
+    let cmd = format!(
+        "sleep 100000 & echo $! > '{}'; cat >/dev/null; sleep 100000",
+        pidfile.display()
+    );
+    let started = std::time::Instant::now();
+    let child = pgpp(&url)
+        .args([
+            "rotate",
+            "pgpp_t_exec_stop",
+            "--exec",
+            &cmd,
+            "--exec-timeout",
+            "0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cannot run pgpp");
+    let sub: libc::pid_t = wait_for_line(&pidfile).parse().unwrap();
+    // the handler is installed before the hook starts; leave it a margin
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    // SAFETY: plain system call on the pgpp process started above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
+    assert!(stderr.contains("interrupted (Ctrl-C)"), "{stderr}");
+    assert!(stdout.contains("delivery failed: rotate again"), "{stdout}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert_gone(sub);
+    let _ = std::fs::remove_file(&pidfile);
+    exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_exec_stop").await;
+}
+
 fn vault_body_from_cli(req: &HttpMockRequest) -> bool {
     let Some(body) = &req.body else { return false };
     let Ok(v) = serde_json::from_slice::<Value>(body) else {

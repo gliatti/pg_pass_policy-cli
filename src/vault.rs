@@ -555,10 +555,25 @@ pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Val
 
 /// JSON text of `payload` in a buffer allocated once at its exact size (a
 /// growing `Vec` would leave unwiped copies behind each reallocation) and
-/// wiped when dropped.  Used for the Vault body and for the JSON output of
-/// a rotation with `--show`.  Copies made further down (hyper's write
-/// buffer, rustls' TLS records) are not under the control of pgpp.
+/// wiped when dropped.  Used for the Vault body.  Copies made further down
+/// (hyper's write buffer, rustls' TLS records) are not under the control of
+/// pgpp.
 pub fn zeroizing_json<T: Serialize + ?Sized>(payload: &T) -> Result<Zeroizing<Vec<u8>>> {
+    zeroizing_json_with(payload, false)
+}
+
+/// Same as [`zeroizing_json`], followed by a newline, which is counted in
+/// the allocation: pushing it afterwards onto the exact-size buffer would
+/// reallocate it and leave the first, unwiped copy behind.  Used for the
+/// JSON output of a rotation with `--show`.
+pub fn zeroizing_json_line<T: Serialize + ?Sized>(payload: &T) -> Result<Zeroizing<Vec<u8>>> {
+    zeroizing_json_with(payload, true)
+}
+
+fn zeroizing_json_with<T: Serialize + ?Sized>(
+    payload: &T,
+    newline: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
     struct Count(usize);
     impl Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -571,8 +586,17 @@ pub fn zeroizing_json<T: Serialize + ?Sized>(payload: &T) -> Result<Zeroizing<Ve
     }
     let mut count = Count(0);
     serde_json::to_writer(&mut count, payload).context("cannot serialise the JSON text")?;
-    let mut buf = Zeroizing::new(Vec::with_capacity(count.0));
+    let size = count.0 + usize::from(newline);
+    let mut buf = Zeroizing::new(Vec::with_capacity(size));
     serde_json::to_writer(&mut *buf, payload).context("cannot serialise the JSON text")?;
+    if newline {
+        buf.push(b'\n');
+    }
+    // a payload whose serialisation changed between the two passes would
+    // have grown the buffer: refuse it rather than hide the copy
+    if buf.len() != size {
+        bail!("cannot serialise the JSON text: size changed between two passes");
+    }
     Ok(buf)
 }
 
@@ -837,6 +861,14 @@ mod tests {
         let body = zeroizing_json(&p).unwrap();
         assert_eq!(body.as_slice(), serde_json::to_vec(&p).unwrap().as_slice());
         assert_eq!(body.capacity(), body.len(), "no reallocation");
+        let line = zeroizing_json_line(&p).unwrap();
+        assert_eq!(
+            line.capacity(),
+            line.len(),
+            "no reallocation for the newline"
+        );
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(&line[..line.len() - 1], body.as_slice());
     }
 
     #[test]

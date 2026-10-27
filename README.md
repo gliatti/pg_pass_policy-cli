@@ -153,8 +153,8 @@ le rôle inactif, le rend actif et borne le `VALID UNTIL` de l'ancien à la
 période de grâce du profil. La sortie donne `pair`, le rôle désormais actif
 (`active_role` en table, `role` en JSON, comme pour `rotate`),
 `previous_role`, `previous_valid_until` et `valid_until`. Les options
-`--length`, `--show`, `--exec`, `--vault-kv`, `--vault-mount` ont le même
-sens que pour `rotate` ; `--exec` reçoit en plus `PGPP_PAIR` et
+`--length`, `--show`, `--exec`, `--exec-timeout`, `--vault-kv`,
+`--vault-mount` ont le même sens que pour `rotate` ; `--exec` reçoit en plus `PGPP_PAIR` et
 `PGPP_PREVIOUS_ROLE`.
 
 ### Verrouillage et expiration
@@ -199,12 +199,18 @@ quel (intervalles PostgreSQL : `"30 days"`, `"1 hour"`). Les mots-clés `true`,
 `false`, `on`, `off`, `yes`, `no` et `null` sont insensibles à la casse (`TRUE`,
 `Off`, `NULL` conviennent aussi) ; les autres
 valeurs sont transmises sans changement de casse. Une valeur entre
-guillemets doubles est toujours une chaîne, transmise sans les guillemets et
-sans autre traitement (ni séquence d'échappement, ni suppression des blancs
-intérieurs) : `--set 'max_age="90"'` envoie la chaîne `"90"` là où
-`--set max_age=90` envoie le nombre 90, et `"null"` ou `"true"` restent des
-chaînes. Les guillemets doivent arriver jusqu'à `pgpp` : les protéger du
-shell par des apostrophes, comme dans l'exemple. L'ensemble est
+guillemets doubles est toujours une chaîne, transmise sans les guillemets :
+`--set 'max_age="90"'` envoie la chaîne `"90"` là où `--set max_age=90` envoie
+le nombre 90, et `"null"` ou `"true"` restent des chaînes. Entre les
+guillemets, `\"` donne un guillemet littéral et `\\` une barre oblique
+inverse littérale (utile pour une valeur qui se termine par une barre :
+`"a\\"`) ; tout le reste est conservé tel quel, blancs intérieurs, guillemet
+nu et autre barre oblique inverse compris (`"a"b"` donne `a"b`, `"a\nb"`
+donne `a\nb`). Changement de comportement : ces deux séquences étaient
+auparavant transmises telles quelles (`"a\"b"` donnait `a\"b`, il donne
+désormais `a"b`). Hors guillemets, aucune séquence n'est interprétée. Les
+guillemets doivent arriver jusqu'à `pgpp` : les protéger du shell par des
+apostrophes, comme dans l'exemple. L'ensemble est
 envoyé en jsonb à `create_profile()` / `alter_profile()`, qui valident les
 clés.
 
@@ -301,36 +307,53 @@ variables suivantes :
 | `PGPP_PAIR`, `PGPP_PREVIOUS_ROLE` | uniquement pour `switch-pair` |
 
 Sont des erreurs de remise (code 1, `delivered_to` sans `exec`) : un code de
-retour non nul du processus, une erreur d'écriture sur son entrée, et un
+retour non nul du processus, une erreur d'écriture sur son entrée, un
 processus qui se termine sans avoir lu toute la ligne du mot de passe (par
-exemple `--exec true`). `pgpp` garde pour cela sa propre copie de
+exemple `--exec true`), un hook arrêté par `--exec-timeout` ou par un Ctrl-C
+(voir plus bas). `pgpp` garde pour cela sa propre copie de
 l'extrémité de lecture du tube et vérifie, une fois le processus terminé,
 qu'il n'y reste aucun octet. Le hook doit donc consommer la ligne avant de
 se terminer (`cat`, `read -r pw`, `--from-file=/dev/stdin`…) ; une lecture
 confiée à un processus lancé en arrière-plan qui survit au hook n'est pas
 reconnue.
 
-L'écriture du mot de passe et l'attente du processus sont menées en
-parallèle : un processus qui se termine sans lire ne peut pas bloquer `pgpp`
-sur l'écriture. Celle-ci est en outre bornée à 30 s : au-delà, le groupe de
-processus du hook (`sh` et les sous-processus qu'il a lancés) reçoit
-`SIGKILL` et la remise échoue. Ce délai ne
-peut être atteint que si la ligne dépasse la capacité du tube (64 Kio sous
-Linux), ce que la longueur maximale du serveur exclut ; une fois la ligne
-écrite, le hook peut durer aussi longtemps que nécessaire.
+Le hook est lancé dans son propre groupe de processus : `pgpp` peut ainsi
+tuer d'un coup `sh` et les sous-processus qu'il a lancés (sauf ceux qui ont
+changé de groupe ou de session, avec `setsid` par exemple). Le groupe reçoit
+`SIGKILL`, l'attente de sa fin est bornée à 5 s et la remise échoue dans
+les cas suivants :
+
+- l'écriture de la ligne échoue, ou ne se termine pas en 30 s. Ce délai ne
+  peut être atteint que si la ligne dépasse la capacité du tube (64 Kio sous
+  Linux) et que le hook ne la lit pas, ce que la longueur maximale du
+  serveur exclut ; l'écriture et l'attente du processus sont menées en
+  parallèle, un hook qui se termine sans lire ne bloque donc pas `pgpp` ;
+- le hook dure plus que `--exec-timeout` (300 s par défaut ; durée comme
+  `90s`, `5m`, `1h`, ou nombre de secondes ; `0` supprime la limite). C'est
+  le cas d'un hook qui a fermé son entrée sans se terminer
+  (`exec 0<&-; sleep 100000`) ou qui est suspendu (voir ci-dessous) ;
+- `pgpp` reçoit un Ctrl-C (`SIGINT`) pendant que le hook tourne : le
+  terminal n'envoie ce signal qu'au groupe de `pgpp`, qui le relaie en tuant
+  celui du hook, puis termine avec le code 1 (rotation faite, remise
+  échouée, comme ci-dessus).
 
 Quelle que soit l'issue (succès, délai dépassé, erreur d'écriture, code de
-retour non nul), `pgpp` vide le tube (octets effacés) avant de rendre la
-main : un sous-processus ayant hérité de l'entrée standard et qui survit au
-hook n'y trouve plus le mot de passe. Un sous-processus qui a quitté le
-groupe (`setsid`) échappe au `SIGKILL`, pas à ce vidage.
+retour non nul, interruption), `pgpp` vide le tube (octets effacés) avant de
+rendre la main : un sous-processus ayant hérité de l'entrée standard et qui
+survit au hook n'y trouve plus ce qui restait de la ligne. Ce vidage ne
+retire que les octets encore présents dans le tube à ce moment : il ne
+garantit rien face à un lecteur qui a quitté le groupe (`setsid`), échappe
+donc au `SIGKILL` et a pu lire la ligne avant le vidage.
 
-Le hook est lancé dans son propre groupe de processus. Conséquences : un
-Ctrl-C tapé dans le terminal de `pgpp` ne lui parvient pas (il continue si
-`pgpp` est interrompu), et il ne peut pas lire le terminal : un programme qui
-y demande une saisie (invite de mot de passe de `sudo`, par exemple) est
-suspendu par `SIGTTIN` et `pgpp` attend indéfiniment. Le hook doit donc
-s'exécuter sans interaction (`sudo -n`, authentification par clé).
+Hors du groupe de premier plan du terminal, le hook ne peut pas s'en servir
+librement : un programme qui lit le terminal (invite de mot de passe de
+`sudo`, par exemple) est suspendu par `SIGTTIN`, et un programme qui y écrit
+alors que `stty tostop` est actif, ou qui en change les réglages, est
+suspendu par `SIGTTOU`. `pgpp` attend alors jusqu'à `--exec-timeout` (ou un
+Ctrl-C), puis tue le groupe. Le hook doit donc s'exécuter sans interaction
+(`sudo -n`, authentification par clé) ; pour ses messages, désactiver
+`tostop` (`stty -tostop`) ou rediriger sa sortie vers un fichier
+(`--exec './deploy-hook.sh >>/var/log/deploy-hook.log 2>&1'`).
 
 Conséquence de l'héritage : un hook fourni par un tiers (script de
 déploiement d'une autre équipe) reçoit les identifiants de l'opérateur
