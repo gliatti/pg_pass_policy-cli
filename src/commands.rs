@@ -4,7 +4,7 @@
 //! interpolate user input.  Timestamps and intervals are cast to text on the
 //! server so that special values (`infinity`) render faithfully.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::time::Duration;
 
@@ -60,19 +60,14 @@ pub async fn expiring(
     Ok(())
 }
 
-/// Same columns as the view `v_locked`, but `locked_by` / `lock_reason` are
-/// read from `role_state` by OID: the view joins `role_state` on `role_name`,
-/// which the maintenance refreshes only, so that after an
-/// `ALTER ROLE ... RENAME` the view would show the lock without its origin
-/// and reason.
+/// Rows of the view `v_locked`.  The view joins `role_state` by OID (it
+/// used to join on `role_name`, which the maintenance refreshes only, so
+/// that `locked_by` / `lock_reason` were empty after an
+/// `ALTER ROLE ... RENAME`); an older extension still shows that gap.
 pub async fn locked(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     let rows = sqlx::query(
-        "SELECT v.role_name, v.locked_until::text, s.locked_by, s.lock_reason, v.failed_count \
-           FROM pass_policy.v_role_status v \
-           JOIN pg_catalog.pg_roles r ON r.rolname = v.role_name \
-           LEFT JOIN pass_policy.role_state s ON s.role_oid = r.oid \
-          WHERE v.status = 'locked' \
-          ORDER BY v.role_name",
+        "SELECT role_name, locked_until::text, locked_by, lock_reason, failed_count \
+           FROM pass_policy.v_locked ORDER BY role_name",
     )
     .fetch_all(conn)
     .await?;
@@ -131,8 +126,16 @@ impl Delivery {
             check_shell()?;
         }
         if let Some((cfg, target)) = &vault {
-            for w in vault::preflight(cfg, target).await? {
-                eprintln!("pgpp: warning: {w}");
+            if opts.vault_skip_preflight {
+                eprintln!(
+                    "pgpp: warning: Vault preflight skipped (--vault-skip-preflight): \
+                     VAULT_TOKEN and its permission on the path are only checked by the \
+                     write, after the rotation"
+                );
+            } else {
+                for w in vault::preflight(cfg, target).await? {
+                    eprintln!("pgpp: warning: {w}");
+                }
             }
         }
         Ok(Delivery {
@@ -333,21 +336,21 @@ pub async fn lock(
         .bind(reason)
         .execute(&mut *conn)
         .await?;
-    // role_state.role_name is refreshed by the maintenance only: after an
-    // ALTER ROLE ... RENAME it still holds the old name, so look the row up
-    // by OID through pg_roles.
+    // locked_until is read from v_role_status, which joins role_state by
+    // OID (robust to ALTER ROLE ... RENAME).  The return value of lock_role()
+    // is not used yet: older versions of the extension return void.
     let until: Option<String> = sqlx::query(
-        "SELECT s.locked_until::text FROM pass_policy.role_state s \
-           JOIN pg_catalog.pg_roles r ON r.oid = s.role_oid \
-          WHERE r.rolname = $1",
+        "SELECT locked_until::text FROM pass_policy.v_role_status WHERE role_name = $1",
     )
     .bind(role)
     .fetch_optional(conn)
     .await?
     .and_then(|r| r.get(0));
-    let text = match &until {
-        Some(u) if u != "infinity" => format!("role \"{role}\" locked until {u}"),
-        _ => format!("role \"{role}\" locked until manual unlock"),
+    let text = match until.as_deref() {
+        Some("infinity") => format!("role \"{role}\" locked until manual unlock"),
+        Some(u) => format!("role \"{role}\" locked until {u}"),
+        // not a login role (absent from v_role_status): end unknown here
+        None => format!("role \"{role}\" locked"),
     };
     print_message(
         fmt,
@@ -544,47 +547,102 @@ fn read_password() -> Result<Secret> {
         .as_fd()
         .try_clone_to_owned()
         .context("cannot read the password from stdin")?;
-    read_first_line(&mut std::fs::File::from(fd)).context("cannot read the password from stdin")
+    let mut file = std::fs::File::from(fd);
+    let regular = file.metadata().is_ok_and(|m| m.file_type().is_file());
+    let line = if regular {
+        read_first_line_seekable(&mut file)
+    } else {
+        read_first_line(&mut file)
+    };
+    line.context("cannot read the password from stdin")
+}
+
+/// Line being read, in a zeroised buffer that is replaced (old one wiped)
+/// instead of being reallocated in place, so that no unwiped copy is left
+/// behind whatever the length.
+struct LineBuf(Zeroizing<Vec<u8>>);
+
+impl LineBuf {
+    fn new() -> Self {
+        LineBuf(Zeroizing::new(Vec::with_capacity(256)))
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            let mut capacity = self.0.capacity().max(1);
+            while capacity < needed {
+                capacity *= 2;
+            }
+            let mut bigger = Zeroizing::new(Vec::with_capacity(capacity));
+            bigger.extend_from_slice(&self.0);
+            self.0 = bigger;
+        }
+        self.0.extend_from_slice(bytes);
+    }
+
+    /// Strips a final `\r` and converts to a [`Secret`].
+    fn finish(mut self) -> std::io::Result<Secret> {
+        if self.0.last() == Some(&b'\r') {
+            self.0.pop();
+        }
+        match String::from_utf8(std::mem::take(&mut *self.0)) {
+            Ok(s) => Ok(Zeroizing::new(s)),
+            Err(e) => {
+                e.into_bytes().zeroize();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the password is not valid UTF-8",
+                ))
+            }
+        }
+    }
 }
 
 /// Reads one line byte by byte (nothing after the `\n` is consumed, so that a
 /// writer that keeps its end of the pipe open does not block pgpp) and strips
 /// the final `\n` / `\r\n`.  `input` must be unbuffered, or its own buffer
-/// keeps a copy.  The bytes are kept in a zeroised buffer that is replaced
-/// (old one wiped) instead of being reallocated in place, so that no
-/// unwiped copy is left behind whatever the length.
+/// keeps a copy.  Used for pipes and terminals, which cannot seek.
 fn read_first_line(input: &mut impl Read) -> std::io::Result<Secret> {
-    let mut line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(256));
+    let mut line = LineBuf::new();
     let mut byte = Zeroizing::new([0u8; 1]);
     loop {
         match input.read(&mut byte[..]) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => {
-                if line.len() == line.capacity() {
-                    let mut bigger = Zeroizing::new(Vec::with_capacity(line.capacity() * 2));
-                    bigger.extend_from_slice(&line);
-                    line = bigger;
-                }
-                line.push(byte[0]);
-            }
+            Ok(_) => line.extend(&byte[..]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    match String::from_utf8(std::mem::take(&mut *line)) {
-        Ok(s) => Ok(Zeroizing::new(s)),
-        Err(e) => {
-            e.into_bytes().zeroize();
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "the password is not valid UTF-8",
-            ))
+    line.finish()
+}
+
+/// Same as [`read_first_line`] for a regular file (`pgpp check < file`):
+/// reads by blocks into a zeroised buffer, then seeks back to just after the
+/// `\n`, so that the rest of the file is left unread for whoever shares the
+/// descriptor, as with the byte-by-byte loop.
+fn read_first_line_seekable(input: &mut (impl Read + Seek)) -> std::io::Result<Secret> {
+    let mut line = LineBuf::new();
+    let mut block = Zeroizing::new([0u8; 4096]);
+    loop {
+        let n = match input.read(&mut block[..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if let Some(pos) = block[..n].iter().position(|&b| b == b'\n') {
+            line.extend(&block[..pos]);
+            let unread = (n - pos - 1) as i64;
+            if unread > 0 {
+                input.seek(SeekFrom::Current(-unread))?;
+            }
+            break;
         }
+        line.extend(&block[..n]);
     }
+    line.finish()
 }
 
 /// Keeps the candidate password out of the server log.  A bound parameter is
@@ -721,5 +779,46 @@ mod tests {
         let mut input: &[u8] = data.as_bytes();
         assert_eq!(read_first_line(&mut input).unwrap().as_str(), long);
         assert_eq!(input, b"rest");
+    }
+
+    #[test]
+    fn reads_only_the_first_line_of_a_seekable_input() {
+        use std::io::Cursor;
+        let read = |data: &[u8]| {
+            let mut c = Cursor::new(data.to_vec());
+            let line = read_first_line_seekable(&mut c).ok().map(|s| s.to_string());
+            (line, c.position() as usize)
+        };
+        assert_eq!(read(b"first\r\nsecond\n"), (Some("first".into()), 7));
+        assert_eq!(read(b"pw\n").0.unwrap(), "pw");
+        assert_eq!(read(b"no-newline"), (Some("no-newline".into()), 10));
+        assert_eq!(read(b"").0.unwrap(), "");
+        assert_eq!(read(b"\nnext"), (Some(String::new()), 1));
+        assert!(read(b"\xff\xfe\n").0.is_none(), "invalid UTF-8");
+        // longer than a block and than the initial capacity
+        let long = "é".repeat(3000);
+        let data = format!("{long}\nrest");
+        let (line, pos) = read(data.as_bytes());
+        assert_eq!(line.unwrap(), long);
+        assert_eq!(
+            &data.as_bytes()[pos..],
+            b"rest",
+            "seeks back after the newline"
+        );
+    }
+
+    #[test]
+    fn regular_file_on_stdin_is_left_after_the_first_line() {
+        let path = std::env::temp_dir().join(format!("pgpp-stdin-{}.txt", std::process::id()));
+        std::fs::write(&path, "pw-line\nsecond line\n").unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            read_first_line_seekable(&mut f).unwrap().as_str(),
+            "pw-line"
+        );
+        let mut rest = String::new();
+        f.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "second line\n");
+        let _ = std::fs::remove_file(&path);
     }
 }

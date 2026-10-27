@@ -64,7 +64,7 @@ les listes sont des tableaux d'objets et les actions renvoient un objet
 |---|---|
 | 0 | succès (pour `check` : mot de passe conforme) |
 | 1 | erreur (base injoignable, réseau, refus de l'extension, échec de remise du mot de passe après rotation) |
-| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé ou sans droit d'écriture sur le chemin, Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation |
+| 2 | erreur d'usage : option inconnue, durée ou `--set` invalide, `--limit` < 1, rotation sans option de remise, configuration Vault absente ou invalide (`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, chemin `--vault-kv`), jeton Vault refusé (401 ou 403, y compris un jeton expiré, révoqué ou inconnu) ou sans droit d'écriture sur le chemin, Vault injoignable, `sh` introuvable pour `--exec` ; toujours détectée avant la connexion et avant toute rotation (sauf la validité du jeton avec `--vault-skip-preflight`, voir « Intégration HashiCorp Vault ») |
 | 3 | mot de passe refusé par `check` (motif `PPP-xxx`) |
 
 Les durées (`--within`, `--for`, `--since`) s'écrivent `45s`, `30m`, `12h`,
@@ -116,8 +116,8 @@ Politique d'affichage :
   `VAULT_CACERT` / `VAULT_CAPATH` lisible, chemin `--vault-kv` bien formé,
   `sh` disponible pour `--exec`, puis jeton accepté par Vault et autorisé à
   écrire le chemin (requêtes `lookup-self` et `capabilities-self`, voir
-  « Intégration HashiCorp Vault »). Une erreur à ce stade sort avec le code 2
-  sans rien changer côté serveur ;
+  « Intégration HashiCorp Vault » ; `--vault-skip-preflight` les supprime).
+  Une erreur à ce stade sort avec le code 2 sans rien changer côté serveur ;
 - si une remise (`--exec`, Vault) échoue malgré cela (Vault devenu
   injoignable, droits insuffisants sur le chemin, commande en erreur ou qui
   n'a pas lu le mot de passe), le mot de passe a déjà été changé côté serveur ; il
@@ -154,11 +154,13 @@ pgpp unlock app_user               # déverrouille et remet le compteur d'échec
 pgpp expire app_user               # must_change + VALID UNTIL now()
 ```
 
-`lock` et `locked` retrouvent l'état de verrouillage par l'OID du rôle : la
-colonne `role_name` de `pass_policy.role_state` (et donc la vue `v_locked`,
-qui la joint par nom) n'est mise à jour qu'au passage suivant de la
-maintenance après un `ALTER ROLE … RENAME`. Entre-temps, `pgpp locked`
-affiche bien `locked_by` et `lock_reason`, que la vue laisse vides.
+`lock` lit la fin du verrouillage dans `v_role_status` et `locked` lit la
+vue `v_locked` : toutes deux joignent `pass_policy.role_state` par l'OID du
+rôle. La colonne `role_name` de `role_state` n'est en effet mise à jour qu'au
+passage suivant de la maintenance après un `ALTER ROLE … RENAME` ; avec une
+version de l'extension antérieure à cette jointure (vue jointe par nom),
+`pgpp locked` laisse `locked_by` et `lock_reason` vides pour un rôle renommé
+jusqu'à ce passage.
 
 ### Profils de politique
 
@@ -351,8 +353,9 @@ est une erreur (code 1). Suivre une redirection rejouerait le jeton et le mot
 de passe vers l'hôte indiqué par `Location`, ce qui contournerait la règle
 ci-dessus. `VAULT_ADDR` doit donc pointer sur l'adresse finale de Vault.
 
-`VAULT_TOKEN` et `VAULT_NAMESPACE` sont débarrassés des blancs en début et
-en fin (un `\n` final recopié d'un fichier de jeton, par exemple), puis
+`VAULT_TOKEN` et `VAULT_NAMESPACE`, envoyés en en-têtes HTTP, sont
+débarrassés des blancs en début et en fin (un `\n` final recopié d'un fichier
+de jeton, par exemple), puis
 doivent ne contenir que des caractères ASCII visibles : sinon la commande est
 refusée (code 2) par un message qui nomme la variable sans jamais afficher
 sa valeur. De même, aucun message d'erreur sur `VAULT_ADDR` ne reprend
@@ -363,23 +366,35 @@ la connexion à PostgreSQL, puis `pgpp` interroge Vault avec le même client
 HTTP que pour l'écriture (redirections refusées) :
 
 1. `GET {VAULT_ADDR}/v1/auth/token/lookup-self` (autorisé par la politique
-   `default`) : une erreur réseau, une redirection, un 401, un 5xx ou tout
-   autre statut non 2xx sortent avec le code 2. Un 403 n'est qu'un
-   avertissement : un jeton créé avec `-no-default-policy` ne peut pas
-   s'inspecter lui-même mais peut avoir le droit d'écrire ;
+   `default`) : une erreur réseau, une redirection, un 401, un 403, un 5xx ou
+   tout autre statut non 2xx sortent avec le code 2. Vault répond en effet
+   403 « permission denied » (jamais 401) à un jeton expiré, révoqué ou
+   inconnu : un 403 est donc un refus ;
 2. `POST {VAULT_ADDR}/v1/sys/capabilities-self` avec
-   `{"paths": ["{mount}/data/{chemin}"]}` : si les droits du jeton sur ce
-   chemin ne comprennent ni `create`, ni `update`, ni `root`, la commande est
-   refusée (code 2). Si cette requête est elle-même refusée (403) ou que la
-   réponse est illisible, `pgpp` avertit et tente l'écriture après la
-   rotation.
+   `{"paths": ["{mount}/data/{chemin}"]}` : un refus de cette requête (403
+   compris) ou des droits sur ce chemin qui ne comprennent ni `create`, ni
+   `update`, ni `root` sortent avec le code 2. Si la réponse est illisible,
+   `pgpp` avertit et tente l'écriture après la rotation.
 
-Un jeton expiré ou révoqué, un jeton sans droit d'écriture sur le chemin, un
-Vault injoignable ou une redirection sortent donc avec le code 2 avant toute
-rotation. Restent possibles après la rotation : un refus d'écriture que la
-vérification n'a pas pu prévoir (jeton non inspectable, politique modifiée
-entre-temps) ou une panne survenue entre les requêtes (code 1, voir
-« Politique d'affichage »).
+Un jeton expiré, révoqué ou inconnu, un jeton sans droit d'écriture sur le
+chemin, un Vault injoignable ou une redirection sortent donc avec le code 2
+avant toute rotation. Restent possibles après la rotation : un refus
+d'écriture que la vérification n'a pas pu prévoir (réponse illisible de
+`capabilities-self`, politique modifiée entre-temps) ou une panne survenue
+entre les requêtes (code 1, voir « Politique d'affichage »).
+
+Un jeton créé avec `-no-default-policy` ne peut pas appeler `lookup-self` ni,
+en général, `capabilities-self` : il est refusé par la vérification
+ci-dessus. Pour un tel jeton, l'option `--vault-skip-preflight` (ou la
+variable `PGPP_VAULT_SKIP_PREFLIGHT=1`, ou `true`, `yes`, `on` ; `0`,
+`false`, `no`, `off` la désactivent, toute autre valeur, vide comprise, est
+une erreur d'usage, code 2) supprime les deux requêtes et affiche un
+avertissement. **La validité du jeton et son droit d'écriture ne sont alors
+vérifiés qu'après la rotation**, par l'écriture elle-même : un jeton expiré
+ou révoqué fait échouer la remise (code 1) alors que le mot de passe a déjà
+changé côté serveur, et celui-ci est perdu sans `--show` ou `--exec`.
+Combiner cette option avec une seconde remise (`--exec` vers un coffre de
+secours) ou relancer la rotation après correction du jeton.
 
 ## Sécurité
 
@@ -405,8 +420,11 @@ entre-temps) ou une panne survenue entre les requêtes (code 1, voir
 - Le mot de passe reçu est conservé dans un tampon `zeroize` effacé dès que
   la commande n'en a plus besoin (y compris la copie du corps JSON envoyé à
   Vault et la sortie JSON formatée). Le mot de passe candidat de `check` est
-  lu octet par octet sur une copie du descripteur 0, sans le tampon interne
-  de `std::io::stdin()` qui en garderait une copie non effacée. Les tampons
+  lu sur une copie du descripteur 0, sans le tampon interne de
+  `std::io::stdin()` qui en garderait une copie non effacée : octet par
+  octet depuis un tube ou un terminal, par blocs dans un tampon effacé depuis
+  un fichier ordinaire (`pgpp check app < fichier`), la position étant alors
+  ramenée juste après le premier `\n`. Les tampons
   internes des bibliothèques (réponse réseau et paramètres liés de sqlx,
   requête HTTP de reqwest, saisie sans écho de rpassword) ne sont pas sous
   contrôle de `pgpp`.

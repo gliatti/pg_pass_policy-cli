@@ -64,6 +64,18 @@ pub struct RotateOpts {
     /// Vault KV v2 mount point (default: first component of --vault-kv)
     #[arg(long = "vault-mount", value_name = "MOUNT", requires = "vault_kv", help_heading = DELIVERY_HEADING)]
     pub vault_mount: Option<String>,
+
+    /// Do not check VAULT_TOKEN (lookup-self, capabilities-self) before the
+    /// rotation, for a token created with -no-default-policy.  An invalid
+    /// token is then only detected by the write, after the rotation
+    #[arg(
+        long = "vault-skip-preflight",
+        env = "PGPP_VAULT_SKIP_PREFLIGHT",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help_heading = DELIVERY_HEADING
+    )]
+    pub vault_skip_preflight: bool,
 }
 
 const DELIVERY_HEADING: &str = "Delivery (choose at least one: --show, --exec or --vault-kv)";
@@ -279,6 +291,30 @@ mod tests {
         let err = Cli::try_parse_from(["pgpp", "rotate", "app", "--vault-mount", "kv", "--show"])
             .unwrap_err();
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn vault_skip_preflight_flag() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Rotate { opts, .. } => opts.vault_skip_preflight,
+            other => panic!("unexpected command {other:?}"),
+        };
+        assert!(parse(&[
+            "pgpp",
+            "rotate",
+            "app",
+            "--vault-kv",
+            "secret/app",
+            "--vault-skip-preflight"
+        ]));
+        // without --vault-kv the flag is accepted and has no effect (no
+        // `requires`: PGPP_VAULT_SKIP_PREFLIGHT may be exported for every
+        // invocation); PGPP_VAULT_SKIP_PREFLIGHT itself is exercised by the
+        // integration tests, setting it here would race with other threads
+        assert!(
+            Cli::try_parse_from(["pgpp", "rotate", "app", "--show", "--vault-skip-preflight"])
+                .is_ok()
+        );
     }
 
     #[test]

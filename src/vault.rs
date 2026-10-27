@@ -145,12 +145,15 @@ impl VaultConfig {
     /// Reads the environment and validates everything (address, token,
     /// certificates, HTTP client) so that a misconfiguration is reported
     /// before any password is rotated.  Surrounding whitespace (a final
-    /// newline copied from a token file, for instance) is removed.
+    /// newline copied from a token file, for instance) is removed from the
+    /// values sent as HTTP headers (`VAULT_TOKEN`, `VAULT_NAMESPACE`) only;
+    /// `VAULT_ADDR`, `VAULT_CACERT` and `VAULT_CAPATH` are used as given.
     pub fn from_env() -> Result<Self> {
         let addr = env_var("VAULT_ADDR").context("VAULT_ADDR is not set")?;
-        let token = env_var("VAULT_TOKEN").context("VAULT_TOKEN is not set")?;
+        let token = clean(env_var("VAULT_TOKEN")).context("VAULT_TOKEN is not set")?;
+        let namespace = clean(env_var("VAULT_NAMESPACE"));
         let certs = root_certs_from_env()?;
-        Self::with_root_certs(addr, token, env_var("VAULT_NAMESPACE"), &certs)
+        Self::with_root_certs(addr, token, namespace, &certs)
     }
 
     /// Request carrying the token and namespace headers.
@@ -177,11 +180,23 @@ impl std::fmt::Debug for VaultConfig {
     }
 }
 
-/// Non-empty value of an environment variable, without surrounding
-/// whitespace.
+/// Non-empty value of an environment variable, as given.
 fn env_var(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+    std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+/// Non-empty path from an environment variable, as given (not necessarily
+/// UTF-8).
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Value meant for an HTTP header without surrounding whitespace, `None`
+/// when nothing is left.
+fn clean(value: Option<String>) -> Option<String> {
+    value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -263,10 +278,10 @@ pub fn check_addr(addr: &str) -> Result<Url> {
 /// takes precedence over `VAULT_CAPATH` (a directory of `*.pem` / `*.crt`
 /// files), as in the official Vault client.
 fn root_certs_from_env() -> Result<Vec<Certificate>> {
-    if let Some(file) = env_var("VAULT_CACERT") {
-        return load_pem_bundle(Path::new(&file)).with_context(|| format!("VAULT_CACERT {file:?}"));
+    if let Some(file) = env_path("VAULT_CACERT") {
+        return load_pem_bundle(&file).with_context(|| format!("VAULT_CACERT {file:?}"));
     }
-    if let Some(dir) = env_var("VAULT_CAPATH") {
+    if let Some(dir) = env_path("VAULT_CAPATH") {
         let entries = std::fs::read_dir(&dir)
             .with_context(|| format!("VAULT_CAPATH {dir:?}: cannot read the directory"))?;
         let mut paths: Vec<PathBuf> = entries
@@ -318,71 +333,36 @@ pub fn build_payload(username: &str, password: &str, rotated_at: &str) -> Value 
 /// Checks, before any rotation, that Vault is reachable at `VAULT_ADDR`
 /// (no redirect), that it accepts `VAULT_TOKEN` and that the token may write
 /// the target, so that these failures are reported while the password is
-/// still unchanged.  Two requests:
+/// still unchanged.  Two requests, each of which must answer 2xx:
 ///
 /// 1. `GET {addr}/v1/auth/token/lookup-self` (allowed by Vault's `default`
-///    policy): a network error, a redirect, a 401 or any other non-2xx
-///    status is an error.  A 403 is only a warning: a token created with
-///    `-no-default-policy` cannot introspect itself but may still write.
-///    The response body (token metadata) is not read.
+///    policy).  Vault answers 403 "permission denied", never 401, for an
+///    expired, revoked or unknown token: a 403 is therefore a refusal like
+///    any other non-2xx status.  The response body (token metadata) is not
+///    read.
 /// 2. `POST {addr}/v1/sys/capabilities-self` with the KV v2 data path: an
-///    error when the capabilities of the token on that path contain none of
-///    `create`, `update`, `root`.  When this endpoint is itself denied (403)
-///    or its answer cannot be read, a warning is returned and the write is
+///    error when this request is refused, or when the capabilities of the
+///    token on that path contain none of `create`, `update`, `root`.  When
+///    the answer cannot be read, a warning is returned and the write is
 ///    attempted after the rotation.
 ///
-/// Returns the warnings, which the caller prints.
+/// A token created with `-no-default-policy` fails the first request: the
+/// caller skips this preflight on an explicit request only
+/// (`--vault-skip-preflight`).  Returns the warnings, which the caller prints.
 pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
     let url = endpoint(&cfg.addr, ["v1", "auth", "token", "lookup-self"]);
-    let resp = cfg
-        .request(reqwest::Method::GET, url.clone())
-        .send()
-        .await
-        .with_context(|| format!("Vault preflight request to {url} failed"))?;
-    let status = resp.status();
-    if status.is_redirection() {
-        bail!(redirect_message(status, &url));
-    }
-    if status == StatusCode::FORBIDDEN {
-        warnings.push(format!(
-            "Vault denied {url} (HTTP 403): VAULT_TOKEN cannot introspect itself \
-             (token without the default policy?); its validity is checked through \
-             sys/capabilities-self only"
-        ));
-    } else if !status.is_success() {
-        bail!(
-            "Vault refused VAULT_TOKEN at {url}: HTTP {status}{} (expired or revoked token?)",
-            error_body(resp).await
-        );
-    }
+    send_checked(cfg.request(reqwest::Method::GET, url.clone()), &url).await?;
 
     let path = target.api_path();
     let url = endpoint(&cfg.addr, ["v1", "sys", "capabilities-self"]);
-    let resp = cfg
-        .request(reqwest::Method::POST, url.clone())
-        .json(&json!({ "paths": [path] }))
-        .send()
-        .await
-        .with_context(|| format!("Vault preflight request to {url} failed"))?;
-    let status = resp.status();
-    if status.is_redirection() {
-        bail!(redirect_message(status, &url));
-    }
-    if status == StatusCode::FORBIDDEN {
-        warnings.push(format!(
-            "Vault denied {url} (HTTP 403): the write permission of VAULT_TOKEN on \
-             \"{path}\" could not be checked before the rotation"
-        ));
-        return Ok(warnings);
-    }
-    if !status.is_success() {
-        bail!(
-            "Vault preflight request to {url} failed: HTTP {status}{}",
-            error_body(resp).await
-        );
-    }
+    let resp = send_checked(
+        cfg.request(reqwest::Method::POST, url.clone())
+            .json(&json!({ "paths": [path] })),
+        &url,
+    )
+    .await?;
     let capabilities = resp
         .json::<Value>()
         .await
@@ -407,6 +387,33 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
         Some(_) => {}
     }
     Ok(warnings)
+}
+
+/// Sends a preflight request and returns the response when its status is
+/// 2xx.  A network error, a redirect (never followed) or any other status is
+/// an error; 401 and 403 are reported as a refused token, with the hint for
+/// a token without the default policy.
+async fn send_checked(req: reqwest::RequestBuilder, url: &Url) -> Result<reqwest::Response> {
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("Vault preflight request to {url} failed"))?;
+    let status = resp.status();
+    if status.is_redirection() {
+        bail!(redirect_message(status, url));
+    }
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = error_body(resp).await;
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        bail!(
+            "Vault refused VAULT_TOKEN at {url}: HTTP {status}{body} (expired, revoked or \
+             unknown token, or no permission on this endpoint; a token created with \
+             -no-default-policy needs --vault-skip-preflight)"
+        );
+    }
+    bail!("Vault preflight request to {url} failed: HTTP {status}{body}")
 }
 
 /// Capabilities of the token on `path` in a `sys/capabilities-self` answer:
@@ -609,14 +616,14 @@ mod tests {
     }
 
     #[test]
-    fn env_var_is_trimmed() {
-        let name = format!("PGPP_TEST_ENV_VAR_{}", std::process::id());
-        std::env::set_var(&name, " hvs.tok\n");
-        assert_eq!(env_var(&name).as_deref(), Some("hvs.tok"));
-        std::env::set_var(&name, " \n");
-        assert_eq!(env_var(&name), None);
-        std::env::remove_var(&name);
-        assert_eq!(env_var(&name), None);
+    fn header_values_are_cleaned() {
+        assert_eq!(clean(Some(" hvs.tok\n".into())).as_deref(), Some("hvs.tok"));
+        assert_eq!(clean(Some("\tns-a\r\n".into())).as_deref(), Some("ns-a"));
+        assert_eq!(clean(Some(" \n".into())), None);
+        assert_eq!(clean(Some(String::new())), None);
+        assert_eq!(clean(None), None);
+        // inner whitespace is kept, then refused by header_value
+        assert_eq!(clean(Some(" a b ".into())).as_deref(), Some("a b"));
     }
 
     #[test]

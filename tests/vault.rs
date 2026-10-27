@@ -248,27 +248,44 @@ async fn preflight_refuses_a_token_that_cannot_write() {
     }
 }
 
-/// A token created with -no-default-policy cannot call lookup-self (403):
-/// warning only, the capability check decides.
+/// Vault answers 403 "permission denied" (never 401) for an expired,
+/// revoked or unknown token: a 403 on lookup-self or on capabilities-self is
+/// a refusal, before any rotation (fail-closed).  A token without the
+/// default policy needs --vault-skip-preflight, which bypasses `preflight`.
 #[tokio::test]
-async fn preflight_tolerates_a_token_that_cannot_introspect_itself() {
+async fn preflight_refuses_a_403() {
     let server = MockServer::start_async().await;
     let (lookup, cap) =
         preflight_mocks(&server, 403, 200, json!({"capabilities": ["create"]})).await;
-    let warnings = preflight(&cfg(&server), &target()).await.unwrap();
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("lookup-self") && warnings[0].contains("403"));
+    let text = format!(
+        "{:#}",
+        preflight(&cfg(&server), &target()).await.unwrap_err()
+    );
+    assert!(
+        text.contains("lookup-self") && text.contains("403") && text.contains("VAULT_TOKEN"),
+        "{text}"
+    );
+    assert!(text.contains("--vault-skip-preflight"), "{text}");
+    assert!(!text.contains("good-token"), "token must not leak: {text}");
     lookup.assert_async().await;
+    assert_eq!(cap.hits_async().await, 0, "stops at lookup-self");
+
+    // capabilities-self denied: refused as well
+    let server = MockServer::start_async().await;
+    let (_, cap) =
+        preflight_mocks(&server, 200, 403, json!({"errors": ["permission denied"]})).await;
+    let text = format!(
+        "{:#}",
+        preflight(&cfg(&server), &target()).await.unwrap_err()
+    );
+    assert!(
+        text.contains("capabilities-self") && text.contains("403"),
+        "{text}"
+    );
+    assert!(text.contains("permission denied"), "{text}");
     cap.assert_async().await;
 
-    // capabilities-self denied too: two warnings, the write is attempted later
-    let server = MockServer::start_async().await;
-    preflight_mocks(&server, 403, 403, json!({"errors": ["permission denied"]})).await;
-    let warnings = preflight(&cfg(&server), &target()).await.unwrap();
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
-    assert!(warnings[1].contains("capabilities-self"), "{warnings:?}");
-
-    // unreadable answer: warning
+    // unreadable answer: warning only (the token itself was accepted)
     let server = MockServer::start_async().await;
     preflight_mocks(&server, 200, 200, json!({"unexpected": true})).await;
     let warnings = preflight(&cfg(&server), &target()).await.unwrap();
@@ -278,7 +295,7 @@ async fn preflight_tolerates_a_token_that_cannot_introspect_itself() {
 
 #[tokio::test]
 async fn preflight_reports_a_refused_token() {
-    for status in [401, 500, 503] {
+    for status in [401, 403, 500, 503] {
         let server = MockServer::start_async().await;
         let (lookup, cap) =
             preflight_mocks(&server, status, 200, json!({"capabilities": ["create"]})).await;
@@ -287,9 +304,12 @@ async fn preflight_reports_a_refused_token() {
             preflight(&cfg(&server), &target()).await.unwrap_err()
         );
         assert!(
-            text.contains(&status.to_string()) && text.contains("VAULT_TOKEN"),
+            text.contains(&status.to_string()) && text.contains("lookup-self"),
             "{text}"
         );
+        if status < 500 {
+            assert!(text.contains("refused VAULT_TOKEN"), "{text}");
+        }
         assert!(text.contains("permission denied"), "{text}");
         assert!(!text.contains("good-token"), "token must not leak: {text}");
         lookup.assert_async().await;

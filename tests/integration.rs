@@ -32,7 +32,8 @@ fn pgpp(url: &str) -> Command {
     c.env("DATABASE_URL", url)
         .env_remove("VAULT_ADDR")
         .env_remove("VAULT_TOKEN")
-        .env_remove("VAULT_NAMESPACE");
+        .env_remove("VAULT_NAMESPACE")
+        .env_remove("PGPP_VAULT_SKIP_PREFLIGHT");
     c
 }
 
@@ -429,6 +430,15 @@ async fn vault_preflight_failure_rotates_nothing() {
                 .json_body(serde_json::json!({"errors": ["permission denied"]}));
         })
         .await;
+    // Vault answers 403 (not 401) for an expired, revoked or unknown token
+    let denied = MockServer::start_async().await;
+    let denied_lookup = denied
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/auth/token/lookup-self");
+            then.status(403)
+                .json_body(serde_json::json!({"errors": ["permission denied"]}));
+        })
+        .await;
     let read_only = MockServer::start_async().await;
     read_only
         .mock_async(|when, then| {
@@ -444,7 +454,7 @@ async fn vault_preflight_failure_rotates_nothing() {
         })
         .await;
     let mut writes = Vec::new();
-    for server in [&refused, &read_only] {
+    for server in [&refused, &denied, &read_only] {
         writes.push(
             server
                 .mock_async(|when, then| {
@@ -456,6 +466,7 @@ async fn vault_preflight_failure_rotates_nothing() {
     }
     for (addr, expected) in [
         (refused.base_url(), "lookup-self"),
+        (denied.base_url(), "403"),
         ("http://127.0.0.1:9".to_string(), "lookup-self"),
         (read_only.base_url(), "may not write"),
     ] {
@@ -478,6 +489,7 @@ async fn vault_preflight_failure_rotates_nothing() {
         assert_refused_before_rotation(&url, "pgpp_t_vpre", out);
     }
     assert_eq!(lookup.hits_async().await, 1);
+    assert_eq!(denied_lookup.hits_async().await, 1);
     for w in &writes {
         assert_eq!(w.hits_async().await, 0, "nothing written to Vault");
     }
@@ -485,9 +497,10 @@ async fn vault_preflight_failure_rotates_nothing() {
     assert_eq!(st[0]["status"], "unknown", "password never changed");
 }
 
-/// A token without the default policy (lookup-self denied) and without the
-/// right to call capabilities-self still rotates: two warnings, then the
-/// write succeeds.
+/// A token without the default policy (lookup-self and capabilities-self
+/// denied) is refused by default; with --vault-skip-preflight (or
+/// PGPP_VAULT_SKIP_PREFLIGHT=1) no preflight request is sent, a warning is
+/// printed and the write succeeds after the rotation.
 #[tokio::test]
 #[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
 async fn vault_token_without_introspection_still_rotates() {
@@ -496,7 +509,7 @@ async fn vault_token_without_introspection_still_rotates() {
     fresh_login_role(&mut conn, "pgpp_t_vnodef").await;
 
     let server = MockServer::start_async().await;
-    server
+    let introspection = server
         .mock_async(|when, then| {
             when.path_matches(
                 httpmock::Regex::new("^/v1/(auth/token/lookup-self|sys/capabilities-self)$")
@@ -512,8 +525,9 @@ async fn vault_token_without_introspection_still_rotates() {
             then.status(200);
         })
         .await;
-    let out = pgpp(&url)
-        .args([
+    let rotate = |extra: &[&str], env: Option<&str>| {
+        let mut cmd = pgpp(&url);
+        cmd.args([
             "-f",
             "json",
             "rotate",
@@ -521,17 +535,65 @@ async fn vault_token_without_introspection_still_rotates() {
             "--vault-kv",
             "secret/nodef",
         ])
+        .args(extra)
         .env("VAULT_ADDR", server.base_url())
-        .env("VAULT_TOKEN", "t-no-default\n")
-        .output()
-        .unwrap();
+        .env("VAULT_TOKEN", "t-no-default\n");
+        if let Some(v) = env {
+            cmd.env("PGPP_VAULT_SKIP_PREFLIGHT", v);
+        }
+        cmd.output().unwrap()
+    };
+
+    // default: refused before the rotation
+    let out = rotate(&[], None);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(out.status.success(), "{stderr}");
-    assert_eq!(stderr.matches("pgpp: warning:").count(), 2, "{stderr}");
-    assert!(!stderr.contains("t-no-default"), "{stderr}");
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["delivered_to"], serde_json::json!(["vault"]));
-    write.assert_async().await;
+    assert!(stderr.contains("--vault-skip-preflight"), "{stderr}");
+    assert_refused_before_rotation(&url, "pgpp_t_vnodef", out);
+    assert_eq!(introspection.hits_async().await, 1, "stops at lookup-self");
+    assert_eq!(write.hits_async().await, 0);
+
+    let rotations = || {
+        run_json(
+            &url,
+            &[
+                "audit",
+                "--role",
+                "pgpp_t_vnodef",
+                "--type",
+                "password_rotated",
+            ],
+        )
+        .as_array()
+        .unwrap()
+        .len()
+    };
+    let before = rotations();
+
+    // explicit opt-out, by option or by environment variable
+    for (extra, env) in [
+        (&["--vault-skip-preflight"][..], None),
+        (&[][..], Some("1")),
+        (&[][..], Some("true")),
+    ] {
+        let out = rotate(extra, env);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(out.status.success(), "{extra:?} {env:?}: {stderr}");
+        assert_eq!(stderr.matches("pgpp: warning:").count(), 1, "{stderr}");
+        assert!(stderr.contains("preflight skipped"), "{stderr}");
+        assert!(!stderr.contains("t-no-default"), "{stderr}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["delivered_to"], serde_json::json!(["vault"]));
+    }
+    assert_eq!(introspection.hits_async().await, 1, "no preflight request");
+    assert_eq!(write.hits_async().await, 3);
+
+    // a falsy value keeps the preflight: refused, no further rotation
+    let out = rotate(&[], Some("0"));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(rotations(), before + 3);
+    assert_eq!(introspection.hits_async().await, 2);
+    assert_eq!(write.hits_async().await, 3);
 }
 
 #[tokio::test]
@@ -583,7 +645,8 @@ async fn lock_and_unlock() {
     run_ok(&url, &["unlock", "pgpp_t_lock"]);
 
     // after a rename, role_state.role_name keeps the old name until the next
-    // maintenance pass: locked_until must still be reported (lookup by OID)
+    // maintenance pass: v_role_status and v_locked join role_state by OID, so
+    // locked_until, locked_by and lock_reason must still be reported
     exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_lock_renamed").await;
     conn.execute("ALTER ROLE pgpp_t_lock RENAME TO pgpp_t_lock_renamed")
         .await
@@ -605,7 +668,7 @@ async fn lock_and_unlock() {
             .is_some_and(|s| s != "infinity"),
         "{out}"
     );
-    // ... and `locked` must still show who locked it and why (OID join)
+    // ... and `locked` (view v_locked) must still show who locked it and why
     let locked = run_json(&url, &["locked"]);
     let row = locked
         .as_array()
@@ -781,14 +844,24 @@ async fn check_reads_password_from_stdin() {
 
     // the log warning is printed only when pgpp cannot set
     // log_parameter_max_length and the value in force is not already 0
-    let (masked, may_set): (String, bool) = sqlx::query_as(
+    // has_parameter_privilege() exists from PostgreSQL 15 on; before, only a
+    // superuser may set log_parameter_max_length
+    let (masked, version, superuser): (String, i32, bool) = sqlx::query_as(
         "SELECT current_setting('log_parameter_max_length'), \
-                rolsuper OR has_parameter_privilege('log_parameter_max_length', 'SET') \
+                current_setting('server_version_num')::int, rolsuper \
            FROM pg_catalog.pg_roles WHERE rolname = current_user",
     )
     .fetch_one(&mut conn)
     .await
     .unwrap();
+    let may_set = superuser
+        || (version >= 150000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT has_parameter_privilege('log_parameter_max_length', 'SET')",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap());
     let (code, out, err) = check_with_stdin_full(&url, "pgpp_t_chk", "Zq7!vLm2#pRw9xKt", true);
     assert_eq!(code, 0, "{out}");
     let expect_warning = !may_set && masked != "0";
@@ -1156,6 +1229,7 @@ fn rotate_against_vault(server: &MockServer) -> Output {
         .env_remove("VAULT_NAMESPACE")
         .env_remove("VAULT_CACERT")
         .env_remove("VAULT_CAPATH")
+        .env_remove("PGPP_VAULT_SKIP_PREFLIGHT")
         .output()
         .unwrap()
 }
@@ -1181,10 +1255,10 @@ async fn vault_token_refused_before_connecting() {
     assert!(!stderr.contains("t-refused"), "{stderr}");
     lookup.assert_async().await;
 
-    // 403 on lookup-self (token without the default policy) is only a
-    // warning: with the write capability, pgpp goes on to the connection
+    // 403 on lookup-self (expired, revoked or unknown token, or a token
+    // without the default policy): refused too, before the connection
     let server = MockServer::start_async().await;
-    server
+    let lookup = server
         .mock_async(|when, then| {
             when.method(GET).path("/v1/auth/token/lookup-self");
             then.status(403);
@@ -1199,13 +1273,14 @@ async fn vault_token_refused_before_connecting() {
         .await;
     let out = rotate_against_vault(&server);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("pgpp: warning:") && stderr.contains("403"),
+        stderr.contains("403") && stderr.contains("VAULT_TOKEN"),
         "{stderr}"
     );
-    assert!(stderr.contains("cannot connect"), "{stderr}");
-    caps.assert_async().await;
+    assert!(!stderr.contains("cannot connect"), "{stderr}");
+    lookup.assert_async().await;
+    assert_eq!(caps.hits_async().await, 0);
 }
 
 #[test]
