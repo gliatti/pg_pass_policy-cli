@@ -492,18 +492,15 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
     let err = write(&cfg, &target(), &build_payload("app", "x", "now"))
         .await
         .unwrap_err();
-    assert!(
-        err.chain()
-            .filter_map(|e| e.downcast_ref::<std::io::Error>())
-            .any(|e| e.kind() == std::io::ErrorKind::ConnectionRefused),
-        "{err:#}"
-    );
-    // the rendered message the README quotes (Linux wording)
-    #[cfg(target_os = "linux")]
-    assert!(
-        pgpp::format_error(&err).contains("Connection refused"),
-        "{err:#}"
-    );
+    let refused = err
+        .chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .find(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+        .unwrap_or_else(|| panic!("no refused connection in {err:#}"));
+    // the rendered message carries the system's text of that refusal (the
+    // README quotes the Linux one), on any system
+    let msg = pgpp::format_error(&err);
+    assert!(msg.contains(&refused.to_string()), "{msg}");
     drop((reserved, listener));
 }
 

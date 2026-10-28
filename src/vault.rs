@@ -1232,9 +1232,8 @@ mod tests {
             // port 0: resolve() makes reqwest take the port of the URL;
             // an explicit port is covered end to end by tests/vault.rs
             // http_localhost_reaches_the_pinned_loopback_address; the
-            // default port (80/443) is not tested: an end-to-end test would
-            // need a listener on a privileged port (and, for https, a
-            // certificate for localhost)
+            // default port (80/443) is not tested: a choice, an end-to-end
+            // test would bind 80/443, which is privileged on most hosts
             assert_eq!(pinned, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "{addr}");
         }
         // other https names are not pinned
