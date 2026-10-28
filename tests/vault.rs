@@ -501,16 +501,13 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
     // any system
     let msg = pgpp::format_error(&err);
     assert!(msg.contains(&refused.to_string()), "{msg}");
-    // the wording the README quotes on Linux (errno taken from the error:
-    // ECONNREFUSED is 111 on x86-64 and arm64, not on every architecture)
-    #[cfg(target_os = "linux")]
-    assert!(
-        msg.contains(&format!(
-            "Connection refused (os error {})",
-            refused.raw_os_error().unwrap_or_default()
-        )),
-        "{msg}"
-    );
+    // the literal wording the README quotes (ECONNREFUSED is 111 on most
+    // Linux architectures, not on MIPS, SPARC, Alpha or PA-RISC)
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    assert!(msg.contains("Connection refused (os error 111)"), "{msg}");
     drop((reserved, listener));
 }
 

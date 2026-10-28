@@ -811,8 +811,8 @@ secours) ou relancer la rotation après correction du jeton.
   l'adresse jointe est celle qu'on écrit. Un agent Vault qui n'écoute que
   sur `[::1]` n'est donc pas joint : l'erreur affichée contient le message
   de connexion refusée du système (`Connection refused (os error 111)`
-  sous Linux x86-64 ou arm64 ; le texte et le numéro varient selon le
-  système). Aucun indice sur IPv6 n'y est ajouté, c'est voulu : le même
+  sous Linux, sauf sur MIPS, SPARC, Alpha et PA-RISC ; le texte et le
+  numéro varient selon le système). Aucun indice sur IPv6 n'y est ajouté, c'est voulu : le même
   symptôme vient aussi d'un port erroné ou d'un agent arrêté, et l'indice
   égarerait. Un tel agent se désigne par `http://[::1]:PORT`, ou par
   `https://[::1]:PORT`, qui exige alors un certificat portant l'adresse IP
