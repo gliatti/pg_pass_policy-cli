@@ -53,9 +53,10 @@ pub async fn expiring(
 ) -> Result<()> {
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
-         WHERE v.status IN ('warning', 'grace', 'expired') \
-            OR ($1::interval IS NOT NULL AND v.expires_at IS NOT NULL \
-                AND v.expires_at <= now() + $1) \
+         WHERE v.status <> 'exempt' \
+           AND (v.status IN ('warning', 'grace', 'expired') \
+                OR ($1::interval IS NOT NULL AND v.expires_at IS NOT NULL \
+                    AND v.expires_at <= now() + $1)) \
          ORDER BY v.expires_at NULLS LAST, v.role_name"
     );
     let rows = sqlx::query(&sql)
