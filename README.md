@@ -582,9 +582,8 @@ qu'en `https://` : `localhost`, `localhost.`, un nom en `.localhost` comme
 `vault.localhost`, avec ou sans point final). Un tel nom n'est jamais
 résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe où) :
 la RFC 6761 le réserve à la boucle locale, et le client HTTP se connecte
-directement à `127.0.0.1` sur le port de l'URL, en gardant le nom dans
-l'en-tête `Host`. Un agent Vault qui n'écoute que sur `[::1]` se désigne
-donc par `http://[::1]:8200`. Toute autre adresse en clair (y compris `localhost.example.net`
+directement à `127.0.0.1`, puis à `[::1]` si la première connexion échoue,
+sur le port de l'URL, en gardant le nom dans l'en-tête `Host`. Toute autre adresse en clair (y compris `localhost.example.net`
 ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe
 y circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
@@ -664,8 +663,9 @@ HTTP que pour l'écriture (redirections refusées) :
    refus est acquis dès la réponse. La relecture vient après, bornée à
    5 secondes ; un Vault qui ne répond pas dans ce délai ou un Ctrl-C
    l'abandonne et donne le même message prudent, suivi de `(no answer
-   within 5s)` ou de `(interrupted)`, jamais « may or may not have been
-   written ».
+   within 5s)`, de `(interrupted before the check)` (Ctrl-C déjà reçu : la
+   relecture n'est pas envoyée) ou de `(interrupted)` (Ctrl-C pendant la
+   relecture), jamais « may or may not have been written ».
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme

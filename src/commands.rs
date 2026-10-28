@@ -93,19 +93,23 @@ fn sqlstate(err: &anyhow::Error) -> Option<String> {
 /// transaction.  The callers guarantee it: the commands run their
 /// statements outside any transaction except `check`, whose transaction
 /// is rolled back before its error is returned (and a `Transaction`
-/// dropped by `?` queues its ROLLBACK, sent ahead of the next query); a
-/// transaction left open all the same is rolled back first
-/// ([`extension_version`]).  The check, rollback included, is bounded by [`crate::db::CLOSE_TIMEOUT`].  When it fails or
-/// times out (connection lost, Ctrl-C during the command, permission,
-/// unresponsive server), the original error is kept, with
-/// [`UNVERIFIED_INSTALLATION`] and the reason in front: the hint that an
-/// object is missing is not lost.
+/// dropped by `?` queues its ROLLBACK, sent ahead of the next query).  If
+/// sqlx still counts a transaction as open all the same, the check is not
+/// run: the original error is kept, with [`UNVERIFIED_INSTALLATION`]
+/// (`inside a transaction`) in front.  The check is bounded by
+/// [`crate::db::CLOSE_TIMEOUT`].  When it fails or times out (connection
+/// lost, Ctrl-C during the command, permission, unresponsive server), the
+/// original error is kept, with [`UNVERIFIED_INSTALLATION`] and the reason
+/// in front: the hint that an object is missing is not lost.
 pub async fn diagnose(conn: &mut PgConnection, err: anyhow::Error) -> anyhow::Error {
     let Some(code) = sqlstate(&err) else {
         return err;
     };
     if !SCHEMA_SQLSTATES.contains(&code.as_str()) {
         return err;
+    }
+    if conn.is_in_transaction() {
+        return err.context(format!("{UNVERIFIED_INSTALLATION} (inside a transaction)"));
     }
     let check = tokio::time::timeout(crate::db::CLOSE_TIMEOUT, extension_version(conn)).await;
     match check {
@@ -121,14 +125,9 @@ pub async fn diagnose(conn: &mut PgConnection, err: anyhow::Error) -> anyhow::Er
 }
 
 /// `extversion` of `pg_pass_policy` in `pg_extension`, `None` when it is
-/// not installed.  A transaction still open on `conn` (none is expected,
-/// see [`diagnose`]) is rolled back first ([`crate::db::rollback_open`]).
+/// not installed.  `conn` must be outside any transaction (see
+/// [`diagnose`]).
 async fn extension_version(conn: &mut PgConnection) -> Result<Option<String>> {
-    // defensive: the callers leave no transaction open (see `diagnose`),
-    // but the check must never run in an aborted one
-    crate::db::rollback_open(conn)
-        .await
-        .context("cannot roll back the failed transaction")?;
     sqlx::query_scalar::<_, String>(
         "SELECT extversion::text FROM pg_catalog.pg_extension \
           WHERE extname = 'pg_pass_policy'",
@@ -1708,14 +1707,12 @@ mod tests {
     }
 
     /// A transaction left open on the connection (none is expected, here
-    /// one forgotten by sqlx and aborted by the error) is rolled back
-    /// before the check of `pg_extension`, through the transaction manager
-    /// of sqlx: the check reads the catalog (no « current transaction is
-    /// aborted »), and sqlx counts no transaction afterwards, so that the
-    /// next `begin` is a real BEGIN, not a SAVEPOINT outside any block.
+    /// one forgotten by sqlx and aborted by the error): the check of
+    /// `pg_extension` is not run, the original error is kept with
+    /// [`UNVERIFIED_INSTALLATION`] (`inside a transaction`) in front.
     #[tokio::test]
     #[ignore = "needs PGPP_TEST_URL"]
-    async fn a_transaction_left_open_is_rolled_back_before_the_check() {
+    async fn a_transaction_left_open_skips_the_check() {
         use sqlx::Connection;
         let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
         let mut conn = PgConnection::connect(&url).await.unwrap();
@@ -1729,15 +1726,10 @@ mod tests {
         assert_eq!(code_of(&e), "42P01");
         let before = crate::format_error(&e);
         let m = crate::format_error(&diagnose(&mut conn, e).await);
-        assert_eq!(m, before, "the check failed: {m}");
-        assert!(!conn.is_in_transaction());
-        let tx = conn.begin().await.unwrap();
-        tx.commit().await.unwrap();
-        let one: i32 = sqlx::query_scalar("SELECT 1")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-        assert_eq!(one, 1);
+        assert_eq!(
+            m,
+            format!("{UNVERIFIED_INSTALLATION} (inside a transaction): {before}")
+        );
         crate::db::close(conn).await;
     }
 
@@ -2104,7 +2096,9 @@ mod tests {
         let target = VaultTarget::parse("secret/db/app", None).unwrap();
         let cfg = VaultConfig::with_timeout(&addr, "t", None, Duration::from_millis(1200)).unwrap();
         let started = std::time::Instant::now();
-        let err = vault::write_secret(&cfg, &target, &build_payload("app", "pw", "now"))
+        let body_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let payload = build_payload("app", "pw", "now");
+        let err = vault::send_write(&cfg, &target, &payload, body_sent)
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(1100), "{err:#}");

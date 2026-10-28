@@ -1,7 +1,7 @@
 //! HashiCorp Vault KV v2 integration.
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,7 +314,7 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// host the `Location` header names, bypassing the loopback rule of
 /// `check_addr`.  A redirect is reported as an error instead.  `pinned`
 /// (`http://localhost`) replaces the resolution of that name by the
-/// loopback address set by `check_addr_pinned`.  `connect_timeout` bounds the
+/// loopback addresses set by `check_addr_pinned`.  `connect_timeout` bounds the
 /// connection alone (see [`CONNECT_TIMEOUT`]).
 ///
 /// `direct` (a loopback target, see [`is_loopback_target`]) disables the
@@ -337,8 +337,8 @@ fn build_client(
     if direct {
         builder = builder.no_proxy();
     }
-    if let Some((host, addr)) = pinned {
-        builder = builder.resolve(host, *addr);
+    if let Some((host, addrs)) = pinned {
+        builder = builder.resolve_to_addrs(host, addrs);
     }
     for cert in root_certs {
         builder = builder.add_root_certificate(cert.clone());
@@ -356,18 +356,18 @@ pub fn check_addr(addr: &str) -> Result<Url> {
     Ok(check_addr_pinned(addr)?.0)
 }
 
-/// Host name of an `http://` localhost address with the loopback address
+/// Host name of an `http://` localhost address with the loopback addresses
 /// it is pinned to; the HTTP client connects there without resolving it.
-type Pinned = Option<(String, SocketAddr)>;
+type Pinned = Option<(String, [SocketAddr; 2])>;
 
-/// [`check_addr`], returning in addition the address a localhost name is
+/// [`check_addr`], returning in addition the addresses a localhost name is
 /// pinned to.  With `http://`, the host must be a literal loopback address
 /// (`127.0.0.0/8`, `[::1]`), or a localhost name ([`is_localhost_name`]:
 /// `localhost`, `localhost.`, `vault.localhost`, as with `https://`).  Such
 /// a name is never resolved (neither `/etc/hosts` nor DNS, which could
 /// point it anywhere, nor a blocking call): RFC 6761 reserves it for the
-/// loopback interface, and the HTTP client connects to `127.0.0.1` on the
-/// port of the URL, under that name (`Host` header).
+/// loopback interface, and the HTTP client connects to `127.0.0.1`, then
+/// `[::1]`, on the port of the URL, under that name (`Host` header).
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
     // (`user:pw@`) that are only detected once the URL is parsed.
@@ -395,9 +395,12 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
             }
             // a localhost name (RFC 6761): pinned, never resolved
             let port = url.port_or_known_default().unwrap_or(80);
-            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let addrs = [
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+            ];
             let host = host.to_string();
-            Ok((url, Some((host, addr))))
+            Ok((url, Some((host, addrs))))
         }
         other => bail!("VAULT_ADDR: unsupported scheme {other:?} (use https://)"),
     }
@@ -810,21 +813,15 @@ async fn error_body(resp: reqwest::Response) -> String {
     }
 }
 
-/// Writes the payload.  Errors (network, HTTP status) are reported with the
-/// status and the response body, which Vault fills with its own error list;
-/// the payload itself is never included.  The body is serialised into a
-/// buffer wiped when reqwest drops it (see [`zeroizing_json`]).
-/// Without a preflight result, a 403 is reported as it is: this is
-/// [`send_write`] alone ([`explain_refusal`] only explains a refusal after
-/// an `update`-only preflight).  A rotation goes through
+/// Writes the payload, the request alone: a refusal of Vault is returned as
+/// it is (a [`WriteRefused`]), never explained ([`explain_refusal`] only
+/// explains a refusal after an `update`-only preflight).  Errors (network,
+/// HTTP status) are reported with the status and the response body, which
+/// Vault fills with its own error list; the payload itself is never
+/// included.  The body is serialised into a buffer wiped when reqwest drops
+/// it (see [`zeroizing_json`]).  A rotation goes through
 /// `commands::vault_delivery`, which calls [`send_write`] and
-/// [`explain_refusal`] apart.
-pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
-    send_write(cfg, target, payload, Arc::new(AtomicBool::new(false))).await
-}
-
-/// The write request alone: a refusal of Vault is returned as it is
-/// (a [`WriteRefused`]), never explained.  `body_sent` is set once the
+/// [`explain_refusal`] apart.  `body_sent` is set once the
 /// HTTP client starts to send the body (see [`TrackedBody`]): while it is
 /// still false, Vault cannot have written the secret, whatever the error
 /// (or the interruption), the request being incomplete without its body.
@@ -862,8 +859,9 @@ pub const REREAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// gives the cautious [`REFUSED_SINCE_PREFLIGHT`] with what that read
 /// found.  That read is bounded by `timeout` and abandoned when `cancel`
 /// ends (Ctrl-C): the result is then [`REFUSED_SINCE_PREFLIGHT`] followed
-/// by `(no answer within 5s)` or `(interrupted)`, never « may or may not
-/// have been written ».  The error of that
+/// by `(no answer within <timeout>)`, `(interrupted before the check)` (a
+/// Ctrl-C already received: the read is not sent) or `(interrupted)`
+/// (during the read), never « may or may not have been written ».  The error of that
 /// read is only quoted as text: the result stays an answer of Vault to the
 /// write ([`may_have_been_received`] is false).  Any other error is
 /// returned as it is.
@@ -896,27 +894,27 @@ pub async fn explain_refusal(
             Err(e) => Some(format!("request to {url} failed ({e})")),
         }
     };
-    // biased: a Ctrl-C already received skips the read
-    let found = tokio::select! {
+    let mut cancel = std::pin::pin!(cancel);
+    // a Ctrl-C already received skips the read
+    let already = tokio::select! {
         biased;
-        () = cancel => "interrupted".to_string(),
-        r = tokio::time::timeout(timeout, reread) => match r {
-            Ok(None) => return anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}"),
-            Ok(Some(found)) => found,
-            Err(_) => format!("no answer within {}", short_duration(timeout)),
-        },
+        () = &mut cancel => true,
+        () = std::future::ready(()) => false,
+    };
+    let found = if already {
+        "interrupted before the check".to_string()
+    } else {
+        tokio::select! {
+            biased;
+            () = &mut cancel => "interrupted".to_string(),
+            r = tokio::time::timeout(timeout, reread) => match r {
+                Ok(None) => return anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}"),
+                Ok(Some(found)) => found,
+                Err(_) => format!("no answer within {timeout:?}"),
+            },
+        }
     };
     anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT} ({found})")
-}
-
-/// `timeout` of [`explain_refusal`] for its message: whole seconds (`5s`),
-/// milliseconds otherwise (`300ms`).
-fn short_duration(d: Duration) -> String {
-    if d.subsec_nanos() == 0 {
-        format!("{}s", d.as_secs())
-    } else {
-        format!("{}ms", d.as_millis())
-    }
 }
 
 /// Request body made of a single chunk, which raises `sent` when the HTTP
@@ -1215,7 +1213,8 @@ mod tests {
             assert!(check_addr_pinned(addr).unwrap().1.is_none(), "{addr}");
         }
         // every localhost name (is_localhost_name, as with https://) is
-        // pinned to 127.0.0.1 on the port of the URL under its own name,
+        // pinned to 127.0.0.1 and [::1] on the port of the URL under its
+        // own name,
         // whatever its case and whatever the system would resolve: names
         // no resolver knows are accepted the same way
         for (addr, port) in [
@@ -1232,7 +1231,10 @@ mod tests {
             assert_eq!(host, url.host_str().unwrap(), "{addr}");
             assert_eq!(
                 pinned,
-                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                [
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+                ],
                 "{addr}"
             );
         }
