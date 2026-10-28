@@ -480,8 +480,8 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         eprintln!("skipped: port {port} is taken on 127.0.0.1");
         return;
     }
-    // short timeout: a regression reaching [::1] (never accepted) fails
-    // fast instead of waiting for REQUEST_TIMEOUT
+    // short timeout: a regression reaching [::1] (accepted by the kernel,
+    // never answered) fails fast instead of waiting for REQUEST_TIMEOUT
     let cfg = VaultConfig::with_timeout(
         format!("http://localhost:{port}"),
         "tok",

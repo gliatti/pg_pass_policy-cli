@@ -809,11 +809,12 @@ secours) ou relancer la rotation après correction du jeton.
   `127.0.0.1` seul. C'est une décision, sans repli sur `[::1]` : une seule
   adresse, jamais de course entre IPv4 et IPv6 (happy eyeballs), et
   l'adresse jointe est celle qu'on écrit. Un agent Vault qui n'écoute que
-  sur `[::1]` n'est donc pas joint : l'erreur affichée contient
-  `Connection refused` (suivi d'un numéro d'erreur qui dépend du système,
-  `os error 111` sous Linux). Aucun indice sur
-  IPv6 n'y est ajouté, c'est voulu : le même symptôme vient aussi d'un
-  port erroné ou d'un agent arrêté, et l'indice égarerait. Un tel agent
+  sur `[::1]` n'est donc pas joint : l'erreur affichée se termine par le
+  message de connexion refusée du système (`Connection refused (os error
+  111)` sous Linux ; le texte et le numéro varient selon le système).
+  Aucun indice sur IPv6 n'y est ajouté, c'est voulu : le même symptôme
+  vient aussi d'un port erroné ou d'un agent arrêté, et l'indice
+  égarerait. Un tel agent
   se désigne par `http://[::1]:PORT`, ou par `https://[::1]:PORT`, qui
   exige alors un certificat portant l'adresse IP `::1` dans son SAN (le
   nom `localhost` n'y suffit pas).
