@@ -24,7 +24,9 @@ impl VaultTarget {
     /// Splits `--vault-kv` into mount and path.  Without `--vault-mount`, the
     /// first path component is the mount (`secret/db/app` → `secret`, `db/app`).
     /// Every segment is validated so that the URL built from it cannot point
-    /// to another endpoint than the one the operator typed.
+    /// to another endpoint than the one the operator typed; only the slashes
+    /// at both ends are dropped, an empty segment is refused everywhere,
+    /// including at the boundary of the mount (`secret//app`).
     pub fn parse(kv_path: &str, mount: Option<&str>) -> Result<Self> {
         let kv_path = kv_path.trim().trim_matches('/');
         if kv_path.is_empty() {
@@ -33,10 +35,8 @@ impl VaultTarget {
         let (mount, path) = match mount {
             Some(m) => (m.trim().trim_matches('/').to_string(), kv_path.to_string()),
             None => match kv_path.split_once('/') {
-                Some((m, p)) if !p.trim_matches('/').is_empty() => {
-                    (m.to_string(), p.trim_matches('/').to_string())
-                }
-                _ => bail!(
+                Some((m, p)) => (m.to_string(), p.to_string()),
+                None => bail!(
                     "--vault-kv \"{kv_path}\": expected <mount>/<path> (or use --vault-mount)"
                 ),
             },
@@ -678,6 +678,8 @@ mod tests {
             "secret/../x",
             "secret/./x",
             "secret/a//b",
+            "secret//app",
+            "secret///app",
             "secret/a%2Fb",
             "secret/a b",
             "secret/a\\b",
@@ -689,6 +691,8 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+        assert!(VaultTarget::parse("a//b", Some("kv")).is_err());
+        assert!(VaultTarget::parse("x", Some("team//kv")).is_err());
         assert!(VaultTarget::parse("x", Some("..")).is_err());
         assert!(VaultTarget::parse("x", Some("kv?a")).is_err());
         assert!(VaultTarget::parse("team/kv/app", None).is_ok());

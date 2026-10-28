@@ -21,7 +21,7 @@ use crate::duration::to_pg_interval;
 use crate::output::{
     is_broken_pipe, map_stdout_error, print_message, print_record, write_line, Format, ResultSet,
 };
-use crate::secret::{check_shell, run_exec, Interrupt, Secret};
+use crate::secret::{check_shell, run_exec, Interrupt, Secret, SigintGuard};
 use crate::vault::{self, build_payload, write_secret, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
 
@@ -159,6 +159,11 @@ impl Delivery {
     pub async fn prepare(opts: &RotateOpts) -> std::result::Result<Self, PrepareError> {
         let vault = match &opts.vault_kv {
             Some(kv) => {
+                // PGPP_VAULT_SKIP_PREFLIGHT is only validated when it matters
+                let skip_preflight = opts
+                    .vault_skip_preflight
+                    .get()
+                    .map_err(|e| PrepareError::Invalid(anyhow::anyhow!(e)))?;
                 let target = VaultTarget::parse(kv, opts.vault_mount.as_deref())
                     .map_err(PrepareError::Invalid)?;
                 if opts.vault_mount.is_some() {
@@ -167,15 +172,15 @@ impl Delivery {
                     }
                 }
                 let cfg = VaultConfig::from_env().map_err(PrepareError::Invalid)?;
-                Some((cfg, target))
+                Some((cfg, target, skip_preflight))
             }
             None => None,
         };
         if opts.exec.is_some() {
             check_shell().map_err(PrepareError::Invalid)?;
         }
-        if let Some((cfg, target)) = &vault {
-            if opts.vault_skip_preflight {
+        if let Some((cfg, target, skip_preflight)) = &vault {
+            if *skip_preflight {
                 crate::warn(
                     "Vault preflight skipped (--vault-skip-preflight): \
                      VAULT_TOKEN and its permission on the path are only checked by the \
@@ -195,7 +200,7 @@ impl Delivery {
             show: opts.show,
             exec: opts.exec.clone(),
             exec_timeout: opts.exec_timeout.0,
-            vault,
+            vault: vault.map(|(cfg, target, _)| (cfg, target)),
         })
     }
 }
@@ -827,8 +832,33 @@ fn read_password() -> Result<Secret> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         crate::output::write_stderr("Password to check: ", false);
-        let pw = rpassword::read_password().context("cannot read the password")?;
-        return Ok(Zeroizing::new(pw));
+        // rpassword puts the terminal in raw mode (no echo, no ISIG) and
+        // turns a typed Ctrl-C into `raise(SIGINT)` before restoring the
+        // terminal settings (in a Drop): with the default action, pgpp
+        // would die with the echo still off.  The guard catches SIGINT for
+        // the duration of the prompt, so that rpassword returns and
+        // restores the terminal; the Ctrl-C is then replayed below with the
+        // previous disposition.
+        let guard = SigintGuard::install();
+        let read = rpassword::read_password().map(Zeroizing::new);
+        let interrupted = guard.received()
+            || matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::Interrupted);
+        drop(guard);
+        if interrupted {
+            drop(read);
+            crate::output::write_stderr("", true);
+            // SAFETY: plain system call; the previous disposition of SIGINT
+            // (default: terminate) is back in force.
+            unsafe {
+                libc::raise(libc::SIGINT);
+            }
+            bail!("interrupted (Ctrl-C)");
+        }
+        let pw = read.context("cannot read the password")?;
+        if pw.len() > MAX_CANDIDATE_BYTES {
+            return Err(too_long().into());
+        }
+        return Ok(pw);
     }
     // Read on a duplicate of descriptor 0, unbuffered: `StdinLock` would keep
     // a copy of the password in the internal buffer of `std::io::stdin()`,
@@ -847,6 +877,18 @@ fn read_password() -> Result<Secret> {
     line.context("cannot read the password from stdin")
 }
 
+/// Longest candidate password accepted by `check` (the server refuses
+/// passwords longer than 1024 characters anyway): past it, the input is a
+/// usage error instead of an unbounded read into memory.
+const MAX_CANDIDATE_BYTES: usize = 4096;
+
+fn too_long() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("the password is longer than {MAX_CANDIDATE_BYTES} bytes"),
+    )
+}
+
 /// Line being read, in a zeroised buffer that is replaced (old one wiped)
 /// instead of being reallocated in place, so that no unwiped copy is left
 /// behind whatever the length.
@@ -857,8 +899,15 @@ impl LineBuf {
         LineBuf(Zeroizing::new(Vec::with_capacity(256)))
     }
 
-    fn extend(&mut self, bytes: &[u8]) {
+    /// Appends `bytes`; refuses a line longer than [`MAX_CANDIDATE_BYTES`]
+    /// (one more byte is allowed for a final `\r`, checked by
+    /// [`LineBuf::finish`]).  The bytes already read are wiped when the
+    /// buffer is dropped.
+    fn extend(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let needed = self.0.len() + bytes.len();
+        if needed > MAX_CANDIDATE_BYTES + 1 {
+            return Err(too_long());
+        }
         if needed > self.0.capacity() {
             let mut capacity = self.0.capacity().max(1);
             while capacity < needed {
@@ -869,12 +918,16 @@ impl LineBuf {
             self.0 = bigger;
         }
         self.0.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Strips a final `\r` and converts to a [`Secret`].
     fn finish(mut self) -> std::io::Result<Secret> {
         if self.0.last() == Some(&b'\r') {
             self.0.pop();
+        }
+        if self.0.len() > MAX_CANDIDATE_BYTES {
+            return Err(too_long());
         }
         match String::from_utf8(std::mem::take(&mut *self.0)) {
             Ok(s) => Ok(Zeroizing::new(s)),
@@ -900,7 +953,7 @@ fn read_first_line(input: &mut impl Read) -> std::io::Result<Secret> {
         match input.read(&mut byte[..]) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.extend(&byte[..]),
+            Ok(_) => line.extend(&byte[..])?,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
@@ -923,14 +976,14 @@ fn read_first_line_seekable(input: &mut (impl Read + Seek)) -> std::io::Result<S
             Err(e) => return Err(e),
         };
         if let Some(pos) = block[..n].iter().position(|&b| b == b'\n') {
-            line.extend(&block[..pos]);
+            line.extend(&block[..pos])?;
             let unread = (n - pos - 1) as i64;
             if unread > 0 {
                 input.seek(SeekFrom::Current(-unread))?;
             }
             break;
         }
-        line.extend(&block[..n]);
+        line.extend(&block[..n])?;
     }
     line.finish()
 }
@@ -1090,8 +1143,9 @@ mod tests {
         assert_eq!(read(b"").0.unwrap(), "");
         assert_eq!(read(b"\nnext"), (Some(String::new()), 1));
         assert!(read(b"\xff\xfe\n").0.is_none(), "invalid UTF-8");
-        // longer than a block and than the initial capacity
-        let long = "é".repeat(3000);
+        // longer than a block and than the initial capacity, and exactly
+        // at the limit (4096 bytes)
+        let long = "é".repeat(2048);
         let data = format!("{long}\nrest");
         let (line, pos) = read(data.as_bytes());
         assert_eq!(line.unwrap(), long);
@@ -1100,6 +1154,46 @@ mod tests {
             b"rest",
             "seeks back after the newline"
         );
+    }
+
+    /// A candidate longer than 4 KiB is refused (usage error of `check`)
+    /// instead of being read without bound, by both readers; 4096 bytes
+    /// (plus a final `\r`) are accepted.
+    #[test]
+    fn a_candidate_longer_than_4_kib_is_refused() {
+        use std::io::Cursor;
+        let at_limit = "a".repeat(MAX_CANDIDATE_BYTES);
+        let over = "a".repeat(MAX_CANDIDATE_BYTES + 1);
+        for (data, ok) in [
+            (format!("{at_limit}\n"), true),
+            (format!("{at_limit}\r\n"), true),
+            (at_limit.clone(), true),
+            (format!("{over}\n"), false),
+            (format!("{at_limit}a\r\n"), false),
+            ("a".repeat(1 << 20), false),
+        ] {
+            let mut input: &[u8] = data.as_bytes();
+            let r = read_first_line(&mut input);
+            let mut c = Cursor::new(data.as_bytes().to_vec());
+            let s = read_first_line_seekable(&mut c);
+            for (kind, r) in [("pipe", r), ("file", s)] {
+                match r {
+                    Ok(pw) => {
+                        assert!(ok, "{kind}: accepted {} bytes", data.len());
+                        assert_eq!(pw.as_str(), at_limit, "{kind}");
+                    }
+                    Err(e) => {
+                        assert!(!ok, "{kind}: {e}");
+                        assert!(e.to_string().contains("longer than 4096 bytes"), "{e}");
+                    }
+                }
+            }
+        }
+        // the pipe reader stops at the limit: the rest is not consumed
+        let data = "a".repeat(10_000);
+        let mut input: &[u8] = data.as_bytes();
+        assert!(read_first_line(&mut input).is_err());
+        assert_eq!(input.len(), 10_000 - MAX_CANDIDATE_BYTES - 2);
     }
 
     #[test]

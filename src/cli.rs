@@ -5,7 +5,9 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::Value;
 
-use crate::duration::{parse_duration, MAX_DURATION_SECS};
+use crate::duration::parse_duration;
+#[cfg(test)]
+use crate::duration::MAX_DURATION_SECS;
 use crate::kv::parse_kv;
 use crate::output::Format;
 use crate::secret::EXEC_DEFAULT_TIMEOUT;
@@ -15,24 +17,16 @@ fn duration_arg(s: &str) -> Result<Duration, String> {
 }
 
 /// `--exec-timeout`: a duration (`300s`, `5m`), a bare number of seconds,
-/// or `0` for no limit.
+/// or `0` for no limit.  Everything but `0` goes through [`parse_duration`]
+/// (a bare number as `<n>s`), which owns the bounds and their messages.
 fn exec_timeout_arg(s: &str) -> Result<ExecTimeout, String> {
     let t = s.trim();
-    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
-        let secs: u64 = t
-            .parse()
-            .map_err(|_| format!("invalid duration \"{s}\": number too large"))?;
-        if secs == 0 {
-            return Ok(ExecTimeout(None));
-        }
-        if secs > MAX_DURATION_SECS {
-            return Err(format!(
-                "invalid duration \"{s}\": at most 36500d (100 years)"
-            ));
-        }
-        return Ok(ExecTimeout(Some(Duration::from_secs(secs))));
+    let bare = !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    if bare && t.bytes().all(|b| b == b'0') {
+        return Ok(ExecTimeout(None));
     }
-    parse_duration(s)
+    let input = if bare { format!("{t}s") } else { s.to_string() };
+    parse_duration(&input)
         .map(|d| ExecTimeout(Some(d)))
         .map_err(|e| e.to_string())
 }
@@ -55,9 +49,8 @@ impl std::fmt::Display for ExecTimeout {
 
 /// `--vault-skip-preflight` / `PGPP_VAULT_SKIP_PREFLIGHT`: the boolean
 /// values of clap (`1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`...);
-/// an empty value (`export PGPP_VAULT_SKIP_PREFLIGHT=`) counts as absent,
-/// so that it does not turn every rotation into a usage error.
-fn skip_preflight_arg(s: &str) -> Result<bool, String> {
+/// an empty value (`export PGPP_VAULT_SKIP_PREFLIGHT=`) counts as absent.
+fn parse_skip_preflight(s: &str) -> Result<bool, String> {
     let t = s.trim();
     if t.is_empty() {
         return Ok(false);
@@ -65,8 +58,28 @@ fn skip_preflight_arg(s: &str) -> Result<bool, String> {
     match t.to_ascii_lowercase().as_str() {
         "y" | "yes" | "t" | "true" | "on" | "1" => Ok(true),
         "n" | "no" | "f" | "false" | "off" | "0" => Ok(false),
-        _ => Err(format!("value was not a boolean: \"{s}\"")),
+        _ => Err(format!(
+            "PGPP_VAULT_SKIP_PREFLIGHT: value was not a boolean: \"{s}\""
+        )),
     }
+}
+
+/// Value of `--vault-skip-preflight` / `PGPP_VAULT_SKIP_PREFLIGHT`, kept
+/// unvalidated by clap: the variable may be exported for every invocation,
+/// an invalid value must only be an error for a rotation that writes to
+/// Vault (checked by `Delivery::prepare` when `--vault-kv` is given).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkipPreflight(Result<bool, String>);
+
+impl SkipPreflight {
+    /// The boolean, or the error message naming the variable.
+    pub fn get(&self) -> Result<bool, String> {
+        self.0.clone()
+    }
+}
+
+fn skip_preflight_arg(s: &str) -> Result<SkipPreflight, String> {
+    Ok(SkipPreflight(parse_skip_preflight(s)))
 }
 
 fn kv_arg(s: &str) -> Result<(String, Value), String> {
@@ -154,7 +167,7 @@ pub struct RotateOpts {
         value_parser = skip_preflight_arg,
         help_heading = DELIVERY_HEADING
     )]
-    pub vault_skip_preflight: bool,
+    pub vault_skip_preflight: SkipPreflight,
 }
 
 const DELIVERY_HEADING: &str = "Delivery (choose at least one: --show, --exec or --vault-kv)";
@@ -388,7 +401,7 @@ mod tests {
     #[test]
     fn vault_skip_preflight_flag() {
         let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
-            Command::Rotate { opts, .. } => opts.vault_skip_preflight,
+            Command::Rotate { opts, .. } => opts.vault_skip_preflight.get().unwrap(),
             other => panic!("unexpected command {other:?}"),
         };
         assert!(parse(&[
@@ -398,6 +411,13 @@ mod tests {
             "--vault-kv",
             "secret/app",
             "--vault-skip-preflight"
+        ]));
+        assert!(!parse(&[
+            "pgpp",
+            "rotate",
+            "app",
+            "--vault-kv",
+            "secret/app"
         ]));
         // without --vault-kv the flag is accepted and has no effect (no
         // `requires`: PGPP_VAULT_SKIP_PREFLIGHT may be exported for every
@@ -412,15 +432,19 @@ mod tests {
     #[test]
     fn an_empty_skip_preflight_value_counts_as_absent() {
         for v in ["", "  "] {
-            assert_eq!(skip_preflight_arg(v), Ok(false), "{v:?}");
+            assert_eq!(parse_skip_preflight(v), Ok(false), "{v:?}");
         }
         for v in ["1", "true", "TRUE", "yes", "on", "y", "t"] {
-            assert_eq!(skip_preflight_arg(v), Ok(true), "{v:?}");
+            assert_eq!(parse_skip_preflight(v), Ok(true), "{v:?}");
         }
         for v in ["0", "false", "no", "off", "n", "f"] {
-            assert_eq!(skip_preflight_arg(v), Ok(false), "{v:?}");
+            assert_eq!(parse_skip_preflight(v), Ok(false), "{v:?}");
         }
-        assert!(skip_preflight_arg("maybe").is_err());
+        // an invalid value is not a clap error (checked with --vault-kv
+        // only), its message names the variable
+        let err = parse_skip_preflight("maybe").unwrap_err();
+        assert!(err.contains("PGPP_VAULT_SKIP_PREFLIGHT"), "{err}");
+        assert!(skip_preflight_arg("maybe").is_ok());
         // the value given to the flag by the command line
         let err = Cli::try_parse_from([
             "pgpp",

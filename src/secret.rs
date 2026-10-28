@@ -200,6 +200,60 @@ impl Interrupt {
     }
 }
 
+/// Set by [`on_sigint`] while a [`SigintGuard`] is installed.
+static SIGINT_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_sigint(_: libc::c_int) {
+    // async-signal-safe: a plain atomic store
+    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Catches `SIGINT` for a synchronous step (the password prompt of
+/// `check`): while the guard lives, a Ctrl-C only sets a flag (no
+/// `SA_RESTART`: a read in progress returns `EINTR`), so that the code that
+/// changed the terminal settings can restore them; the previous disposition
+/// is put back on drop.  Unlike [`Interrupt`], nothing stays installed
+/// afterwards: a Ctrl-C later on keeps its usual effect.
+pub struct SigintGuard {
+    /// `None` when the handler could not be installed.
+    previous: Option<libc::sigaction>,
+}
+
+impl SigintGuard {
+    pub fn install() -> Self {
+        SIGINT_RECEIVED.store(false, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `sigaction` structures fully initialised (zeroed, empty
+        // mask); the handler only stores into an atomic.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            let ok = libc::sigaction(libc::SIGINT, &action, &mut previous) == 0;
+            SigintGuard {
+                previous: ok.then_some(previous),
+            }
+        }
+    }
+
+    /// True once a `SIGINT` was received while the guard is installed.
+    pub fn received(&self) -> bool {
+        SIGINT_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for SigintGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            // SAFETY: restores the disposition saved by `install`.
+            unsafe {
+                libc::sigaction(libc::SIGINT, previous, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 /// Environment given to the command (see [`run_exec`]).
 struct Env<'a> {
     role: &'a str,
@@ -293,7 +347,9 @@ async fn run_exec_with(
             Err(s) => stop = Some(s),
         }
     }
-    if exited.is_none() {
+    // the command was killed by pgpp, rather than exited by itself
+    let killed = exited.is_none();
+    if killed {
         // Write failure or delay, --exec-timeout, Ctrl-C: kill the whole
         // process group of `sh`, a sub-process it started (still holding
         // the read end) must not read the line later.  The wait for the
@@ -316,9 +372,7 @@ async fn run_exec_with(
         None => {}
     }
     match written {
-        Written::Failed(e) => bail!(
-            "cannot write the password to the stdin of the --exec command: {e} (command killed)"
-        ),
+        Written::Failed(e) => bail!("{}", write_failure(&e, killed)),
         Written::TimedOut => bail!(
             "--exec command did not read the password from its stdin within {} \
              (command killed)",
@@ -346,6 +400,18 @@ async fn run_exec_with(
         );
     }
     Ok(())
+}
+
+/// Message of a failed write of the password line: the command was killed
+/// by pgpp (write failed while it was running), or had already exited by
+/// itself (the write failed when it ended).
+fn write_failure(e: &std::io::Error, killed: bool) -> String {
+    let outcome = if killed {
+        "command killed"
+    } else {
+        "the command had already exited"
+    };
+    format!("cannot write the password to the stdin of the --exec command: {e} ({outcome})")
 }
 
 /// First event of [`run_exec_with`], while the line is being written.
@@ -428,9 +494,26 @@ fn kill_group(child: &tokio::process::Child) {
 }
 
 /// Number of bytes still buffered in the pipe (drained and wiped).  Called
-/// once the child has exited and the write end is closed: every write end is
-/// gone, so a blocking read returns at once (data, or 0 at end of file).
+/// once the child has exited and the write end of pgpp is closed.  The read
+/// is non-blocking: a descendant that outlived `sh` may still hold a write
+/// end (`exec 3>/proc/self/fd/0; sleep 100 &`), in which case an empty pipe
+/// never reaches end of file; the drain then stops at once (`EAGAIN`)
+/// instead of waiting for that descendant.  `O_NONBLOCK` is set on the open
+/// file description shared with the stdin of the command: a reader that
+/// outlived `sh` then gets `EAGAIN` too, which is fine, it must not read the
+/// line anyway.
 fn unread_bytes(probe: std::os::fd::OwnedFd) -> Result<usize> {
+    use std::os::fd::AsRawFd;
+    let fd = probe.as_raw_fd();
+    // SAFETY: fcntl on a descriptor owned by `probe`.
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if !nonblocking {
+        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+            .context("cannot make the pipe non-blocking"));
+    }
     let mut file = std::fs::File::from(probe);
     let mut buf = Zeroizing::new([0u8; 512]);
     let mut total = 0;
@@ -439,6 +522,7 @@ fn unread_bytes(probe: std::os::fd::OwnedFd) -> Result<usize> {
             Ok(0) => return Ok(total),
             Ok(n) => total += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(total),
             Err(e) => return Err(e.into()),
         }
     }
@@ -843,6 +927,84 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "{tag}");
             assert_killed(&pidfile).await;
         }
+    }
+
+    /// « command killed » only when pgpp killed the command.
+    #[test]
+    fn a_write_failure_says_whether_the_command_was_killed() {
+        let e = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let killed = write_failure(&e, true);
+        assert!(killed.contains("(command killed)"), "{killed}");
+        let exited = write_failure(&e, false);
+        assert!(!exited.contains("killed"), "{exited}");
+        assert!(exited.contains("already exited"), "{exited}");
+    }
+
+    /// A descendant that outlives `sh` and holds a write end of the pipe
+    /// (opened through /proc) does not block the drain: the check returns
+    /// as soon as `sh` exits.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_surviving_writer_does_not_block_the_drain() {
+        let pidfile = temp_path("writer-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = format!(
+            "read -r pw; exec 3>/proc/self/fd/0; sleep 30 & echo $! > '{}'",
+            pidfile.display()
+        );
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(10), exec(&cmd)).await;
+        let elapsed = started.elapsed();
+        // do not leave the sleep behind
+        if wait_for(&pidfile).await {
+            let text = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            if let Ok(pid) = text.trim().parse::<libc::pid_t>() {
+                if pid > 1 {
+                    // SAFETY: plain system call on a process started by the test.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        let r = r.expect("the drain blocked on the surviving writer");
+        r.unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// Current handler of SIGINT.
+    fn sigint_handler() -> libc::sighandler_t {
+        // SAFETY: query only (no new action).
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current),
+                0
+            );
+            current.sa_sigaction
+        }
+    }
+
+    /// While the guard lives, a SIGINT (as raised by rpassword on a typed
+    /// Ctrl-C) is recorded instead of killing the process; the previous
+    /// disposition is restored on drop.
+    #[test]
+    fn the_sigint_guard_catches_and_restores() {
+        let before = sigint_handler();
+        let guard = SigintGuard::install();
+        assert!(!guard.received());
+        assert_ne!(sigint_handler(), before);
+        // SAFETY: the guard's handler is installed: the signal only sets a flag.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        assert!(guard.received());
+        drop(guard);
+        assert_eq!(sigint_handler(), before);
+        // a new guard starts without a received signal
+        let guard = SigintGuard::install();
+        assert!(!guard.received());
     }
 
     #[tokio::test]

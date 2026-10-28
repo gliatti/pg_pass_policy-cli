@@ -1636,29 +1636,45 @@ fn a_closed_stderr_keeps_the_exit_code() {
 
 /// `PGPP_VAULT_SKIP_PREFLIGHT` exported empty counts as absent: the
 /// rotation goes on to the connection (refused here, exit 1), it is not a
-/// usage error (exit 2); an invalid non-empty value still is.
+/// usage error (exit 2).  An invalid non-empty value is a usage error naming
+/// the variable only for a rotation with --vault-kv; without it the variable
+/// is ignored.
 #[test]
 fn an_empty_skip_preflight_variable_is_ignored() {
-    let run = |v: &str| {
+    let run = |v: &str, delivery: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_pgpp"))
-            .args(["rotate", "x", "--show"])
+            .args(["rotate", "x"])
+            .args(delivery)
             .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
             .env("PGPP_VAULT_SKIP_PREFLIGHT", v)
+            .env("VAULT_ADDR", "http://127.0.0.1:9")
+            .env("VAULT_TOKEN", "t-unused")
+            .env_remove("VAULT_NAMESPACE")
+            .env_remove("VAULT_CACERT")
+            .env_remove("VAULT_CAPATH")
             .output()
             .unwrap()
     };
     for v in ["", " "] {
-        let out = run(v);
+        let out = run(v, &["--show"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{v:?}: {stderr}");
         assert!(!stderr.contains("boolean"), "{v:?}: {stderr}");
     }
-    let out = run("maybe");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    // without --vault-kv: ignored, the rotation goes on to the connection
+    for delivery in [&["--show"][..], &["--exec", "cat >/dev/null"][..]] {
+        let out = run("maybe", delivery);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{delivery:?}: {stderr}");
+        assert!(!stderr.contains("boolean"), "{delivery:?}: {stderr}");
+    }
+    // with --vault-kv: usage error, before any request
+    let out = run("maybe", &["--vault-kv", "secret/app"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("PGPP_VAULT_SKIP_PREFLIGHT") && stderr.contains("maybe"),
+        "{stderr}"
     );
 }
 
@@ -1802,4 +1818,26 @@ fn connection_failure_exits_with_1_without_leaking_the_url() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("cannot connect"), "{stderr}");
     assert!(!stderr.contains("hidden-secret"), "{stderr}");
+}
+
+/// A candidate password longer than 4 KiB on the stdin of `check` is a
+/// usage error (exit 2) reported before the connection, without echoing it.
+#[test]
+fn an_oversized_check_input_is_a_usage_error() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .args(["check", "app"])
+        .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let data = format!("{}\n", "Q".repeat(5000));
+    // pgpp stops reading at the limit: the rest of the write may fail
+    let _ = child.stdin.take().unwrap().write_all(data.as_bytes());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("longer than 4096 bytes"), "{stderr}");
+    assert!(!stderr.contains("QQQQ"), "{stderr}");
 }

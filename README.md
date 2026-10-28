@@ -268,9 +268,11 @@ sans écho sur un terminal, puis envoyé en paramètre lié à
 `pass_policy.check_password(role, password)`. Code 0 si conforme, 3 avec le
 motif `PPP-xxx` sinon ; le code 1 est réservé aux erreurs (base injoignable,
 erreur de l'extension), ce qui permet à un script de distinguer un refus d'une
-panne. Le mot de passe est lu avant la connexion : une première ligne vide ou
-qui n'est pas de l'UTF-8 valide sort avec le code 2 sans se connecter.
-Il n'est jamais passé en argument de ligne de commande.
+panne. Le mot de passe est lu avant la connexion : une première ligne vide,
+qui n'est pas de l'UTF-8 valide ou qui dépasse 4096 octets sort avec le
+code 2 sans se connecter (la lecture s'arrête à la limite, le tampon est
+effacé). Il n'est jamais passé en argument de ligne de commande. Un Ctrl-C à
+l'invite rétablit l'écho du terminal avant d'interrompre `pgpp`.
 
 Journal du serveur : un paramètre lié n'apparaît pas dans le texte de la
 requête, mais PostgreSQL l'écrit dans la ligne `DETAIL:  parameters: …` dès
@@ -503,8 +505,9 @@ Un jeton créé avec `-no-default-policy` ne peut pas appeler `lookup-self` ni,
 en général, `capabilities-self` : il est refusé par la vérification
 ci-dessus. Pour un tel jeton, l'option `--vault-skip-preflight` (ou la
 variable `PGPP_VAULT_SKIP_PREFLIGHT=1`, ou `true`, `yes`, `on` ; `0`,
-`false`, `no`, `off` la désactivent, toute autre valeur, vide comprise, est
-une erreur d'usage, code 2) supprime les deux requêtes et affiche un
+`false`, `no`, `off` ou une valeur vide la désactivent ; toute autre valeur
+est une erreur d'usage, code 2, signalée seulement avec `--vault-kv` : la
+variable peut rester exportée pour les rotations sans Vault) supprime les deux requêtes et affiche un
 avertissement. **La validité du jeton et son droit d'écriture ne sont alors
 vérifiés qu'après la rotation**, par l'écriture elle-même : un jeton expiré
 ou révoqué fait échouer la remise (code 1) alors que le mot de passe a déjà
