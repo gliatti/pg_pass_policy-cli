@@ -480,7 +480,15 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         eprintln!("skipped: port {port} is taken on 127.0.0.1");
         return;
     }
-    let cfg = VaultConfig::new(format!("http://localhost:{port}"), "tok", None).unwrap();
+    // short timeout: a regression reaching [::1] (never accepted) fails
+    // fast instead of waiting for REQUEST_TIMEOUT
+    let cfg = VaultConfig::with_timeout(
+        format!("http://localhost:{port}"),
+        "tok",
+        None,
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let err = write(&cfg, &target(), &build_payload("app", "x", "now"))
         .await
         .unwrap_err();
