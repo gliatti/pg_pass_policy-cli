@@ -464,6 +464,27 @@ async fn http_localhost_reaches_the_pinned_loopback_address() {
     mock.assert_async().await;
 }
 
+/// `http://localhost` never reaches an agent that listens on `[::1]` alone:
+/// the name is pinned to 127.0.0.1, and the error says how to reach it.
+#[tokio::test]
+async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
+    let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("skipped: no IPv6 loopback in this environment");
+        return;
+    };
+    let port = listener.local_addr().unwrap().port();
+    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+        eprintln!("skipped: port {port} is taken on 127.0.0.1");
+        return;
+    }
+    let cfg = VaultConfig::new(format!("http://localhost:{port}"), "tok", None).unwrap();
+    let err = write(&cfg, &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("use http://[::1]:PORT"), "{text}");
+}
+
 /// Minimal keep-alive HTTP/1.1 server: answers `lookup-self` with a token
 /// metadata body and `capabilities-self` with a write capability, and
 /// counts the TCP connections it accepts.

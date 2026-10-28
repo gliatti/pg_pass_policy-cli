@@ -619,12 +619,12 @@ par segment, jamais par concaténation de texte.
 `VAULT_ADDR` doit être en `https://` ; `http://` n'est accepté que vers un
 hôte de boucle locale, par exemple un agent Vault local : une adresse IP
 littérale (`127.0.0.0/8`, `[::1]`), ou un nom `localhost` (les mêmes
-qu'en `https://` : `localhost`, `localhost.`, un nom en `.localhost` comme
-`vault.localhost`, avec ou sans point final). Un tel nom n'est jamais
-résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe où) :
+`localhost`, `localhost.`, un nom en `.localhost` comme
+`vault.localhost`, avec ou sans point final). Un tel nom, en `http://`
+comme en `https://`, n'est jamais résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe où) :
 la RFC 6761 le réserve à la boucle locale, et le client HTTP se connecte
 directement à `127.0.0.1` sur le port de l'URL, en gardant le nom dans
-l'en-tête `Host`. Un agent Vault qui n'écoute que sur `[::1]` se désigne
+l'en-tête `Host` (et, en `https://`, pour la vérification du certificat). Un agent Vault qui n'écoute que sur `[::1]` se désigne
 donc par `http://[::1]:8200`. Toute autre adresse en clair (y compris `localhost.example.net`
 ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe
 y circuleraient sans chiffrement. Pour un cas non
@@ -635,16 +635,13 @@ Mandataire HTTP (proxy) : vers une adresse de boucle locale (adresse IP
 littérale `127.0.0.0/8` ou `[::1]`, en `http://` comme en `https://`,
 ou un nom `localhost` : `localhost`, `localhost.` ou un nom en
 `.localhost` comme `vault.localhost`, avec ou sans point final, réservés à
-la boucle locale par la RFC 6761, épinglé comme décrit ci-dessus en
-`http://`), le client se connecte toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
+la boucle locale par la RFC 6761, épinglé comme décrit ci-dessus), le client se connecte toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
 un mandataire résoudrait `localhost` de son côté et verrait passer le jeton
 (et, en `http://`, le mot de passe) en clair. Vers une adresse distante, les
 réglages de mandataire du système s'appliquent (`HTTPS_PROXY`, `NO_PROXY`
 compris), comme avec le client officiel : le mandataire relaie alors un
 tunnel TLS (`CONNECT`) dont le certificat reste vérifié pour l'hôte de
 `VAULT_ADDR`, il voit l'hôte et le port contactés mais pas le contenu.
-Un nom `localhost` en `https://` n'est pas résolu par `pgpp` (TLS vérifie
-le certificat), mais il est lui aussi joint directement, sans mandataire.
 Un nom qui contient seulement `localhost` (`localhost.example.net`,
 `my-localhost`) est une adresse distante.
 
@@ -798,12 +795,22 @@ secours) ou relancer la rotation après correction du jeton.
   enfant hérite en revanche de l'environnement de `pgpp` (voir la section
   `--exec`).
 - Vault n'est joint qu'en TLS vérifié (ou en clair sur la boucle locale
-  uniquement, un nom `localhost` étant résolu et vérifié), avec `VAULT_CACERT` /
+  uniquement, un nom `localhost` étant épinglé sur `127.0.0.1`), avec `VAULT_CACERT` /
   `VAULT_CAPATH` pour une autorité privée.
 - Le rôle de connexion doit être membre de `pass_policy_admin` : les
   vérifications de droits sont faites par les fonctions `SECURITY DEFINER`
   de l'extension (un administrateur non superutilisateur ne peut pas agir sur
   un rôle `SUPERUSER`, `REPLICATION` ou `BYPASSRLS`).
+
+## Limites connues
+
+- Un nom `localhost` (en `http://` comme en `https://`) est épinglé sur
+  `127.0.0.1` seul, par choix de sécurité : un agent Vault qui n'écoute que
+  sur `[::1]` n'est pas joint (erreur de connexion, avec l'indice
+  correspondant). Il se désigne par `http://[::1]:PORT`.
+- En fin de commande, `pgpp` annule une transaction restée ouverte par un
+  `ROLLBACK` brut, sans mettre à jour le compteur de transactions de sqlx :
+  sans effet, la connexion étant fermée juste après.
 
 ## Tests
 

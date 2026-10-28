@@ -313,7 +313,7 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// followed: a 307/308 would replay the token and the password to whatever
 /// host the `Location` header names, bypassing the loopback rule of
 /// `check_addr`.  A redirect is reported as an error instead.  `pinned`
-/// (`http://localhost`) replaces the resolution of that name by the
+/// (a localhost name) replaces the resolution of that name by the
 /// loopback address set by `check_addr_pinned`.  `connect_timeout` bounds the
 /// connection alone (see [`CONNECT_TIMEOUT`]).
 ///
@@ -363,11 +363,12 @@ type Pinned = Option<(String, SocketAddr)>;
 /// [`check_addr`], returning in addition the address a localhost name is
 /// pinned to.  With `http://`, the host must be a literal loopback address
 /// (`127.0.0.0/8`, `[::1]`), or a localhost name ([`is_localhost_name`]:
-/// `localhost`, `localhost.`, `vault.localhost`, as with `https://`).  Such
-/// a name is never resolved (neither `/etc/hosts` nor DNS, which could
-/// point it anywhere, nor a blocking call): RFC 6761 reserves it for the
-/// loopback interface, and the HTTP client connects to `127.0.0.1` alone
-/// on the port of the URL, under that name (`Host` header).
+/// `localhost`, `localhost.`, `vault.localhost`).  Such a name, with
+/// `http://` or `https://`, is never resolved (neither `/etc/hosts` nor
+/// DNS, which could point it anywhere, nor a blocking call): RFC 6761
+/// reserves it for the loopback interface, and the HTTP client connects to
+/// `127.0.0.1` alone on the port of the URL, under that name (`Host`
+/// header, and TLS name checked against the certificate).
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
     // (`user:pw@`) that are only detected once the URL is parsed.
@@ -378,29 +379,23 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     if url.query().is_some() || url.fragment().is_some() {
         bail!("VAULT_ADDR: a query string (?) or a fragment (#) is not allowed");
     }
+    // `url` lower-cases the host and normalises IPv4 (`127.1`)
+    let host = url.host_str().unwrap_or("");
     match url.scheme() {
-        "https" => Ok((url, None)),
-        "http" => {
-            // `url` lower-cases the host and normalises IPv4 (`127.1`)
-            let host = url.host_str().unwrap_or("");
-            if literal_loopback(host) {
-                return Ok((url, None));
-            }
-            if !is_localhost_name(host) {
-                bail!(
-                    "VAULT_ADDR: plain http:// is only accepted for a loopback host \
-                     (127.0.0.0/8, [::1], localhost or a name under it); use https:// \
-                     (set VAULT_CACERT or VAULT_CAPATH for a private CA)"
-                );
-            }
-            // a localhost name (RFC 6761): pinned, never resolved
-            let port = url.port_or_known_default().unwrap_or(80);
-            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            let host = host.to_string();
-            Ok((url, Some((host, addr))))
-        }
+        "https" => {}
+        "http" if literal_loopback(host) || is_localhost_name(host) => {}
+        "http" => bail!(
+            "VAULT_ADDR: plain http:// is only accepted for a loopback host \
+             (127.0.0.0/8, [::1], localhost or a name under it); use https:// \
+             (set VAULT_CACERT or VAULT_CAPATH for a private CA)"
+        ),
         other => bail!("VAULT_ADDR: unsupported scheme {other:?} (use https://)"),
     }
+    // a localhost name (RFC 6761): pinned, never resolved; port 0 lets the
+    // client take the port of the URL
+    let pinned = is_localhost_name(host)
+        .then(|| (host.to_string(), SocketAddr::from((Ipv4Addr::LOCALHOST, 0))));
+    Ok((url, pinned))
 }
 
 /// True when `VAULT_ADDR` designates this host, with `http://` or
@@ -730,10 +725,14 @@ async fn send_checked(
         Call::Preflight => "Vault preflight request",
         Call::Write => "Vault request",
     };
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("{request} to {url} failed"))?;
+    let resp = req.send().await.map_err(|e| {
+        let hint = if e.is_connect() && is_localhost_name(url.host_str().unwrap_or("")) {
+            " (localhost is pinned to 127.0.0.1; use http://[::1]:PORT for an IPv6-only agent)"
+        } else {
+            ""
+        };
+        anyhow::Error::new(e).context(format!("{request} to {url} failed{hint}"))
+    })?;
     let status = resp.status();
     if status.is_redirection() {
         bail!(redirect_message(status, url));
@@ -1209,31 +1208,30 @@ mod tests {
         ] {
             assert!(check_addr_pinned(addr).unwrap().1.is_none(), "{addr}");
         }
-        // every localhost name (is_localhost_name, as with https://) is
-        // pinned to 127.0.0.1 alone (never [::1]) on the port of the URL
+        // every localhost name (is_localhost_name), with http:// or
+        // https://, is pinned to 127.0.0.1 alone (never [::1]) on the port of the URL
         // under its own name,
         // whatever its case and whatever the system would resolve: names
         // no resolver knows are accepted the same way
-        for (addr, port) in [
-            ("http://localhost:8200", 8200),
-            ("http://LocalHost:8200/", 8200),
-            ("http://localhost", 80),
-            ("http://localhost.:8200", 8200),
-            ("http://vault.localhost:8200", 8200),
-            ("http://Vault.LocalHost.:8200", 8200),
-            ("http://pgpp-no-such-name.a.b.localhost:9", 9),
+        for addr in [
+            "http://localhost:8200",
+            "http://LocalHost:8200/",
+            "http://localhost",
+            "http://localhost.:8200",
+            "http://vault.localhost:8200",
+            "http://Vault.LocalHost.:8200",
+            "http://pgpp-no-such-name.a.b.localhost:9",
+            "https://localhost:8200",
+            "https://vault.localhost",
         ] {
             let (url, pinned) = check_addr_pinned(addr).unwrap();
             let (host, pinned) = pinned.expect("a localhost name is pinned");
             assert_eq!(host, url.host_str().unwrap(), "{addr}");
-            assert_eq!(
-                pinned,
-                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                "{addr}"
-            );
+            // port 0: the client takes the port of the URL
+            assert_eq!(pinned, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "{addr}");
         }
-        // https is never resolved nor restricted
-        assert!(check_addr_pinned("https://localhost:8200")
+        // other https names are not pinned
+        assert!(check_addr_pinned("https://vault.example.net:8200")
             .unwrap()
             .1
             .is_none());
