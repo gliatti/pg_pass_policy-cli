@@ -55,6 +55,8 @@ pub(crate) const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// already known) and the whole is bounded by [`CLOSE_TIMEOUT`].
 pub async fn close(mut conn: PgConnection) {
     let graceful = async move {
+        // raw ROLLBACK: the count of sqlx is left stale, harmless as the
+        // connection is closed right after
         if conn.is_in_transaction() {
             let _ = sqlx::Executor::execute(&mut conn, "ROLLBACK").await;
         }

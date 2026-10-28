@@ -15,6 +15,11 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
+/// [`send_write`] without tracking of the body (the flag is not read).
+async fn write(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> anyhow::Result<()> {
+    send_write(cfg, target, payload, Arc::new(AtomicBool::new(false))).await
+}
+
 fn no_namespace_header(req: &HttpMockRequest) -> bool {
     match &req.headers {
         None => true,
@@ -56,9 +61,7 @@ async fn writes_kv_v2_payload_with_token_header() {
     .unwrap();
     let target = VaultTarget::parse("secret/db/app", None).unwrap();
     let payload = build_payload("app", "s3cret-Value!", "2026-10-27T10:00:00Z");
-    send_write(&cfg, &target, &payload, Arc::new(AtomicBool::new(false)))
-        .await
-        .unwrap();
+    write(&cfg, &target, &payload).await.unwrap();
     mock.assert_async().await;
 }
 
@@ -77,14 +80,9 @@ async fn explicit_mount_without_namespace() {
         .await;
     let cfg = VaultConfig::new(server.base_url(), "tok", None).unwrap();
     let target = VaultTarget::parse("db/app", Some("kv")).unwrap();
-    send_write(
-        &cfg,
-        &target,
-        &build_payload("app", "x", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap();
+    write(&cfg, &target, &build_payload("app", "x", "now"))
+        .await
+        .unwrap();
     mock.assert_async().await;
 }
 
@@ -100,14 +98,9 @@ async fn http_error_is_reported_without_payload() {
         .await;
     let cfg = VaultConfig::new(server.base_url(), "bad", None).unwrap();
     let target = VaultTarget::parse("secret/db/app", None).unwrap();
-    let err = send_write(
-        &cfg,
-        &target,
-        &build_payload("app", "hidden-pw", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
+    let err = write(&cfg, &target, &build_payload("app", "hidden-pw", "now"))
+        .await
+        .unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("403"), "{text}");
     assert!(text.contains("permission denied"), "{text}");
@@ -119,14 +112,9 @@ async fn http_error_is_reported_without_payload() {
 async fn connection_error_is_clear() {
     let cfg = VaultConfig::new("http://127.0.0.1:9", "tok", None).unwrap();
     let target = VaultTarget::parse("secret/app", None).unwrap();
-    let err = send_write(
-        &cfg,
-        &target,
-        &build_payload("app", "pw", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
+    let err = write(&cfg, &target, &build_payload("app", "pw", "now"))
+        .await
+        .unwrap_err();
     let text = format!("{err:#}");
     assert!(
         text.contains("http://127.0.0.1:9/v1/secret/data/app"),
@@ -176,14 +164,9 @@ async fn redirects_are_not_followed() {
         .await;
     let cfg = VaultConfig::new(server.base_url(), "tok", None).unwrap();
     let target = VaultTarget::parse("secret/db/app", None).unwrap();
-    let err = send_write(
-        &cfg,
-        &target,
-        &build_payload("app", "hidden-pw", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
+    let err = write(&cfg, &target, &build_payload("app", "hidden-pw", "now"))
+        .await
+        .unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("307"), "{text}");
     assert!(!text.contains("hidden-pw"), "payload must not leak: {text}");
@@ -442,7 +425,7 @@ async fn path_prefix_of_vault_addr_is_kept() {
                 .json_body(json!({"capabilities": ["create", "update"]}));
         })
         .await;
-    let write = server
+    let mock = server
         .mock_async(|when, then| {
             when.method(POST).path("/vault/v1/secret/data/db/app");
             then.status(204);
@@ -451,17 +434,12 @@ async fn path_prefix_of_vault_addr_is_kept() {
     let cfg = VaultConfig::new(format!("{}/vault/", server.base_url()), "tok", None).unwrap();
     let target = target();
     assert!(preflight(&cfg, &target).await.unwrap().warnings.is_empty());
-    send_write(
-        &cfg,
-        &target,
-        &build_payload("app", "x", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap();
+    write(&cfg, &target, &build_payload("app", "x", "now"))
+        .await
+        .unwrap();
     lookup.assert_async().await;
     caps.assert_async().await;
-    write.assert_async().await;
+    mock.assert_async().await;
 }
 
 /// `http://localhost` is accepted without any resolution: the client
@@ -480,14 +458,9 @@ async fn http_localhost_reaches_the_pinned_loopback_address() {
         .await;
     let cfg = VaultConfig::new(format!("http://localhost:{}", server.port()), "tok", None).unwrap();
     let target = VaultTarget::parse("db/app", Some("kv")).unwrap();
-    send_write(
-        &cfg,
-        &target,
-        &build_payload("app", "x", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap();
+    write(&cfg, &target, &build_payload("app", "x", "now"))
+        .await
+        .unwrap();
     mock.assert_async().await;
 }
 
@@ -724,7 +697,7 @@ async fn loopback_writes_with_a_proxy_in_the_environment() {
         return;
     }
     let server = MockServer::start_async().await;
-    let write = server
+    let mock = server
         .mock_async(|when, then| {
             when.method(POST).path("/v1/secret/data/db/app");
             then.status(204);
@@ -735,26 +708,16 @@ async fn loopback_writes_with_a_proxy_in_the_environment() {
         format!("http://localhost:{}", server.port()),
     ] {
         let cfg = VaultConfig::new(&addr, "tok", None).unwrap();
-        send_write(
-            &cfg,
-            &target(),
-            &build_payload("app", "x", "now"),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{addr}: {e:#}"));
+        write(&cfg, &target(), &build_payload("app", "x", "now"))
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: {e:#}"));
     }
-    write.assert_hits_async(2).await;
+    mock.assert_hits_async(2).await;
     let addr = format!("https://localhost:{}", server.port());
     let cfg = VaultConfig::new(&addr, "tok", None).unwrap();
-    let err = send_write(
-        &cfg,
-        &target(),
-        &build_payload("app", "x", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
+    let err = write(&cfg, &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
     assert!(!format!("{err:#}").contains("502"), "{addr}: {err:#}");
 }
 
@@ -779,15 +742,10 @@ async fn refused_write(server: &MockServer) -> Mock<'_> {
 async fn a_write_refused_after_an_update_only_preflight_says_why() {
     // the path of a rotation (commands::vault_delivery): the write, then
     // the explanation of its refusal
-    let write = |cfg: VaultConfig, update_only: bool| async move {
-        let refused = send_write(
-            &cfg,
-            &target(),
-            &build_payload("app", "x", "now"),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await
-        .unwrap_err();
+    let rotate = |cfg: VaultConfig, update_only: bool| async move {
+        let refused = write(&cfg, &target(), &build_payload("app", "x", "now"))
+            .await
+            .unwrap_err();
         let err = explain_refusal(
             &cfg,
             &target(),
@@ -811,7 +769,7 @@ async fn a_write_refused_after_an_update_only_preflight_says_why() {
     assert!(pre.update_only, "{pre:?}");
     meta.delete_async().await;
     let gone = metadata_mock(&server, 404).await;
-    let m = write(checked.clone(), pre.update_only).await;
+    let m = rotate(checked.clone(), pre.update_only).await;
     gone.assert_async().await;
     assert!(m.contains("HTTP 403"), "{m}");
     assert!(m.contains(METADATA_DISAPPEARED), "{m}");
@@ -824,7 +782,7 @@ async fn a_write_refused_after_an_update_only_preflight_says_why() {
         preflight_mocks(&server, 200, 200, json!({"capabilities": ["update"]})).await;
         refused_write(&server).await;
         let meta = metadata_mock(&server, status).await;
-        let m = write(cfg(&server), true).await;
+        let m = rotate(cfg(&server), true).await;
         meta.assert_async().await;
         assert!(m.contains("HTTP 403"), "{status}: {m}");
         assert!(m.contains(REFUSED_SINCE_PREFLIGHT), "{status}: {m}");
@@ -844,19 +802,14 @@ async fn a_write_refused_after_an_update_only_preflight_says_why() {
     let server = MockServer::start_async().await;
     refused_write(&server).await;
     let meta = metadata_mock(&server, 404).await;
-    let m = write(cfg(&server), false).await;
+    let m = rotate(cfg(&server), false).await;
     assert_eq!(meta.hits_async().await, 0);
     assert!(m.contains("HTTP 403"), "{m}");
     assert!(!m.contains(METADATA_DISAPPEARED), "{m}");
     assert!(!m.contains(REFUSED_SINCE_PREFLIGHT), "{m}");
-    let err = send_write(
-        &cfg(&server),
-        &target(),
-        &build_payload("app", "x", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
+    let err = write(&cfg(&server), &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
     assert!(
         !format!("{err:#}").contains(METADATA_DISAPPEARED),
         "{err:#}"
@@ -879,14 +832,9 @@ async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
         })
         .await;
     let refused = || async {
-        let e = send_write(
-            &cfg(&server),
-            &target(),
-            &build_payload("app", "x", "now"),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await
-        .unwrap_err();
+        let e = write(&cfg(&server), &target(), &build_payload("app", "x", "now"))
+            .await
+            .unwrap_err();
         assert!(format!("{e:#}").contains("HTTP 403"), "{e:#}");
         e
     };
@@ -935,14 +883,9 @@ async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
     let server = MockServer::start_async().await;
     refused_write(&server).await;
     let meta = metadata_mock(&server, 404).await;
-    let e = send_write(
-        &cfg(&server),
-        &target(),
-        &build_payload("app", "x", "now"),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
+    let e = write(&cfg(&server), &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
     let want = expected(&e, "interrupted before the check");
     let err = explain_refusal(
         &cfg(&server),

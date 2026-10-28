@@ -1,7 +1,7 @@
 //! HashiCorp Vault KV v2 integration.
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,7 +314,7 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// host the `Location` header names, bypassing the loopback rule of
 /// `check_addr`.  A redirect is reported as an error instead.  `pinned`
 /// (`http://localhost`) replaces the resolution of that name by the
-/// loopback addresses set by `check_addr_pinned`.  `connect_timeout` bounds the
+/// loopback address set by `check_addr_pinned`.  `connect_timeout` bounds the
 /// connection alone (see [`CONNECT_TIMEOUT`]).
 ///
 /// `direct` (a loopback target, see [`is_loopback_target`]) disables the
@@ -337,8 +337,8 @@ fn build_client(
     if direct {
         builder = builder.no_proxy();
     }
-    if let Some((host, addrs)) = pinned {
-        builder = builder.resolve_to_addrs(host, addrs);
+    if let Some((host, addr)) = pinned {
+        builder = builder.resolve(host, *addr);
     }
     for cert in root_certs {
         builder = builder.add_root_certificate(cert.clone());
@@ -356,18 +356,18 @@ pub fn check_addr(addr: &str) -> Result<Url> {
     Ok(check_addr_pinned(addr)?.0)
 }
 
-/// Host name of an `http://` localhost address with the loopback addresses
+/// Host name of an `http://` localhost address with the loopback address
 /// it is pinned to; the HTTP client connects there without resolving it.
-type Pinned = Option<(String, [SocketAddr; 2])>;
+type Pinned = Option<(String, SocketAddr)>;
 
-/// [`check_addr`], returning in addition the addresses a localhost name is
+/// [`check_addr`], returning in addition the address a localhost name is
 /// pinned to.  With `http://`, the host must be a literal loopback address
 /// (`127.0.0.0/8`, `[::1]`), or a localhost name ([`is_localhost_name`]:
 /// `localhost`, `localhost.`, `vault.localhost`, as with `https://`).  Such
 /// a name is never resolved (neither `/etc/hosts` nor DNS, which could
 /// point it anywhere, nor a blocking call): RFC 6761 reserves it for the
-/// loopback interface, and the HTTP client connects to `127.0.0.1`, then
-/// `[::1]`, on the port of the URL, under that name (`Host` header).
+/// loopback interface, and the HTTP client connects to `127.0.0.1` alone
+/// on the port of the URL, under that name (`Host` header).
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
     // (`user:pw@`) that are only detected once the URL is parsed.
@@ -395,12 +395,9 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
             }
             // a localhost name (RFC 6761): pinned, never resolved
             let port = url.port_or_known_default().unwrap_or(80);
-            let addrs = [
-                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
-            ];
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             let host = host.to_string();
-            Ok((url, Some((host, addrs))))
+            Ok((url, Some((host, addr))))
         }
         other => bail!("VAULT_ADDR: unsupported scheme {other:?} (use https://)"),
     }
@@ -1213,8 +1210,8 @@ mod tests {
             assert!(check_addr_pinned(addr).unwrap().1.is_none(), "{addr}");
         }
         // every localhost name (is_localhost_name, as with https://) is
-        // pinned to 127.0.0.1 and [::1] on the port of the URL under its
-        // own name,
+        // pinned to 127.0.0.1 alone (never [::1]) on the port of the URL
+        // under its own name,
         // whatever its case and whatever the system would resolve: names
         // no resolver knows are accepted the same way
         for (addr, port) in [
@@ -1231,10 +1228,7 @@ mod tests {
             assert_eq!(host, url.host_str().unwrap(), "{addr}");
             assert_eq!(
                 pinned,
-                [
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                    SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
-                ],
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
                 "{addr}"
             );
         }

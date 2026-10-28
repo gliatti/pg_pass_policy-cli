@@ -582,8 +582,9 @@ qu'en `https://` : `localhost`, `localhost.`, un nom en `.localhost` comme
 `vault.localhost`, avec ou sans point final). Un tel nom n'est jamais
 résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe où) :
 la RFC 6761 le réserve à la boucle locale, et le client HTTP se connecte
-directement à `127.0.0.1`, puis à `[::1]` si la première connexion échoue,
-sur le port de l'URL, en gardant le nom dans l'en-tête `Host`. Toute autre adresse en clair (y compris `localhost.example.net`
+directement à `127.0.0.1` sur le port de l'URL, en gardant le nom dans
+l'en-tête `Host`. Un agent Vault qui n'écoute que sur `[::1]` se désigne
+donc par `http://[::1]:8200`. Toute autre adresse en clair (y compris `localhost.example.net`
 ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe
 y circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
