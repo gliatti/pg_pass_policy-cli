@@ -55,10 +55,23 @@ pub(crate) const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// already known) and the whole is bounded by [`CLOSE_TIMEOUT`].
 pub async fn close(mut conn: PgConnection) {
     let graceful = async move {
-        if conn.is_in_transaction() {
-            let _ = sqlx::Executor::execute(&mut conn, "ROLLBACK").await;
-        }
+        let _ = rollback_open(&mut conn).await;
         let _ = conn.close().await;
     };
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, graceful).await;
+}
+
+/// Rolls back the transactions sqlx still counts as open on `conn`
+/// (`is_in_transaction`), through its transaction manager: each level is
+/// ended by the statement sqlx would send itself (`ROLLBACK`, or
+/// `ROLLBACK TO SAVEPOINT` for a nested level) and its depth is decreased,
+/// so that the count of sqlx stays in step with the server (a raw
+/// `ROLLBACK` would leave it at one and make the next `begin` a
+/// savepoint).  Without an open transaction, nothing is sent.  Used by
+/// [`close`] and by the check of `commands::diagnose`.
+pub(crate) async fn rollback_open(conn: &mut PgConnection) -> Result<()> {
+    while conn.is_in_transaction() {
+        <sqlx::postgres::PgTransactionManager as sqlx::TransactionManager>::rollback(conn).await?;
+    }
+    Ok(())
 }

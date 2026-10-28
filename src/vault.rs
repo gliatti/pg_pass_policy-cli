@@ -1,7 +1,7 @@
 //! HashiCorp Vault KV v2 integration.
 
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,9 +157,8 @@ pub struct VaultConfig {
 /// Outcome of a successful [`preflight`]: the warnings to print, and
 /// whether the token was accepted on `update` alone because the secret
 /// existed ([`check_update_only`]).  The caller keeps it with the delivery
-/// and hands `update_only` to [`explain_refusal`] (or to
-/// [`write_secret_tracked`]): only the handling of a 403 on the write
-/// depends on it.
+/// and hands `update_only` to [`explain_refusal`]: only the handling of a
+/// 403 on the write depends on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preflight {
     pub warnings: Vec<String>,
@@ -214,7 +213,7 @@ impl VaultConfig {
         timeout: Duration,
     ) -> Result<Self> {
         let (addr, pinned) = check_addr_pinned(addr.as_ref())?;
-        let direct = is_loopback_target(&addr, &pinned);
+        let direct = is_loopback_target(&addr);
         let mut token = header_value(&token.into(), "VAULT_TOKEN")?;
         token.set_sensitive(true);
         let namespace = namespace
@@ -314,8 +313,8 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// followed: a 307/308 would replay the token and the password to whatever
 /// host the `Location` header names, bypassing the loopback rule of
 /// `check_addr`.  A redirect is reported as an error instead.  `pinned`
-/// (`http://localhost`) replaces the resolution of that name by the loopback
-/// addresses checked by `check_addr_pinned`.  `connect_timeout` bounds the
+/// (`http://localhost`) replaces the resolution of that name by the
+/// loopback address set by `check_addr_pinned`.  `connect_timeout` bounds the
 /// connection alone (see [`CONNECT_TIMEOUT`]).
 ///
 /// `direct` (a loopback target, see [`is_loopback_target`]) disables the
@@ -338,8 +337,8 @@ fn build_client(
     if direct {
         builder = builder.no_proxy();
     }
-    if let Some((host, addrs)) = pinned {
-        builder = builder.resolve_to_addrs(host, addrs);
+    if let Some((host, addr)) = pinned {
+        builder = builder.resolve(host, *addr);
     }
     for cert in root_certs {
         builder = builder.add_root_certificate(cert.clone());
@@ -357,17 +356,18 @@ pub fn check_addr(addr: &str) -> Result<Url> {
     Ok(check_addr_pinned(addr)?.0)
 }
 
-/// Host name of an `http://` address with the loopback addresses it was
-/// resolved to; the HTTP client is pinned to them.
-type Pinned = Option<(String, Vec<SocketAddr>)>;
+/// Host name of an `http://` localhost address with the loopback address
+/// it is pinned to; the HTTP client connects there without resolving it.
+type Pinned = Option<(String, SocketAddr)>;
 
-/// [`check_addr`], returning in addition the resolution of `localhost`.
-/// With `http://`, the host must be a literal loopback address
+/// [`check_addr`], returning in addition the address a localhost name is
+/// pinned to.  With `http://`, the host must be a literal loopback address
 /// (`127.0.0.0/8`, `[::1]`), or a localhost name ([`is_localhost_name`]:
-/// `localhost`, `localhost.`, `vault.localhost`, as with `https://`)
-/// provided that every address it resolves to (`/etc/hosts`, DNS) is
-/// loopback: a name can be made to point anywhere.  The HTTP client then connects to those addresses only, so
-/// that a later resolution cannot send the request elsewhere.
+/// `localhost`, `localhost.`, `vault.localhost`, as with `https://`).  Such
+/// a name is never resolved (neither `/etc/hosts` nor DNS, which could
+/// point it anywhere, nor a blocking call): RFC 6761 reserves it for the
+/// loopback interface, and the HTTP client connects to `127.0.0.1` on the
+/// port of the URL, under that name (`Host` header).
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
     // (`user:pw@`) that are only detected once the URL is parsed.
@@ -393,29 +393,24 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
                      (set VAULT_CACERT or VAULT_CAPATH for a private CA)"
                 );
             }
-            // a localhost name (RFC 6761), safe to quote: no credentials
+            // a localhost name (RFC 6761): pinned, never resolved
             let port = url.port_or_known_default().unwrap_or(80);
-            let addrs = (host, port)
-                .to_socket_addrs()
-                .with_context(|| format!("VAULT_ADDR: cannot resolve {host}"))?
-                .collect();
-            let addrs = require_loopback(host, addrs)?;
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             let host = host.to_string();
-            Ok((url, Some((host, addrs))))
+            Ok((url, Some((host, addr))))
         }
         other => bail!("VAULT_ADDR: unsupported scheme {other:?} (use https://)"),
     }
 }
 
-/// True when `VAULT_ADDR` designates this host: a literal loopback address
-/// (`http://` or `https://`), a localhost name with `http://` pinned to
-/// its checked loopback addresses, or a `localhost` name with `https://` (not resolved
-/// by `check_addr_pinned`: TLS verifies the certificate, but a proxy would
-/// resolve the name on its own side, so it is reached directly too).  See
-/// [`is_localhost_name`] for the names.
-fn is_loopback_target(url: &Url, pinned: &Pinned) -> bool {
+/// True when `VAULT_ADDR` designates this host, with `http://` or
+/// `https://`: a localhost name ([`is_localhost_name`]) or a literal
+/// loopback address ([`literal_loopback`]).  Such a target is reached
+/// directly, never through a proxy, which would resolve the name on its
+/// own side (see [`build_client`]).
+fn is_loopback_target(url: &Url) -> bool {
     let host = url.host_str().unwrap_or("");
-    pinned.is_some() || is_localhost_name(host) || literal_loopback(host)
+    is_localhost_name(host) || literal_loopback(host)
 }
 
 /// True for `localhost` and the names under it (`vault.localhost`), with
@@ -434,22 +429,6 @@ fn is_localhost_name(host: &str) -> bool {
 fn literal_loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
-
-/// Accepts the resolution of the localhost name `host` only when it is not
-/// empty and every address is loopback.
-fn require_loopback(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
-    if addrs.is_empty() {
-        bail!("VAULT_ADDR: {host} does not resolve to any address");
-    }
-    if let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback()) {
-        bail!(
-            "VAULT_ADDR: {host} resolves to the non-loopback address {} (check \
-             /etc/hosts); plain http:// is refused, use http://127.0.0.1 or https://",
-            a.ip()
-        );
-    }
-    Ok(addrs)
 }
 
 /// Extensions of the files of `VAULT_CAPATH` that are loaded, compared
@@ -787,8 +766,8 @@ async fn send_checked(
 /// answer of Vault (HTTP status, redirect) gives `false`.  A connection
 /// that does not succeed in time is a connection error ([`CONNECT_TIMEOUT`]
 /// is shorter than the request timeout), not a request timeout.  Callers
-/// that know whether the body was sent ([`write_secret_tracked`]) combine
-/// both.
+/// that know whether the body was sent (`body_sent` of [`send_write`])
+/// combine both.
 pub fn may_have_been_received(err: &anyhow::Error) -> bool {
     err.chain()
         .find_map(|e| e.downcast_ref::<reqwest::Error>())
@@ -835,51 +814,20 @@ async fn error_body(resp: reqwest::Response) -> String {
 /// status and the response body, which Vault fills with its own error list;
 /// the payload itself is never included.  The body is serialised into a
 /// buffer wiped when reqwest drops it (see [`zeroizing_json`]).
-/// Without a preflight result: a 403 is reported as it is.
+/// Without a preflight result, a 403 is reported as it is: this is
+/// [`send_write`] alone ([`explain_refusal`] only explains a refusal after
+/// an `update`-only preflight).  A rotation goes through
+/// `commands::vault_delivery`, which calls [`send_write`] and
+/// [`explain_refusal`] apart.
 pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
-    write_secret_tracked(
-        cfg,
-        target,
-        payload,
-        false,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-}
-
-/// [`write_secret`], setting `body_sent` once the HTTP client starts to
-/// send the body (see [`TrackedBody`]).  While it is still false, Vault
-/// cannot have written the secret, whatever the error (or the
-/// interruption): the request is incomplete without its body.
-/// `update_only` is [`Preflight::update_only`] (false without a preflight):
-/// a 403 is then explained by [`explain_refusal`], within
-/// [`REREAD_TIMEOUT`] and without interruption.  A caller that races the
-/// write with Ctrl-C uses [`send_write`] and [`explain_refusal`] apart, so
-/// that the refusal is settled before the new read starts.
-pub async fn write_secret_tracked(
-    cfg: &VaultConfig,
-    target: &VaultTarget,
-    payload: &Value,
-    update_only: bool,
-    body_sent: Arc<AtomicBool>,
-) -> Result<()> {
-    match send_write(cfg, target, payload, body_sent).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(explain_refusal(
-            cfg,
-            target,
-            e,
-            update_only,
-            REREAD_TIMEOUT,
-            std::future::pending(),
-        )
-        .await),
-    }
+    send_write(cfg, target, payload, Arc::new(AtomicBool::new(false))).await
 }
 
 /// The write request alone: a refusal of Vault is returned as it is
-/// (a [`WriteRefused`]), never explained.  See [`write_secret_tracked`]
-/// for `body_sent`.
+/// (a [`WriteRefused`]), never explained.  `body_sent` is set once the
+/// HTTP client starts to send the body (see [`TrackedBody`]): while it is
+/// still false, Vault cannot have written the secret, whatever the error
+/// (or the interruption), the request being incomplete without its body.
 pub async fn send_write(
     cfg: &VaultConfig,
     target: &VaultTarget,
@@ -913,8 +861,9 @@ pub const REREAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// ([`METADATA_DISAPPEARED`]); any other answer, or a failed request,
 /// gives the cautious [`REFUSED_SINCE_PREFLIGHT`] with what that read
 /// found.  That read is bounded by `timeout` and abandoned when `cancel`
-/// ends (Ctrl-C): the result is then [`REFUSED_SINCE_PREFLIGHT`] without
-/// detail, never « may or may not have been written ».  The error of that
+/// ends (Ctrl-C): the result is then [`REFUSED_SINCE_PREFLIGHT`] followed
+/// by `(no answer within 5s)` or `(interrupted)`, never « may or may not
+/// have been written ».  The error of that
 /// read is only quoted as text: the result stays an answer of Vault to the
 /// write ([`may_have_been_received`] is false).  Any other error is
 /// returned as it is.
@@ -950,13 +899,23 @@ pub async fn explain_refusal(
     // biased: a Ctrl-C already received skips the read
     let found = tokio::select! {
         biased;
-        () = cancel => return anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT}"),
-        r = tokio::time::timeout(timeout, reread) => r,
+        () = cancel => "interrupted".to_string(),
+        r = tokio::time::timeout(timeout, reread) => match r {
+            Ok(None) => return anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}"),
+            Ok(Some(found)) => found,
+            Err(_) => format!("no answer within {}", short_duration(timeout)),
+        },
     };
-    match found {
-        Ok(None) => anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}"),
-        Ok(Some(found)) => anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT} ({found})"),
-        Err(_) => anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT}"),
+    anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT} ({found})")
+}
+
+/// `timeout` of [`explain_refusal`] for its message: whole seconds (`5s`),
+/// milliseconds otherwise (`300ms`).
+fn short_duration(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
     }
 }
 
@@ -1246,8 +1205,8 @@ mod tests {
     }
 
     #[test]
-    fn http_localhost_is_checked_by_resolution() {
-        // literal loopback addresses are not resolved
+    fn http_localhost_is_pinned_without_resolution() {
+        // literal loopback addresses are not pinned
         for addr in [
             "http://127.0.0.1:8200",
             "http://[::1]:8200",
@@ -1255,35 +1214,27 @@ mod tests {
         ] {
             assert!(check_addr_pinned(addr).unwrap().1.is_none(), "{addr}");
         }
-        // localhost (here resolved by the system to loopback addresses) is
-        // pinned to the checked addresses, whatever its case in the URL
-        for addr in ["http://localhost:8200", "http://LocalHost:8200/"] {
-            let (_, pinned) = check_addr_pinned(addr).unwrap();
-            let (host, addrs) = pinned.expect("localhost is pinned");
-            assert_eq!(host, "localhost");
-            assert!(!addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback()));
-        }
-        // the other localhost names (is_localhost_name, as with https://)
-        // are accepted the same way: never refused as a remote host; their
-        // resolution depends on the system, and when it succeeds they are
-        // pinned to loopback addresses under their own name
-        for addr in [
-            "http://localhost.:8200",
-            "http://vault.localhost:8200",
-            "http://Vault.LocalHost.:8200",
+        // every localhost name (is_localhost_name, as with https://) is
+        // pinned to 127.0.0.1 on the port of the URL under its own name,
+        // whatever its case and whatever the system would resolve: names
+        // no resolver knows are accepted the same way
+        for (addr, port) in [
+            ("http://localhost:8200", 8200),
+            ("http://LocalHost:8200/", 8200),
+            ("http://localhost", 80),
+            ("http://localhost.:8200", 8200),
+            ("http://vault.localhost:8200", 8200),
+            ("http://Vault.LocalHost.:8200", 8200),
+            ("http://pgpp-no-such-name.a.b.localhost:9", 9),
         ] {
-            match check_addr_pinned(addr) {
-                Ok((url, pinned)) => {
-                    let (host, addrs) = pinned.expect("a localhost name is pinned");
-                    assert_eq!(host, url.host_str().unwrap(), "{addr}");
-                    assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addr}");
-                }
-                Err(e) => {
-                    let m = format!("{e:#}");
-                    assert!(!m.contains("plain http:// is only accepted"), "{addr}: {m}");
-                    assert!(m.contains("resolve"), "{addr}: {m}");
-                }
-            }
+            let (url, pinned) = check_addr_pinned(addr).unwrap();
+            let (host, pinned) = pinned.expect("a localhost name is pinned");
+            assert_eq!(host, url.host_str().unwrap(), "{addr}");
+            assert_eq!(
+                pinned,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                "{addr}"
+            );
         }
         // https is never resolved nor restricted
         assert!(check_addr_pinned("https://localhost:8200")
@@ -1318,8 +1269,7 @@ mod tests {
             "https://Vault.LocalHost.:8200/v",
             "https://a.b.localhost:8200",
         ] {
-            let (url, pinned) = check_addr_pinned(addr).unwrap();
-            assert!(is_loopback_target(&url, &pinned), "{addr}");
+            assert!(is_loopback_target(&check_addr(addr).unwrap()), "{addr}");
         }
         // remote: the system proxy settings apply
         for addr in [
@@ -1332,8 +1282,7 @@ mod tests {
             "https://localhost..:8200",
             "https://[::ffff:127.0.0.1]:8200",
         ] {
-            let (url, pinned) = check_addr_pinned(addr).unwrap();
-            assert!(!is_loopback_target(&url, &pinned), "{addr}");
+            assert!(!is_loopback_target(&check_addr(addr).unwrap()), "{addr}");
         }
     }
 
@@ -1361,26 +1310,6 @@ mod tests {
         ] {
             assert!(!is_localhost_name(name), "{name}");
         }
-    }
-
-    #[test]
-    fn localhost_must_resolve_to_loopback_only() {
-        let lo4: SocketAddr = "127.0.0.1:8200".parse().unwrap();
-        let lo6: SocketAddr = "[::1]:8200".parse().unwrap();
-        let remote: SocketAddr = "192.0.2.10:8200".parse().unwrap();
-        assert_eq!(
-            require_loopback("localhost", vec![lo4, lo6]).unwrap(),
-            [lo4, lo6]
-        );
-        let err = require_loopback("localhost", vec![lo4, remote])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("192.0.2.10") && err.contains("/etc/hosts"),
-            "{err}"
-        );
-        assert!(require_loopback("localhost", vec![remote]).is_err());
-        assert!(require_loopback("localhost", Vec::new()).is_err());
     }
 
     #[test]

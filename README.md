@@ -109,10 +109,10 @@ ou les rôles non exemptés dont le mot de passe expire avant
 `v_role_status` et évalue `v_expiring` en sous-requête, soit deux passages
 sur la vue. Chaque rôle n'apparaît qu'une fois.
 
-Version de l'extension : `status` et `expiring` demandent une version de
-`pg_pass_policy` dont `v_role_status` a les colonnes `expiry_state` et
-`is_exempt` et qui fournit la vue `v_expiring`. Face à une extension plus
-ancienne, le serveur répond par un objet inconnu. Toute commande (lecture
+Version de l'extension : `pgpp` exige une version minimale de
+`pg_pass_policy`, aujourd'hui `1.0`, la seule publiée (elle fournit les
+colonnes `expiry_state` et `is_exempt` de `v_role_status` et la vue
+`v_expiring` que lisent `status` et `expiring`). Toute commande (lecture
 comme écriture : `status`, `expiring`, `locked`, `audit`, `profile`,
 `lock`, `unlock`, `expire`, `rotate`, `switch-pair`, `check`,
 `maintenance`, `failed-attempts`, `worker-status`) passe par le même
@@ -121,15 +121,18 @@ fonction inconnus (SQLSTATE `3F000`, `42P01`, `42703`, `42883`), `pgpp`
 consulte `pg_extension`, sans analyser le texte du message (traduit selon
 `lc_messages`). Si l'extension n'est pas installée, le message devient
 `pg_pass_policy is not installed in this database` suivi du message du
-serveur. Si elle l'est dans une version strictement inférieure à la version
-minimale qu'exige `pgpp` (aujourd'hui `1.0`, comparée composante par
-composante comme des nombres), il affiche `this pgpp requires a newer
-pg_pass_policy (reinstall the extension)` suivi du message du serveur : il
-suffit de réinstaller l'extension livrée avec ce dépôt (voir le README de
-l'extension à la racine du dépôt). Avec une extension à jour, l'objet
-inconnu n'est pas celui de l'extension : l'erreur est affichée telle
-quelle. Ce contrôle est une nouvelle requête, envoyée hors transaction
-(celle de `check` est annulée avant) et bornée à 3 secondes ; s'il échoue
+serveur. Si elle l'est, l'erreur est affichée telle quelle, sans indice :
+une construction de développement antérieure à la publication porte elle
+aussi le numéro `1.0` et ne se distingue pas de la version publiée (face à
+une telle construction, réinstaller l'extension livrée avec ce dépôt, voir
+le README de l'extension à la racine du dépôt). Le message `this pgpp
+requires a newer pg_pass_policy (reinstall the extension)` est réservé à
+une prochaine version de l'extension dont `pgpp` dépendrait : il ne
+s'affiche que face à une version strictement inférieure à la version
+minimale (comparée composante par composante comme des nombres).
+Ce contrôle est une nouvelle requête, envoyée hors transaction
+(celle de `check`, ou toute transaction restée ouverte, est annulée avant)
+et bornée à 3 secondes ; s'il échoue
 (connexion perdue, par exemple) ou ne répond pas dans ce délai, l'erreur
 d'origine est conservée, précédée de `an object of pg_pass_policy is
 missing; the installation of the extension could not be checked` et de la
@@ -576,12 +579,12 @@ par segment, jamais par concaténation de texte.
 hôte de boucle locale, par exemple un agent Vault local : une adresse IP
 littérale (`127.0.0.0/8`, `[::1]`), ou un nom `localhost` (les mêmes
 qu'en `https://` : `localhost`, `localhost.`, un nom en `.localhost` comme
-`vault.localhost`, avec ou sans point final) à condition que toutes les
-adresses qu'il résout (`/etc/hosts`, DNS) soient de boucle locale.
-Un nom peut en effet être dirigé n'importe où : si ce nom résout vers
-une autre adresse, ou ne résout pas, la commande est refusée (code 2). Le
-client HTTP se connecte ensuite aux seules adresses vérifiées, sans nouvelle
-résolution. Toute autre adresse en clair (y compris `localhost.example.net`
+`vault.localhost`, avec ou sans point final). Un tel nom n'est jamais
+résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe où) :
+la RFC 6761 le réserve à la boucle locale, et le client HTTP se connecte
+directement à `127.0.0.1` sur le port de l'URL, en gardant le nom dans
+l'en-tête `Host`. Un agent Vault qui n'écoute que sur `[::1]` se désigne
+donc par `http://[::1]:8200`. Toute autre adresse en clair (y compris `localhost.example.net`
 ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe
 y circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
@@ -659,9 +662,10 @@ HTTP que pour l'écriture (redirections refusées) :
    have changed`, suivi de ce qu'a répondu cette relecture. Dans tous les
    cas, Vault a répondu à l'écriture : le secret n'a pas été écrit, et ce
    refus est acquis dès la réponse. La relecture vient après, bornée à
-   5 secondes ; un Ctrl-C ou un Vault qui ne répond pas dans ce délai
-   l'abandonne et donne le même message prudent, sans détail, jamais
-   « may or may not have been written ».
+   5 secondes ; un Vault qui ne répond pas dans ce délai ou un Ctrl-C
+   l'abandonne et donne le même message prudent, suivi de `(no answer
+   within 5s)` ou de `(interrupted)`, jamais « may or may not have been
+   written ».
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme

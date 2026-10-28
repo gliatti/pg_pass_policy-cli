@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use pgpp::vault::{
-    build_payload, explain_refusal, preflight, send_write, write_secret, write_secret_tracked,
-    VaultConfig, VaultTarget, METADATA_DISAPPEARED, REFUSED_SINCE_PREFLIGHT,
+    build_payload, explain_refusal, preflight, send_write, write_secret, VaultConfig, VaultTarget,
+    METADATA_DISAPPEARED, REFUSED_SINCE_PREFLIGHT,
 };
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -437,8 +437,8 @@ async fn path_prefix_of_vault_addr_is_kept() {
     write.assert_async().await;
 }
 
-/// `http://localhost` is accepted once resolved to loopback addresses only;
-/// the client then reaches the server through those pinned addresses.
+/// `http://localhost` is accepted without any resolution: the client
+/// reaches the server on 127.0.0.1, the address the name is pinned to.
 #[tokio::test]
 async fn http_localhost_reaches_the_pinned_loopback_address() {
     let server = MockServer::start_async().await;
@@ -735,16 +735,26 @@ async fn refused_write(server: &MockServer) -> Mock<'_> {
 /// expired or revoked, policy changed), not a deletion.
 #[tokio::test]
 async fn a_write_refused_after_an_update_only_preflight_says_why() {
+    // the path of a rotation (commands::vault_delivery): the write, then
+    // the explanation of its refusal
     let write = |cfg: VaultConfig, update_only: bool| async move {
-        let err = write_secret_tracked(
+        let refused = send_write(
             &cfg,
             &target(),
             &build_payload("app", "x", "now"),
-            update_only,
             Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap_err();
+        let err = explain_refusal(
+            &cfg,
+            &target(),
+            refused,
+            update_only,
+            pgpp::vault::REREAD_TIMEOUT,
+            std::future::pending(),
+        )
+        .await;
         assert!(!pgpp::vault::may_have_been_received(&err), "{err:#}");
         format!("{err:#}")
     };
@@ -809,7 +819,8 @@ async fn a_write_refused_after_an_update_only_preflight_says_why() {
 /// The 403 of the write is a refusal as soon as Vault answers it: a new
 /// read of the metadata that does not end (slow Vault) is abandoned at the
 /// timeout, or at once on Ctrl-C (`cancel`), and the result is the
-/// cautious refusal without detail, never a write that may have happened.
+/// cautious refusal, which says which of the two ended the read, never a
+/// write that may have happened.
 #[tokio::test]
 async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
     let server = MockServer::start_async().await;
@@ -832,11 +843,12 @@ async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
         assert!(format!("{e:#}").contains("HTTP 403"), "{e:#}");
         e
     };
-    let expected = |e: &anyhow::Error| format!("{e:#}: {REFUSED_SINCE_PREFLIGHT}");
+    let expected =
+        |e: &anyhow::Error, why: &str| format!("{e:#}: {REFUSED_SINCE_PREFLIGHT} ({why})");
 
     // timeout of the new read
     let e = refused().await;
-    let want = expected(&e);
+    let want = expected(&e, "no answer within 300ms");
     let started = Instant::now();
     let err = explain_refusal(
         &cfg(&server),
@@ -853,7 +865,7 @@ async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
 
     // Ctrl-C during the new read
     let e = refused().await;
-    let want = expected(&e);
+    let want = expected(&e, "interrupted");
     let started = Instant::now();
     let err = explain_refusal(
         &cfg(&server),
@@ -884,7 +896,7 @@ async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
     )
     .await
     .unwrap_err();
-    let want = expected(&e);
+    let want = expected(&e, "interrupted");
     let err = explain_refusal(
         &cfg(&server),
         &target(),

@@ -39,6 +39,13 @@ const STATUS_COLUMNS: &str = "v.role_name, v.profile, v.password_changed_at::tex
 /// this pgpp works with.  An error on an unknown object of the extension
 /// ([`SCHEMA_SQLSTATES`]) is put down to an older extension only when the
 /// installed version is strictly lower ([`diagnose`]).
+///
+/// To be raised with each version of the extension whose objects pgpp
+/// starts to use.  Only `1.0` has been published: [`NEWER_EXTENSION`]
+/// cannot show up today (a development build older than `1.0` but
+/// numbered `1.0` gets the error of the server as it is), and is kept for
+/// the next version pgpp depends on.  The text of the error is never
+/// analysed instead (localised by `lc_messages`).
 pub const MIN_EXTENSION_VERSION: &str = "1.0";
 
 /// Message added to an error on an unknown object (see
@@ -86,8 +93,9 @@ fn sqlstate(err: &anyhow::Error) -> Option<String> {
 /// transaction.  The callers guarantee it: the commands run their
 /// statements outside any transaction except `check`, whose transaction
 /// is rolled back before its error is returned (and a `Transaction`
-/// dropped by `?` queues its ROLLBACK, sent ahead of the next query).
-/// The check is bounded by [`crate::db::CLOSE_TIMEOUT`].  When it fails or
+/// dropped by `?` queues its ROLLBACK, sent ahead of the next query); a
+/// transaction left open all the same is rolled back first
+/// ([`extension_version`]).  The check, rollback included, is bounded by [`crate::db::CLOSE_TIMEOUT`].  When it fails or
 /// times out (connection lost, Ctrl-C during the command, permission,
 /// unresponsive server), the original error is kept, with
 /// [`UNVERIFIED_INSTALLATION`] and the reason in front: the hint that an
@@ -113,9 +121,14 @@ pub async fn diagnose(conn: &mut PgConnection, err: anyhow::Error) -> anyhow::Er
 }
 
 /// `extversion` of `pg_pass_policy` in `pg_extension`, `None` when it is
-/// not installed.  `conn` must be outside any transaction (see
-/// [`diagnose`]).
+/// not installed.  A transaction still open on `conn` (none is expected,
+/// see [`diagnose`]) is rolled back first ([`crate::db::rollback_open`]).
 async fn extension_version(conn: &mut PgConnection) -> Result<Option<String>> {
+    // defensive: the callers leave no transaction open (see `diagnose`),
+    // but the check must never run in an aborted one
+    crate::db::rollback_open(conn)
+        .await
+        .context("cannot roll back the failed transaction")?;
     sqlx::query_scalar::<_, String>(
         "SELECT extversion::text FROM pg_catalog.pg_extension \
           WHERE extname = 'pg_pass_policy'",
@@ -194,8 +207,9 @@ pub async fn expiring(
 /// yet in a warning state are not among its rows: the outer query reads
 /// `v_role_status`, so that each role is one row, and `v_expiring` is
 /// evaluated once more as a subquery (two evaluations of the view, not a
-/// single scan).  The integration test checks that every row of
-/// `v_expiring` is listed.
+/// single scan; accepted review finding, docs/SPEC.md §12: the extension
+/// does not expose the filter, and copying it here was refused).  The
+/// integration test checks that every row of `v_expiring` is listed.
 fn expiring_within_sql() -> String {
     format!(
         "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
@@ -1693,6 +1707,40 @@ mod tests {
         sqlstate(err).unwrap_or_default()
     }
 
+    /// A transaction left open on the connection (none is expected, here
+    /// one forgotten by sqlx and aborted by the error) is rolled back
+    /// before the check of `pg_extension`, through the transaction manager
+    /// of sqlx: the check reads the catalog (no « current transaction is
+    /// aborted »), and sqlx counts no transaction afterwards, so that the
+    /// next `begin` is a real BEGIN, not a SAVEPOINT outside any block.
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn a_transaction_left_open_is_rolled_back_before_the_check() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        std::mem::forget(conn.begin().await.unwrap());
+        assert!(conn.is_in_transaction());
+        let e = sqlx::query("SELECT * FROM pass_policy.v_pgpp_no_such_view")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap_err();
+        let e = anyhow::Error::new(e);
+        assert_eq!(code_of(&e), "42P01");
+        let before = crate::format_error(&e);
+        let m = crate::format_error(&diagnose(&mut conn, e).await);
+        assert_eq!(m, before, "the check failed: {m}");
+        assert!(!conn.is_in_transaction());
+        let tx = conn.begin().await.unwrap();
+        tx.commit().await.unwrap();
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(one, 1);
+        crate::db::close(conn).await;
+    }
+
     /// Real errors of the server on an unknown column, view or function,
     /// whatever the command (read or write), with the extension installed
     /// at a version not older than [`MIN_EXTENSION_VERSION`]: the object
@@ -2117,8 +2165,9 @@ mod tests {
     /// A 403 on the write after an `update`-only preflight is a refusal as
     /// soon as Vault answers it: a Ctrl-C during the new read of the
     /// metadata that explains it (here a Vault that does not answer that
-    /// read) ends that read, and the failure stays a refusal without
-    /// detail, never « may or may not have been written ».  `SIGWINCH`
+    /// read) ends that read at once, well before [`vault::REREAD_TIMEOUT`],
+    /// and the failure stays a refusal marked « interrupted », never « may
+    /// or may not have been written ».  `SIGWINCH`
     /// stands for Ctrl-C (ignored by default, used by no other test).
     #[tokio::test]
     async fn a_ctrl_c_during_the_reread_after_a_403_keeps_the_refusal() {
@@ -2157,14 +2206,19 @@ mod tests {
             vault_delivery(&cfg, &target, true, "app", &password, &mut interrupt),
             raise
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // below REREAD_TIMEOUT: the read was ended by the Ctrl-C, not by
+        // its own bound
+        const { assert!(vault::REREAD_TIMEOUT.as_secs() > 3) };
+        assert!(started.elapsed() < Duration::from_secs(3), "{failure:?}");
         let failure = failure.unwrap_err();
         assert!(interrupt.received());
         assert!(!failure.unknown, "{failure:?}");
         assert!(!failure.message.contains("may or may not"), "{failure:?}");
         assert!(failure.message.contains("HTTP 403"), "{failure:?}");
         assert!(
-            failure.message.ends_with(vault::REFUSED_SINCE_PREFLIGHT),
+            failure
+                .message
+                .ends_with(&format!("{} (interrupted)", vault::REFUSED_SINCE_PREFLIGHT)),
             "{failure:?}"
         );
         assert!(
