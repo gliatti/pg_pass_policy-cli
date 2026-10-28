@@ -138,7 +138,8 @@ fn usage_error(err: &anyhow::Error) -> i32 {
 pub async fn run(cli: Cli) -> Result<i32> {
     let fmt = cli.format;
     // Inputs that do not depend on the server are validated before the
-    // connection: a repeated `--set` key, the candidate password of `check`
+    // connection: a repeated `--set` key, the connection options, the
+    // candidate password of `check`
     // (read first, so that an empty or unreadable input is a usage error and
     // the password is never awaited with an idle connection open).
     let settings = match &cli.command {
@@ -150,6 +151,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
         },
         _ => None,
     };
+    // the connection options (DATABASE_URL / PG*) are checked before the
+    // candidate password is prompted for or read: an invalid DATABASE_URL
+    // must not be discovered once the password has been typed
+    let connect_options = db::connect_options()?;
     let password = match &cli.command {
         Command::Check { .. } => match commands::read_candidate_password() {
             Ok(p) => Some(p),
@@ -166,7 +171,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         }
         _ => None,
     };
-    let mut conn = db::connect().await?;
+    let mut conn = db::connect(&connect_options).await?;
     let result = dispatch(&mut conn, cli.command, fmt, settings, password, delivery).await;
     db::close(conn).await;
     result

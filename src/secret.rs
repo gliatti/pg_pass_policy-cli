@@ -372,7 +372,7 @@ async fn run_exec_with(
         None => {}
     }
     match written {
-        Written::Failed(e) => bail!("{}", write_failure(&e, killed)),
+        Written::Failed(e) => bail!("{}", write_failure(&e)),
         Written::TimedOut => bail!(
             "--exec command did not read the password from its stdin within {} \
              (command killed)",
@@ -402,16 +402,17 @@ async fn run_exec_with(
     Ok(())
 }
 
-/// Message of a failed write of the password line: the command was killed
-/// by pgpp (write failed while it was running), or had already exited by
-/// itself (the write failed when it ended).
-fn write_failure(e: &std::io::Error, killed: bool) -> String {
-    let outcome = if killed {
-        "command killed"
-    } else {
-        "the command had already exited"
-    };
-    format!("cannot write the password to the stdin of the --exec command: {e} ({outcome})")
+/// Message of a failed write of the password line.  The write cannot fail
+/// with `EPIPE`: pgpp keeps a read end of the pipe (`probe`) until the
+/// drain, so a command that exits or closes its stdin never makes the write
+/// fail; only another I/O error of the pipe gets here.  It is reported in
+/// the same terms whether the error interrupted a running command (killed
+/// by pgpp right after) or came at the instant the command exited.
+fn write_failure(e: &std::io::Error) -> String {
+    format!(
+        "cannot write the password to the stdin of the --exec command ({e}): the command \
+         did not receive it (killed if it was still running)"
+    )
 }
 
 /// First event of [`run_exec_with`], while the line is being written.
@@ -929,15 +930,21 @@ mod tests {
         }
     }
 
-    /// « command killed » only when pgpp killed the command.
+    /// One message for every write failure (an I/O error other than
+    /// `EPIPE`, which the read end kept by pgpp rules out).
     #[test]
-    fn a_write_failure_says_whether_the_command_was_killed() {
-        let e = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
-        let killed = write_failure(&e, true);
-        assert!(killed.contains("(command killed)"), "{killed}");
-        let exited = write_failure(&e, false);
-        assert!(!exited.contains("killed"), "{exited}");
-        assert!(exited.contains("already exited"), "{exited}");
+    fn a_write_failure_says_the_password_was_not_received() {
+        let e = std::io::Error::from_raw_os_error(libc::EIO);
+        let m = write_failure(&e);
+        assert!(
+            m.starts_with("cannot write the password to the stdin of the --exec command ("),
+            "{m}"
+        );
+        assert!(m.contains(&e.to_string()), "{m}");
+        assert!(
+            m.ends_with("the command did not receive it (killed if it was still running)"),
+            "{m}"
+        );
     }
 
     /// A descendant that outlives `sh` and holds a write end of the pipe

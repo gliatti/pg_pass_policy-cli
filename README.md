@@ -118,10 +118,14 @@ l'audit ni dans les journaux. La sortie indique le rôle, le nouveau
 `VALID UNTIL` et les canaux de remise utilisés (`delivered_to`). En JSON,
 `valid_until` vaut `null` pour un rôle sans limite et `valid_until_known`
 (booléen) indique si cette valeur a pu être relue : `false` signifie
-« inconnue », pas « illimitée ».
+« inconnue », pas « illimitée ». `failed` liste les remises échouées (`[]`
+si tout a réussi) et `advice` reprend le conseil décrit plus bas (« rotate
+again », « do not rotate again ») : `null` si aucune remise n'a échoué, ou
+si le mot de passe est imprimé (`--show`) sans être dans Vault.
 
 ```json
-{"role":"app_user","valid_until":"2027-01-25 10:00:00+01","valid_until_known":true,"delivered_to":["vault"]}
+{"role":"app_user","valid_until":"2027-01-25 10:00:00+01","valid_until_known":true,"delivered_to":["vault"],"failed":[],"advice":null}
+{"role":"app_user","valid_until":"2027-01-25 10:00:00+01","valid_until_known":true,"delivered_to":["vault"],"failed":["exec"],"advice":"delivered to vault, exec failed: the password is in Vault, do not rotate again"}
 ```
 
 Politique d'affichage :
@@ -160,7 +164,8 @@ Politique d'affichage :
     corrigé ;
 
   en JSON, `delivered_to` donne les remises réussies (`["vault"]` dans le
-  deuxième cas) ;
+  deuxième cas), `failed` les remises échouées (`["exec"]`) et `advice` le
+  même conseil ;
 - un Ctrl-C (`SIGINT`) ne tue plus `pgpp` à partir de l'appel SQL de
   rotation : pendant cet appel, `pgpp` l'abandonne et termine avec le code 1
   (le serveur a pu changer le mot de passe : relancer la rotation) ; pendant
@@ -175,6 +180,17 @@ Politique d'affichage :
   standard fermée, par exemple) alors qu'il était la seule remise ou qu'une
   autre remise a échoué, le message le dit (« password could not be
   printed … rotate again ») et le code de retour est 1 ;
+- si toutes les remises ont réussi mais que le résultat ne peut pas être
+  imprimé (disque plein, par exemple ; une sortie standard fermée reste
+  silencieuse, code 0), le code de retour est 1 et le message dit où se
+  trouve le mot de passe : « password rotated and delivered to vault; the
+  result could not be printed: … ». Il n'y a pas lieu de relancer la
+  rotation ;
+- si la réponse du serveur à la rotation ne peut pas être lue (mot de passe
+  absent ou d'un type inattendu, version incompatible de l'extension), le
+  mot de passe a été changé côté serveur mais `pgpp` ne l'a pas : il est
+  perdu, le code de retour est 1 et le message le dit (« the password was
+  changed on the server … the new password is lost, rotate again ») ;
 - si la relecture de `rolvaliduntil` échoue juste après la rotation (connexion
   coupée), un avertissement est émis, `valid_until` vaut `(unknown)` en
   table (une valeur vide y signifie « illimité ») et `null` en JSON, avec
@@ -283,7 +299,10 @@ sans écho sur un terminal, puis envoyé en paramètre lié à
 `pass_policy.check_password(role, password)`. Code 0 si conforme, 3 avec le
 motif `PPP-xxx` sinon ; le code 1 est réservé aux erreurs (base injoignable,
 erreur de l'extension), ce qui permet à un script de distinguer un refus d'une
-panne. Le mot de passe est lu avant la connexion : une première ligne vide,
+panne. Les options de connexion (`DATABASE_URL`, variables `PG*`) sont
+analysées avant de demander ou de lire le mot de passe : une
+`DATABASE_URL` invalide sort avec le code 1 sans rien attendre sur l'entrée
+standard. Le mot de passe est lu avant la connexion : une première ligne vide,
 qui n'est pas de l'UTF-8 valide ou qui dépasse 4096 octets sort avec le
 code 2 sans se connecter (la lecture s'arrête à la limite, le tampon est
 effacé). Il n'est jamais passé en argument de ligne de commande. Un Ctrl-C à
@@ -351,7 +370,11 @@ variables suivantes :
 | `PGPP_PAIR`, `PGPP_PREVIOUS_ROLE` | uniquement pour `switch-pair` |
 
 Sont des erreurs de remise (code 1, `delivered_to` sans `exec`) : un code de
-retour non nul du processus, une erreur d'écriture sur son entrée, un
+retour non nul du processus, une erreur d'entrée-sortie en écrivant sur son
+entrée (le processus n'a pas reçu le mot de passe et `pgpp` le tue s'il
+tourne encore ; un tube fermé par le processus n'en est pas une : `pgpp`
+garde une extrémité de lecture, l'écriture aboutit et la ligne non lue est
+détectée comme ci-après), un
 processus qui se termine sans avoir lu toute la ligne du mot de passe (par
 exemple `--exec true`), un hook arrêté par `--exec-timeout` ou par un Ctrl-C
 (voir plus bas). `pgpp` garde pour cela sa propre copie de

@@ -1857,6 +1857,43 @@ fn connection_failure_exits_with_1_without_leaking_the_url() {
     assert!(!stderr.contains("hidden-secret"), "{stderr}");
 }
 
+/// An invalid DATABASE_URL is reported by `check` before the candidate
+/// password is read: pgpp exits with 1 while its stdin is still open and
+/// empty (no prompt, nothing awaited), without showing the URL.
+#[test]
+fn check_reports_an_invalid_url_before_reading_the_password() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .args(["check", "app"])
+        .env(
+            "DATABASE_URL",
+            "postgres://u:hidden-secret@127.0.0.1:notaport/db",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the write end stays open: a read of the password would block
+    let stdin = child.stdin.take().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pgpp waits for the password despite an invalid DATABASE_URL");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("invalid DATABASE_URL"), "{stderr}");
+    assert!(!stderr.contains("Password to check"), "{stderr}");
+    assert!(!stderr.contains("empty password"), "{stderr}");
+    assert!(!stderr.contains("hidden-secret"), "{stderr}");
+}
+
 /// A candidate password longer than 4 KiB on the stdin of `check` is a
 /// usage error (exit 2) reported before the connection, without echoing it.
 #[test]

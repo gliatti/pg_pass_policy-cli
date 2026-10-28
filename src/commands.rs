@@ -252,6 +252,12 @@ struct RotationOutput<'a> {
     #[serde(flatten)]
     rotation: &'a Rotation,
     delivered_to: &'a [&'a str],
+    /// failed deliveries (`exec`, `vault`), empty when everything went well
+    failed: &'a [&'a str],
+    /// what to do after a failed delivery (text of [`retry_advice`]), null
+    /// when nothing failed or when the password is printed (`--show`) and
+    /// not in Vault: see [`advice`]
+    advice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<&'a str>,
 }
@@ -354,6 +360,14 @@ fn retry_advice(delivered: &[&str], failed: &[&str]) -> String {
     }
 }
 
+/// Advice printed with the outcome of a rotation ([`retry_advice`]): none
+/// when nothing failed, nor when the password is printed (`--show`) without
+/// being in Vault (the printed password is then the one to deliver by hand).
+fn advice(delivered: &[&str], failed: &[&str], show: bool) -> Option<String> {
+    (!failed.is_empty() && (!show || delivered.contains(&"vault")))
+        .then(|| retry_advice(delivered, failed))
+}
+
 /// Writes the secret to Vault, the message of the failure otherwise.  A
 /// Ctrl-C received before the request is polled for the first time means
 /// the request was never sent (« not attempted »); one received while it
@@ -407,6 +421,8 @@ async fn vault_delivery(
 /// with 0) when it was the only delivery or when another one failed.
 /// Without `--show`, a print failure other than a closed pipe after a
 /// failed delivery is added to the error (a full disk must not go unseen).
+/// After successful deliveries, such a failure says that the password was
+/// rotated and where it was delivered.
 fn delivery_outcome(
     delivered: &[&str],
     failed: &[&str],
@@ -450,6 +466,12 @@ fn delivery_outcome(
         Err(e) if lost => {
             Err(e.context("password rotated but it could not be printed: rotate again"))
         }
+        // delivered elsewhere: a closed pipe stays quiet (exit 0), another
+        // print failure says that the password is not lost and where it is
+        Err(e) if !is_broken_pipe(&e) => Err(e.context(format!(
+            "password rotated and delivered to {}; the result could not be printed",
+            delivered.join(", ")
+        ))),
         other => other,
     }
 }
@@ -468,6 +490,8 @@ fn print_rotation(
             let out = RotationOutput {
                 rotation: rot,
                 delivered_to: delivered,
+                failed,
+                advice: advice(delivered, failed, show),
                 password: show.then_some(password.as_str()),
             };
             // exact-size, wiped buffer, newline included (no reallocation
@@ -555,6 +579,19 @@ fn secret_column(row: &PgRow, index: usize) -> Result<Secret> {
     Ok(secret)
 }
 
+/// Error reading the row returned by a rotation: the new password is
+/// already committed on the server but pgpp does not have it (or not the
+/// role it belongs to), so it is lost.
+fn read_after_rotation<T>(read: Result<T>) -> Result<T> {
+    read.map_err(|e| {
+        anyhow::anyhow!(
+            "the password was changed on the server but the result of the rotation could \
+             not be read ({}): the new password is lost, rotate again",
+            crate::format_error(&e)
+        )
+    })
+}
+
 /// Decodes column `index` of a row returned by a function of the
 /// extension: a missing column or a type other than expected (another
 /// version of pg_pass_policy) is an error, not a panic of `Row::get`.
@@ -617,7 +654,7 @@ pub async fn rotate(
         &mut interrupt,
     )
     .await?;
-    let password = secret_column(&row, 0)?;
+    let password = read_after_rotation(secret_column(&row, 0))?;
     drop(row);
     let mut rot = Rotation {
         role: role.to_string(),
@@ -645,12 +682,15 @@ pub async fn switch_pair(
         &mut interrupt,
     )
     .await?;
-    let password = secret_column(&row, 1)?;
-    let active = column::<Option<String>>(&row, 0, "the active role")?
-        .ok_or_else(|| anyhow::anyhow!("the server returned no active role"))?;
-    let previous_role = column::<Option<String>>(&row, 2, "the previous role")?;
-    let previous_valid_until =
-        column::<Option<String>>(&row, 3, "the end of validity of the previous role")?;
+    let (password, active, previous_role, previous_valid_until) = read_after_rotation((|| {
+        let password = secret_column(&row, 1)?;
+        let active = column::<Option<String>>(&row, 0, "the active role")?
+            .ok_or_else(|| anyhow::anyhow!("the server returned no active role"))?;
+        let previous_role = column::<Option<String>>(&row, 2, "the previous role")?;
+        let previous_valid_until =
+            column::<Option<String>>(&row, 3, "the end of validity of the previous role")?;
+        Ok((password, active, previous_role, previous_valid_until))
+    })())?;
     drop(row);
     let read = valid_until_after_rotation(conn, &active, &mut interrupt).await;
     let mut rot = Rotation {
@@ -1290,6 +1330,8 @@ mod tests {
             let out = RotationOutput {
                 rotation: &rot,
                 delivered_to: &["exec"],
+                failed: &[],
+                advice: None,
                 password: None,
             };
             (
@@ -1367,6 +1409,11 @@ mod tests {
                 format!("{err:#}").contains("text expected"),
                 "column {i}: {err:#}"
             );
+            let err = read_after_rotation(secret_column(&row, i)).unwrap_err();
+            let m = format!("{err:#}");
+            assert!(m.contains("changed on the server"), "column {i}: {m}");
+            assert!(m.contains("text expected"), "column {i}: {m}");
+            assert!(m.ends_with("is lost, rotate again"), "column {i}: {m}");
         }
     }
 
@@ -1463,6 +1510,92 @@ mod tests {
         // delivered elsewhere: a closed stdout stays a quiet broken pipe
         let e = delivery_outcome(&["exec"], none, true, closed()).unwrap_err();
         assert!(is_broken_pipe(&e));
+        let e = delivery_outcome(&["vault"], none, false, closed()).unwrap_err();
+        assert!(is_broken_pipe(&e));
+    }
+
+    /// Deliveries done but the outcome not printed (other than a closed
+    /// pipe): the message says that the password was rotated and where it
+    /// is, shown or not.
+    #[test]
+    fn a_print_failure_after_successful_deliveries_says_where_the_password_is() {
+        let none: &[&str] = &[];
+        let other = || Err(anyhow::anyhow!("disk full"));
+        for show in [false, true] {
+            let e = delivery_outcome(&["vault"], none, show, other()).unwrap_err();
+            assert!(!is_broken_pipe(&e));
+            assert_eq!(
+                crate::format_error(&e),
+                "password rotated and delivered to vault; the result could not be printed: \
+                 disk full"
+            );
+        }
+        let e = delivery_outcome(&["vault", "exec"], none, false, other()).unwrap_err();
+        assert_eq!(
+            crate::format_error(&e),
+            "password rotated and delivered to vault, exec; the result could not be printed: \
+             disk full"
+        );
+    }
+
+    /// A failure to read the row of a rotation says that the password was
+    /// changed on the server and is lost.
+    #[test]
+    fn a_failed_read_after_the_rotation_says_the_password_is_lost() {
+        let e = read_after_rotation::<()>(Err(
+            anyhow::anyhow!("text expected").context("cannot read the generated password")
+        ))
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "the password was changed on the server but the result of the rotation could not \
+             be read (cannot read the generated password: text expected): the new password \
+             is lost, rotate again"
+        );
+        assert_eq!(read_after_rotation(Ok(7)).unwrap(), 7);
+    }
+
+    /// JSON output: `failed` lists the failed deliveries and `advice` holds
+    /// the text of `retry_advice` (null when nothing failed, or when the
+    /// printed password is not in Vault).
+    #[test]
+    fn json_lists_failed_deliveries_with_the_advice() {
+        let rot = Rotation {
+            role: "app".into(),
+            ..Rotation::default()
+        };
+        let json_of = |delivered: &[&str], failed: &[&str], show: bool| {
+            let out = RotationOutput {
+                rotation: &rot,
+                delivered_to: delivered,
+                failed,
+                advice: advice(delivered, failed, show),
+                password: show.then_some("pw"),
+            };
+            serde_json::to_value(&out).unwrap()
+        };
+        let none: &[&str] = &[];
+        let ok = json_of(&["vault"], none, false);
+        assert_eq!(ok["failed"], json!([]));
+        assert!(ok["advice"].is_null(), "{ok}");
+        let v = json_of(&["vault"], &["exec"], false);
+        assert_eq!(v["delivered_to"], json!(["vault"]));
+        assert_eq!(v["failed"], json!(["exec"]));
+        assert_eq!(v["advice"], retry_advice(&["vault"], &["exec"]));
+        assert_eq!(
+            v["advice"],
+            "delivered to vault, exec failed: the password is in Vault, do not rotate again"
+        );
+        let v = json_of(none, &["vault", "exec"], false);
+        assert_eq!(v["failed"], json!(["vault", "exec"]));
+        assert_eq!(v["advice"], "nothing delivered: rotate again");
+        // with --show: the advice only when the password is in Vault
+        let v = json_of(&["vault"], &["exec"], true);
+        assert_eq!(v["advice"], retry_advice(&["vault"], &["exec"]));
+        let v = json_of(&["exec"], &["vault"], true);
+        assert_eq!(v["failed"], json!(["vault"]));
+        assert!(v["advice"].is_null(), "{v}");
+        assert_eq!(v["password"], "pw");
     }
 
     /// Columns read with [`column`] (profile show / create, check, the
@@ -1520,6 +1653,8 @@ mod tests {
         let out = RotationOutput {
             rotation: &rot,
             delivered_to: &["exec", "vault"],
+            failed: &[],
+            advice: None,
             password: Some(&password),
         };
         // the line actually printed: JSON text and newline in one exact-size

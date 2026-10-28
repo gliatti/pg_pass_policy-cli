@@ -6,23 +6,36 @@ use anyhow::{Context, Result};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{ConnectOptions, Connection, PgConnection};
 
-/// Opens a connection from `DATABASE_URL` or, when it is unset, from the
+/// Connection options from `DATABASE_URL` or, when it is unset, from the
 /// standard `PG*` environment variables (`PGPASSFILE` / `~/.pgpass` are read
-/// by sqlx when no password is given).  Statement logging is disabled so that
-/// no bound parameter (passwords of `check`) can reach a log.
-pub async fn connect() -> Result<PgConnection> {
-    let mut opts = match std::env::var("DATABASE_URL") {
+/// by sqlx when no password is given).  Nothing is opened: [`run`] calls it
+/// before any input is read (the candidate password of `check`), so that an
+/// invalid `DATABASE_URL` is reported first.  Statement logging is disabled
+/// so that no bound parameter (passwords of `check`) can reach a log.
+///
+/// [`run`]: crate::run
+pub fn connect_options() -> Result<PgConnectOptions> {
+    let opts = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => PgConnectOptions::from_str(&url)
             .context("invalid DATABASE_URL (the value itself is not shown)")?,
         _ => PgConnectOptions::new(),
     };
-    // keep an application_name given by DATABASE_URL (?application_name=)
-    // or by PGAPPNAME (read by sqlx), default to "pgpp" otherwise
+    Ok(with_defaults(opts))
+}
+
+/// Keeps an application_name given by `DATABASE_URL` (`?application_name=`)
+/// or by `PGAPPNAME` (read by sqlx), defaults to "pgpp" otherwise; disables
+/// statement logging.
+fn with_defaults(mut opts: PgConnectOptions) -> PgConnectOptions {
     if opts.get_application_name().is_none() {
         opts = opts.application_name("pgpp");
     }
-    opts = opts.disable_statement_logging();
-    PgConnection::connect_with(&opts)
+    opts.disable_statement_logging()
+}
+
+/// Opens a connection with the options of [`connect_options`].
+pub async fn connect(opts: &PgConnectOptions) -> Result<PgConnection> {
+    PgConnection::connect_with(opts)
         .await
         .context("cannot connect to PostgreSQL (check DATABASE_URL / PG* variables / PGPASSFILE)")
 }
