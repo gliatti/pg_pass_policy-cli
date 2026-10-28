@@ -356,8 +356,10 @@ pub fn check_addr(addr: &str) -> Result<Url> {
     Ok(check_addr_pinned(addr)?.0)
 }
 
-/// Host name of an `http://` localhost address with the loopback address
-/// it is pinned to; the HTTP client connects there without resolving it.
+/// Host name of an `http://` or `https://` localhost address with the
+/// loopback address it is pinned to (`127.0.0.1`, port 0: the client takes
+/// the port of the URL); the HTTP client connects there without resolving
+/// it.
 type Pinned = Option<(String, SocketAddr)>;
 
 /// [`check_addr`], returning in addition the address a localhost name is
@@ -368,7 +370,10 @@ type Pinned = Option<(String, SocketAddr)>;
 /// DNS, which could point it anywhere, nor a blocking call): RFC 6761
 /// reserves it for the loopback interface, and the HTTP client connects to
 /// `127.0.0.1` alone on the port of the URL, under that name (`Host`
-/// header, and TLS name checked against the certificate).
+/// header, and TLS name checked against the certificate).  Ne pas ajouter
+/// `[::1]` en repli : décision (a single address, never a happy eyeballs
+/// race, and the address reached is the one written; an IPv6-only agent
+/// is reached with `[::1]` written in the URL).
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
     // (`user:pw@`) that are only detected once the URL is parsed.
@@ -726,10 +731,18 @@ async fn send_checked(
         Call::Write => "Vault request",
     };
     let resp = req.send().await.map_err(|e| {
-        let hint = if e.is_connect() && is_localhost_name(url.host_str().unwrap_or("")) {
-            " (localhost is pinned to 127.0.0.1; use http://[::1]:PORT for an IPv6-only agent)"
+        // only a refused connection (not TLS, not a timeout) may come from
+        // an agent listening on [::1] alone
+        let refused = std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
+            .filter_map(|e| e.downcast_ref::<std::io::Error>())
+            .any(|e| e.kind() == std::io::ErrorKind::ConnectionRefused);
+        let hint = if refused && is_localhost_name(url.host_str().unwrap_or("")) {
+            format!(
+                " (localhost is pinned to 127.0.0.1; use {}://[::1]:PORT for an IPv6-only agent)",
+                url.scheme()
+            )
         } else {
-            ""
+            String::new()
         };
         anyhow::Error::new(e).context(format!("{request} to {url} failed{hint}"))
     })?;
@@ -1227,8 +1240,13 @@ mod tests {
             let (url, pinned) = check_addr_pinned(addr).unwrap();
             let (host, pinned) = pinned.expect("a localhost name is pinned");
             assert_eq!(host, url.host_str().unwrap(), "{addr}");
-            // port 0: the client takes the port of the URL
+            // port 0: resolve() makes reqwest take the port of the URL,
+            // explicit or the default of its scheme
             assert_eq!(pinned, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "{addr}");
+        }
+        for (addr, port) in [("http://localhost", 80), ("https://localhost", 443)] {
+            let (url, _) = check_addr_pinned(addr).unwrap();
+            assert_eq!(url.port_or_known_default(), Some(port), "{addr}");
         }
         // other https names are not pinned
         assert!(check_addr_pinned("https://vault.example.net:8200")

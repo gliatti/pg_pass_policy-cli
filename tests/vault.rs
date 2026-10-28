@@ -473,7 +473,10 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         return;
     };
     let port = listener.local_addr().unwrap().port();
-    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+    // the port is reserved on 127.0.0.1 by a socket bound without listen,
+    // kept until the end: the connection is refused, with no race
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    if reserved.bind(([127, 0, 0, 1], port).into()).is_err() {
         eprintln!("skipped: port {port} is taken on 127.0.0.1");
         return;
     }
@@ -483,6 +486,7 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         .unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("use http://[::1]:PORT"), "{text}");
+    drop((reserved, listener));
 }
 
 /// Minimal keep-alive HTTP/1.1 server: answers `lookup-self` with a token

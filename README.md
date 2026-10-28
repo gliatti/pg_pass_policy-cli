@@ -618,16 +618,17 @@ par segment, jamais par concaténation de texte.
 
 `VAULT_ADDR` doit être en `https://` ; `http://` n'est accepté que vers un
 hôte de boucle locale, par exemple un agent Vault local : une adresse IP
-littérale (`127.0.0.0/8`, `[::1]`), ou un nom `localhost` (les mêmes
-`localhost`, `localhost.`, un nom en `.localhost` comme
-`vault.localhost`, avec ou sans point final). Un tel nom, en `http://`
-comme en `https://`, n'est jamais résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe où) :
-la RFC 6761 le réserve à la boucle locale, et le client HTTP se connecte
-directement à `127.0.0.1` sur le port de l'URL, en gardant le nom dans
-l'en-tête `Host` (et, en `https://`, pour la vérification du certificat). Un agent Vault qui n'écoute que sur `[::1]` se désigne
-donc par `http://[::1]:8200`. Toute autre adresse en clair (y compris `localhost.example.net`
-ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe
-y circuleraient sans chiffrement. Pour un cas non
+littérale (`127.0.0.0/8`, `[::1]`), ou un nom `localhost` (`localhost`,
+`localhost.`, ou un nom en `.localhost` comme `vault.localhost`, avec ou
+sans point final). Un tel nom, en `http://` comme en `https://`, n'est
+jamais résolu (ni `/etc/hosts` ni DNS, qui pourraient le diriger n'importe
+où) : la RFC 6761 le réserve à la boucle locale, et le client HTTP se
+connecte directement à `127.0.0.1` sur le port de l'URL, en gardant le nom
+dans l'en-tête `Host` (et, en `https://`, pour la vérification du
+certificat). Un agent Vault qui n'écoute que sur `[::1]` se désigne donc
+par `http://[::1]:8200`. Toute autre adresse en clair (y compris
+`localhost.example.net` ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le
+jeton et le mot de passe y circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
 `--exec 'read -r pw; printf "%s" "$pw" | vault kv put -mount=secret db/app password=-'`.
 
@@ -805,9 +806,13 @@ secours) ou relancer la rotation après correction du jeton.
 ## Limites connues
 
 - Un nom `localhost` (en `http://` comme en `https://`) est épinglé sur
-  `127.0.0.1` seul, par choix de sécurité : un agent Vault qui n'écoute que
-  sur `[::1]` n'est pas joint (erreur de connexion, avec l'indice
-  correspondant). Il se désigne par `http://[::1]:PORT`.
+  `127.0.0.1` seul. C'est une décision, sans repli sur `[::1]` : une seule
+  adresse, jamais de course entre IPv4 et IPv6 (happy eyeballs), et
+  l'adresse jointe est celle qu'on écrit. Un agent Vault qui n'écoute que
+  sur `[::1]` n'est donc pas joint (connexion refusée, avec l'indice
+  correspondant) : il se désigne par `http://[::1]:PORT`, ou par
+  `https://[::1]:PORT`, qui exige alors un certificat portant l'adresse IP
+  `::1` dans son SAN (le nom `localhost` n'y suffit pas).
 - En fin de commande, `pgpp` annule une transaction restée ouverte par un
   `ROLLBACK` brut, sans mettre à jour le compteur de transactions de sqlx :
   sans effet, la connexion étant fermée juste après.
