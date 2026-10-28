@@ -92,8 +92,15 @@ pgpp expiring                    # status warning / grace / expired
 pgpp expiring --within 14d       # idem + expiration dans moins de 14 jours
 pgpp locked                      # rôles verrouillés (mêmes colonnes que la vue v_locked)
 pgpp failed-attempts             # compteurs d'échecs en mémoire partagée
-pgpp worker-status               # pid, dernier passage et rechargement du worker
+pgpp worker-status               # pid, dernier passage et rechargement du worker, locks_loaded
 ```
+
+`worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
+les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
+fermée). Tant qu'il est faux, les connexions par mot de passe ou secret des
+rôles non exemptés sont refusées (SQLSTATE `57P03`, voir le README de
+l'extension). Avec une version de l'extension qui ne renvoie pas encore
+cette colonne, la valeur est vide (`null` en JSON).
 
 ### Rotation d'un mot de passe
 

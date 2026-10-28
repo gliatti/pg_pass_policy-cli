@@ -84,13 +84,13 @@ fn report_line(kind: Report, err: &anyhow::Error) -> String {
 /// Prints an error chain on the standard error, as `pgpp: error: ...` or
 /// `pgpp: warning: ...` (see [`format_error`]).
 pub fn report(kind: Report, err: &anyhow::Error) {
-    eprintln!("{}", report_line(kind, err));
+    output::write_stderr(report_line(kind, err), true);
 }
 
 /// Prints a message (not an error chain) on the standard error, with the
 /// prefix of [`report`].
 pub fn report_text(kind: Report, text: &str) {
-    eprintln!("{}", message_line(kind, text));
+    output::write_stderr(message_line(kind, text), true);
 }
 
 /// Prints `pgpp: warning: <text>` on the standard error.

@@ -448,7 +448,12 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
     // `lookup-self` first pins the failure on the token itself; the extra
     // round trip is accepted for that more precise message.
     let url = endpoint(&cfg.addr, ["v1", "auth", "token", "lookup-self"]);
-    send_checked(cfg.request(reqwest::Method::GET, url.clone()), &url).await?;
+    send_checked(
+        cfg.request(reqwest::Method::GET, url.clone()),
+        &url,
+        Call::Preflight,
+    )
+    .await?;
 
     let path = target.api_path();
     let url = endpoint(&cfg.addr, ["v1", "sys", "capabilities-self"]);
@@ -456,6 +461,7 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
         cfg.request(reqwest::Method::POST, url.clone())
             .json(&json!({ "paths": [path] })),
         &url,
+        Call::Preflight,
     )
     .await?;
     let capabilities = resp
@@ -484,15 +490,34 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
     Ok(warnings)
 }
 
-/// Sends a preflight request and returns the response when its status is
-/// 2xx.  A network error, a redirect (never followed) or any other status is
-/// an error; 401 and 403 are reported as a refused token, with the hint for
-/// a token without the default policy.
-async fn send_checked(req: reqwest::RequestBuilder, url: &Url) -> Result<reqwest::Response> {
+/// Kind of a request sent by [`send_checked`], for the wording of its
+/// errors.
+#[derive(Debug, Clone, Copy)]
+enum Call {
+    /// Preflight request, before the rotation.
+    Preflight,
+    /// Write of the secret, after the rotation.
+    Write,
+}
+
+/// Sends a request and returns the response when its status is 2xx.  A
+/// network error, a redirect (never followed) or any other status is an
+/// error, with the status and the response body.  For a preflight request,
+/// 401 and 403 are reported as a refused token, with the hint for a token
+/// without the default policy.
+async fn send_checked(
+    req: reqwest::RequestBuilder,
+    url: &Url,
+    call: Call,
+) -> Result<reqwest::Response> {
+    let request = match call {
+        Call::Preflight => "Vault preflight request",
+        Call::Write => "Vault request",
+    };
     let resp = req
         .send()
         .await
-        .with_context(|| format!("Vault preflight request to {url} failed"))?;
+        .with_context(|| format!("{request} to {url} failed"))?;
     let status = resp.status();
     if status.is_redirection() {
         bail!(redirect_message(status, url));
@@ -501,14 +526,17 @@ async fn send_checked(req: reqwest::RequestBuilder, url: &Url) -> Result<reqwest
         return Ok(resp);
     }
     let body = error_body(resp).await;
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-        bail!(
-            "Vault refused VAULT_TOKEN at {url}: HTTP {status}{body} (expired, revoked or \
-             unknown token, or no permission on this endpoint; a token created with \
-             -no-default-policy needs --vault-skip-preflight)"
-        );
+    match call {
+        Call::Write => bail!("Vault refused the write to {url}: HTTP {status}{body}"),
+        Call::Preflight if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+            bail!(
+                "Vault refused VAULT_TOKEN at {url}: HTTP {status}{body} (expired, revoked or \
+                 unknown token, or no permission on this endpoint; a token created with \
+                 -no-default-policy needs --vault-skip-preflight)"
+            )
+        }
+        Call::Preflight => bail!("{request} to {url} failed: HTTP {status}{body}"),
     }
-    bail!("Vault preflight request to {url} failed: HTTP {status}{body}")
 }
 
 /// Capabilities of the token on `path` in a `sys/capabilities-self` answer:
@@ -554,23 +582,11 @@ async fn error_body(resp: reqwest::Response) -> String {
 pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
     let url = target.url(&cfg.addr);
     let body = zeroizing_json(payload)?;
-    let resp = cfg
+    let req = cfg
         .request(reqwest::Method::POST, url.clone())
         .header(CONTENT_TYPE, "application/json")
-        .body(reqwest::Body::from(Bytes::from_owner(body)))
-        .send()
-        .await
-        .with_context(|| format!("Vault request to {url} failed"))?;
-    let status = resp.status();
-    if status.is_redirection() {
-        bail!(redirect_message(status, &url));
-    }
-    if !status.is_success() {
-        bail!(
-            "Vault refused the write to {url}: HTTP {status}{}",
-            error_body(resp).await
-        );
-    }
+        .body(reqwest::Body::from(Bytes::from_owner(body)));
+    send_checked(req, &url, Call::Write).await?;
     Ok(())
 }
 

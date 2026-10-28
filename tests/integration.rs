@@ -1408,6 +1408,14 @@ async fn maintenance_worker_status_and_failed_attempts() {
     let ws = run_json(&url, &["worker-status"]);
     assert!(ws["pid"].is_number() || ws["pid"].is_null(), "{ws}");
     assert!(ws.get("tracked_roles").is_some());
+    // the installed extension returns locks_loaded (NULL with an older one)
+    assert!(ws["locks_loaded"].is_boolean(), "{ws}");
+    assert!(
+        ws["last_run"].is_string() || ws["last_run"].is_null(),
+        "{ws}"
+    );
+    let table = run_ok(&url, &["worker-status"]);
+    assert!(table.contains("locks_loaded"), "{table}");
 
     let fa = run_json(&url, &["failed-attempts"]);
     assert!(fa.is_array());
@@ -1608,6 +1616,50 @@ fn rotate_against_vault(server: &MockServer) -> Output {
         .env_remove("PGPP_VAULT_SKIP_PREFLIGHT")
         .output()
         .unwrap()
+}
+
+/// An error reported on a standard error closed by its reader does not
+/// panic (`eprintln!` would, exit code 101): the exit code stays 1.
+#[test]
+fn a_closed_stderr_keeps_the_exit_code() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pgpp"))
+        .arg("status")
+        .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // close the read end before pgpp reports the connection error
+    drop(child.stderr.take());
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+}
+
+/// `PGPP_VAULT_SKIP_PREFLIGHT` exported empty counts as absent: the
+/// rotation goes on to the connection (refused here, exit 1), it is not a
+/// usage error (exit 2); an invalid non-empty value still is.
+#[test]
+fn an_empty_skip_preflight_variable_is_ignored() {
+    let run = |v: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pgpp"))
+            .args(["rotate", "x", "--show"])
+            .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+            .env("PGPP_VAULT_SKIP_PREFLIGHT", v)
+            .output()
+            .unwrap()
+    };
+    for v in ["", " "] {
+        let out = run(v);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{v:?}: {stderr}");
+        assert!(!stderr.contains("boolean"), "{v:?}: {stderr}");
+    }
+    let out = run("maybe");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `--vault-mount kv --vault-kv kv/app` writes kv/data/kv/app: a warning

@@ -56,10 +56,40 @@ fn write_line_to(out: &mut impl Write, text: impl Display) -> Result<()> {
 /// `EPIPE`, `cannot write to the standard output: ...` otherwise.  Shared
 /// by every writer of stdout, buffered or not.
 pub fn map_stdout_error(e: std::io::Error) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::BrokenPipe {
+    if is_epipe(&e) {
         anyhow::Error::new(BrokenPipe)
     } else {
         anyhow::Error::new(e).context("cannot write to the standard output")
+    }
+}
+
+/// True for the error of a write to a pipe whose reader is gone (`EPIPE`).
+/// Shared by the writers of stdout ([`map_stdout_error`]) and of stderr
+/// ([`write_stderr`]).
+fn is_epipe(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::BrokenPipe
+}
+
+/// Writes `text` (and a newline when `newline`) to the standard error, then
+/// flushes it.  `eprintln!` / `eprint!` panic when the write fails: a
+/// standard error closed by its reader (`pgpp ... 2>&1 | head -1`) must not
+/// turn a report into a panic.  A failure is ignored: the standard error is
+/// where it would be reported.
+pub fn write_stderr(text: impl Display, newline: bool) {
+    let _ = write_stderr_to(&mut std::io::stderr().lock(), text, newline);
+}
+
+/// [`write_stderr`] on any writer: `Ok` for a closed pipe (`EPIPE`), the
+/// other errors are returned (and ignored by [`write_stderr`]).
+fn write_stderr_to(out: &mut impl Write, text: impl Display, newline: bool) -> std::io::Result<()> {
+    let written = if newline {
+        writeln!(out, "{text}")
+    } else {
+        write!(out, "{text}")
+    };
+    match written.and_then(|()| out.flush()) {
+        Err(e) if is_epipe(&e) => Ok(()),
+        other => other,
     }
 }
 
@@ -272,6 +302,19 @@ mod tests {
         let mut buf = Vec::new();
         write_line_to(&mut buf, json!({"a": 1})).unwrap();
         assert_eq!(buf, b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn a_closed_stderr_does_not_panic() {
+        // EPIPE is ignored, like a closed stdout; other errors are returned
+        write_stderr_to(&mut Failing(std::io::ErrorKind::BrokenPipe), "x", true).unwrap();
+        write_stderr_to(&mut Failing(std::io::ErrorKind::BrokenPipe), "x", false).unwrap();
+        let err = write_stderr_to(&mut Failing(std::io::ErrorKind::Other), "x", true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let mut buf = Vec::new();
+        write_stderr_to(&mut buf, "line", true).unwrap();
+        write_stderr_to(&mut buf, "prompt: ", false).unwrap();
+        assert_eq!(buf, b"line\nprompt: ");
     }
 
     #[test]

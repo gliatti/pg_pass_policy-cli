@@ -373,6 +373,8 @@ async fn vault_delivery(
 /// (`printed`).  With `--show` the standard output is a delivery too: its
 /// failure is reported (never silenced as a closed pipe, which would exit
 /// with 0) when it was the only delivery or when another one failed.
+/// Without `--show`, a print failure other than a closed pipe after a
+/// failed delivery is added to the error (a full disk must not go unseen).
 fn delivery_outcome(
     failures: usize,
     show: bool,
@@ -392,6 +394,10 @@ fn delivery_outcome(
                      password could not be printed ({cause}): rotate again"
                 )
             }
+            Err(e) if !is_broken_pipe(&e) => bail!(
+                "password rotated but {failures} delivery error(s) occurred (and the \
+                 outcome could not be printed: {e:#})"
+            ),
             _ => bail!("password rotated but {failures} delivery error(s) occurred"),
         }
     }
@@ -508,14 +514,6 @@ fn secret_column(row: &PgRow, index: usize) -> Result<Secret> {
     Ok(secret)
 }
 
-/// Decodes an optional text column of the result of a rotation, with the
-/// wording of [`secret_column`] (`cannot read <what>`): a type mismatch is
-/// an error, not a panic.
-fn text_column(row: &PgRow, index: usize, what: &str) -> Result<Option<String>> {
-    row.try_get::<Option<String>, _>(index)
-        .with_context(|| format!("cannot read {what}"))
-}
-
 /// Decodes column `index` of a row returned by a function of the
 /// extension: a missing column or a type other than expected (another
 /// version of pg_pass_policy) is an error, not a panic of `Row::get`.
@@ -607,10 +605,11 @@ pub async fn switch_pair(
     )
     .await?;
     let password = secret_column(&row, 1)?;
-    let active = text_column(&row, 0, "the active role")?
+    let active = column::<Option<String>>(&row, 0, "the active role")?
         .ok_or_else(|| anyhow::anyhow!("the server returned no active role"))?;
-    let previous_role = text_column(&row, 2, "the previous role")?;
-    let previous_valid_until = text_column(&row, 3, "the end of validity of the previous role")?;
+    let previous_role = column::<Option<String>>(&row, 2, "the previous role")?;
+    let previous_valid_until =
+        column::<Option<String>>(&row, 3, "the end of validity of the previous role")?;
     drop(row);
     let read = valid_until_after_rotation(conn, &active, &mut interrupt).await;
     let mut rot = Rotation {
@@ -827,8 +826,7 @@ pub fn read_candidate_password() -> Result<Secret> {
 fn read_password() -> Result<Secret> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
-        eprint!("Password to check: ");
-        std::io::stderr().flush().ok();
+        crate::output::write_stderr("Password to check: ", false);
         let pw = rpassword::read_password().context("cannot read the password")?;
         return Ok(Zeroizing::new(pw));
     }
@@ -1029,9 +1027,14 @@ pub async fn failed_attempts(conn: &mut PgConnection, fmt: Format) -> Result<()>
     ResultSet::from_rows(&rows)?.print(fmt, "no tracked authentication failure")
 }
 
+/// `worker_status()`, columns read by name.  `locks_loaded` (start-up
+/// window closed, the locks are loaded) is read through `to_jsonb(w)`: an
+/// extension that does not return it yet gives NULL instead of an error.
 pub async fn worker_status(conn: &mut PgConnection, fmt: Format) -> Result<()> {
     let row = sqlx::query(
-        "SELECT pid, last_run::text, last_reload::text, tracked_roles FROM pass_policy.worker_status()",
+        "SELECT w.pid, w.last_run::text AS last_run, w.last_reload::text AS last_reload, \
+                w.tracked_roles, to_jsonb(w) -> 'locks_loaded' AS locks_loaded \
+           FROM pass_policy.worker_status() w",
     )
     .fetch_one(conn)
     .await?;
@@ -1205,32 +1208,6 @@ mod tests {
         }
     }
 
-    /// The columns of `switch_rotation_pair` are decoded without panicking
-    /// (PGPP_TEST_URL): NULL, text, and a type that is not text.
-    #[tokio::test]
-    #[ignore = "needs PGPP_TEST_URL"]
-    async fn text_columns_are_decoded_without_panicking() {
-        use sqlx::Connection;
-        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
-        let mut conn = PgConnection::connect(&url).await.unwrap();
-        let row = sqlx::query("SELECT NULL::text, 'r'::text, 42")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-        assert_eq!(text_column(&row, 0, "the active role").unwrap(), None);
-        assert_eq!(
-            text_column(&row, 1, "the active role").unwrap().as_deref(),
-            Some("r")
-        );
-        let err = text_column(&row, 2, "the previous role").unwrap_err();
-        assert!(
-            format!("{err:#}").starts_with("cannot read the previous role: "),
-            "{err:#}"
-        );
-        let err = text_column(&row, 9, "the previous role").unwrap_err();
-        assert!(format!("{err:#}").starts_with("cannot read the previous role"));
-    }
-
     /// A Ctrl-C received before the Vault write: the request is never sent
     /// (no server listens on the address), the message says so.
     #[tokio::test]
@@ -1269,6 +1246,13 @@ mod tests {
         assert_eq!(m, "password rotated but 2 delivery error(s) occurred");
         let m = msg(delivery_outcome(1, false, true, closed()));
         assert_eq!(m, "password rotated but 1 delivery error(s) occurred");
+        // not shown: another print failure is kept in the message
+        let m = msg(delivery_outcome(1, false, true, other()));
+        assert_eq!(
+            m,
+            "password rotated but 1 delivery error(s) occurred (and the outcome could not \
+             be printed: disk full)"
+        );
         // no delivery error
         assert!(delivery_outcome(0, true, false, Ok(())).is_ok());
         let m = msg(delivery_outcome(0, true, true, closed()));
@@ -1278,8 +1262,9 @@ mod tests {
         assert!(is_broken_pipe(&e));
     }
 
-    /// Columns read with [`column`] (profile show / create, check) are
-    /// decoded without panicking (PGPP_TEST_URL).
+    /// Columns read with [`column`] (profile show / create, check, the
+    /// optional text columns of switch-pair) are decoded without panicking
+    /// (PGPP_TEST_URL).
     #[tokio::test]
     #[ignore = "needs PGPP_TEST_URL"]
     async fn extension_columns_are_decoded_without_panicking() {
@@ -1298,6 +1283,12 @@ mod tests {
         assert_eq!(
             column::<Option<String>>(&row, 3, "the reason").unwrap(),
             None
+        );
+        assert_eq!(
+            column::<Option<String>>(&row, 1, "the active role")
+                .unwrap()
+                .as_deref(),
+            Some("x")
         );
         for err in [
             column::<i32>(&row, 1, "the id of the new profile").unwrap_err(),

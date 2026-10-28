@@ -5,7 +5,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::Value;
 
-use crate::duration::parse_duration;
+use crate::duration::{parse_duration, MAX_DURATION_SECS};
 use crate::kv::parse_kv;
 use crate::output::Format;
 use crate::secret::EXEC_DEFAULT_TIMEOUT;
@@ -25,9 +25,12 @@ fn exec_timeout_arg(s: &str) -> Result<ExecTimeout, String> {
         if secs == 0 {
             return Ok(ExecTimeout(None));
         }
-        return parse_duration(&format!("{secs}s"))
-            .map(|d| ExecTimeout(Some(d)))
-            .map_err(|e| e.to_string());
+        if secs > MAX_DURATION_SECS {
+            return Err(format!(
+                "invalid duration \"{s}\": at most 36500d (100 years)"
+            ));
+        }
+        return Ok(ExecTimeout(Some(Duration::from_secs(secs))));
     }
     parse_duration(s)
         .map(|d| ExecTimeout(Some(d)))
@@ -47,6 +50,22 @@ impl std::fmt::Display for ExecTimeout {
             Some(d) => write!(f, "{}s", d.as_secs()),
             None => f.write_str("0"),
         }
+    }
+}
+
+/// `--vault-skip-preflight` / `PGPP_VAULT_SKIP_PREFLIGHT`: the boolean
+/// values of clap (`1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`...);
+/// an empty value (`export PGPP_VAULT_SKIP_PREFLIGHT=`) counts as absent,
+/// so that it does not turn every rotation into a usage error.
+fn skip_preflight_arg(s: &str) -> Result<bool, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(false);
+    }
+    match t.to_ascii_lowercase().as_str() {
+        "y" | "yes" | "t" | "true" | "on" | "1" => Ok(true),
+        "n" | "no" | "f" | "false" | "off" | "0" => Ok(false),
+        _ => Err(format!("value was not a boolean: \"{s}\"")),
     }
 }
 
@@ -132,7 +151,7 @@ pub struct RotateOpts {
         long = "vault-skip-preflight",
         env = "PGPP_VAULT_SKIP_PREFLIGHT",
         action = clap::ArgAction::SetTrue,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = skip_preflight_arg,
         help_heading = DELIVERY_HEADING
     )]
     pub vault_skip_preflight: bool,
@@ -391,6 +410,30 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_skip_preflight_value_counts_as_absent() {
+        for v in ["", "  "] {
+            assert_eq!(skip_preflight_arg(v), Ok(false), "{v:?}");
+        }
+        for v in ["1", "true", "TRUE", "yes", "on", "y", "t"] {
+            assert_eq!(skip_preflight_arg(v), Ok(true), "{v:?}");
+        }
+        for v in ["0", "false", "no", "off", "n", "f"] {
+            assert_eq!(skip_preflight_arg(v), Ok(false), "{v:?}");
+        }
+        assert!(skip_preflight_arg("maybe").is_err());
+        // the value given to the flag by the command line
+        let err = Cli::try_parse_from([
+            "pgpp",
+            "rotate",
+            "app",
+            "--show",
+            "--vault-skip-preflight=maybe",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
     fn rotation_without_delivery_is_a_usage_error() {
         for cmd in ["rotate", "switch-pair"] {
             let err = Cli::try_parse_from(["pgpp", cmd, "app"]).unwrap_err();
@@ -447,7 +490,12 @@ mod tests {
         );
         assert_eq!(parse(&["--exec-timeout", "0"]), Ok(None), "unbounded");
         assert_eq!(parse(&["--exec-timeout", "000"]), Ok(None), "unbounded");
-        for bad in ["", "-1", "5x", "0s", "99999999999999999999999"] {
+        assert_eq!(
+            parse(&["--exec-timeout", &MAX_DURATION_SECS.to_string()]),
+            Ok(Some(Duration::from_secs(MAX_DURATION_SECS)))
+        );
+        let over = (MAX_DURATION_SECS + 1).to_string();
+        for bad in ["", "-1", "5x", "0s", "99999999999999999999999", &over] {
             assert_eq!(parse(&["--exec-timeout", bad]), Err(2), "{bad:?}");
         }
         // only with --exec

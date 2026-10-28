@@ -266,20 +266,22 @@ async fn run_exec_with(
             tx.write_all(&line).await
         };
         tokio::pin!(write);
-        tokio::select! {
-            r = tokio::time::timeout(write_timeout, &mut write) => match r {
-                Ok(Ok(())) => (Written::Complete, None, None),
-                Ok(Err(e)) => (Written::Failed(e), None, None),
-                Err(_) => (Written::TimedOut, None, None),
-            },
-            status = child.wait() => {
-                // The child exited first: take a write that ended at the
-                // same time (a zero timeout still polls it once), give up
-                // the rest, nobody will read it.
-                (poll_once(&mut write).await, Some(status), None)
-            }
-            () = &mut interrupt => (poll_once(&mut write).await, None, Some(Stop::Interrupted)),
-            () = &mut deadline => (poll_once(&mut write).await, None, Some(Stop::TimedOut)),
+        let first = first_event(
+            tokio::time::timeout(write_timeout, &mut write),
+            child.wait(),
+            &mut interrupt,
+            &mut deadline,
+        )
+        .await;
+        match first {
+            First::Written(Ok(Ok(()))) => (Written::Complete, None, None),
+            First::Written(Ok(Err(e))) => (Written::Failed(e), None, None),
+            First::Written(Err(_)) => (Written::TimedOut, None, None),
+            // The child exited first (or was stopped): take a write that
+            // ended at the same time (a zero timeout still polls it once),
+            // give up the rest, nobody will read it.
+            First::Exited(status) => (poll_once(&mut write).await, Some(status), None),
+            First::Stopped(s) => (poll_once(&mut write).await, None, Some(s)),
         }
     };
     // From here on the write end is closed (owned by the dropped future).
@@ -344,6 +346,38 @@ async fn run_exec_with(
         );
     }
     Ok(())
+}
+
+/// First event of [`run_exec_with`], while the line is being written.
+#[derive(Debug, PartialEq)]
+enum First<W, S> {
+    /// The write ended (or its delay expired).
+    Written(W),
+    /// The command exited before the end of the write.
+    Exited(S),
+    /// Ctrl-C or `--exec-timeout` before the end of the write and of the
+    /// command.
+    Stopped(Stop),
+}
+
+/// First wait of [`run_exec_with`]: the end of the write, of the command, a
+/// Ctrl-C or `--exec-timeout`.  `biased`, in this order: the write may stay
+/// first (a line entirely written is then checked by the second wait), but
+/// a command that has exited must win over a Ctrl-C or a delay ready at the
+/// same instant, as in [`wait_or_stop`].
+async fn first_event<W, S>(
+    write: impl std::future::Future<Output = W>,
+    wait: impl std::future::Future<Output = S>,
+    interrupt: impl std::future::Future<Output = ()>,
+    deadline: impl std::future::Future<Output = ()>,
+) -> First<W, S> {
+    tokio::select! {
+        biased;
+        w = write => First::Written(w),
+        status = wait => First::Exited(status),
+        () = interrupt => First::Stopped(Stop::Interrupted),
+        () = deadline => First::Stopped(Stop::TimedOut),
+    }
 }
 
 /// Second wait of [`run_exec_with`], once the line is written: the end of
@@ -488,6 +522,23 @@ mod tests {
         assert_eq!(r, Err(Stop::Interrupted));
         let r = wait_or_stop(pending(), std::future::pending(), std::future::ready(())).await;
         assert_eq!(r, Err(Stop::TimedOut));
+    }
+
+    /// The first wait (write still running) is biased too: write, then the
+    /// end of the command, then Ctrl-C, then the delay.
+    #[tokio::test]
+    async fn the_first_wait_prefers_the_exit_to_a_stop() {
+        use std::future::{pending, ready};
+        for _ in 0..200 {
+            let r = first_event(ready('w'), ready(7), ready(()), ready(())).await;
+            assert_eq!(r, First::Written('w'));
+            let r = first_event(pending::<char>(), ready(7), ready(()), ready(())).await;
+            assert_eq!(r, First::Exited(7));
+        }
+        let r = first_event(pending::<char>(), pending::<i32>(), ready(()), ready(())).await;
+        assert_eq!(r, First::Stopped(Stop::Interrupted));
+        let r = first_event(pending::<char>(), pending::<i32>(), pending(), ready(())).await;
+        assert_eq!(r, First::Stopped(Stop::TimedOut));
     }
 
     #[tokio::test]
