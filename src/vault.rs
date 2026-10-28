@@ -371,8 +371,8 @@ type Pinned = Option<(String, SocketAddr)>;
 /// reserves it for the loopback interface, and the HTTP client connects to
 /// `127.0.0.1` alone on the port of the URL, under that name (`Host`
 /// header, and TLS name checked against the certificate).  Do not add
-/// `[::1]` as a fallback: deliberate decision, see README "Limites
-/// connues" (a single address, never a happy eyeballs race, and the
+/// `[::1]` as a fallback: deliberate decision, see README, section
+/// "Limites connues" (a single address, never a happy eyeballs race, and the
 /// address reached is the one written; an IPv6-only agent is reached with
 /// `[::1]` written in the URL).
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
@@ -1230,8 +1230,10 @@ mod tests {
             let (host, pinned) = pinned.expect("a localhost name is pinned");
             assert_eq!(host, url.host_str().unwrap(), "{addr}");
             // port 0: resolve() makes reqwest take the port of the URL;
-            // covered end to end by tests/vault.rs
-            // http_localhost_reaches_the_pinned_loopback_address
+            // an explicit port is covered end to end by tests/vault.rs
+            // http_localhost_reaches_the_pinned_loopback_address; the
+            // default port (80/443) is not covered (it would need
+            // listening on a privileged port)
             assert_eq!(pinned, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "{addr}");
         }
         // other https names are not pinned

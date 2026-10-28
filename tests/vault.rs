@@ -481,9 +481,15 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         return;
     }
     let cfg = VaultConfig::new(format!("http://localhost:{port}"), "tok", None).unwrap();
-    assert!(write(&cfg, &target(), &build_payload("app", "x", "now"))
+    let err = write(&cfg, &target(), &build_payload("app", "x", "now"))
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(
+        err.chain()
+            .filter_map(|e| e.downcast_ref::<std::io::Error>())
+            .any(|e| e.kind() == std::io::ErrorKind::ConnectionRefused),
+        "{err:#}"
+    );
     drop((reserved, listener));
 }
 

@@ -809,10 +809,13 @@ secours) ou relancer la rotation après correction du jeton.
   `127.0.0.1` seul. C'est une décision, sans repli sur `[::1]` : une seule
   adresse, jamais de course entre IPv4 et IPv6 (happy eyeballs), et
   l'adresse jointe est celle qu'on écrit. Un agent Vault qui n'écoute que
-  sur `[::1]` n'est donc pas joint (connexion refusée) : il se désigne
-  par `http://[::1]:PORT`, ou par `https://[::1]:PORT`, qui exige alors
-  un certificat portant l'adresse IP `::1` dans son SAN (le nom
-  `localhost` n'y suffit pas).
+  sur `[::1]` n'est donc pas joint : l'erreur affichée se termine
+  typiquement par `Connection refused (os error 111)`. Aucun indice sur
+  IPv6 n'y est ajouté, c'est voulu : le même symptôme vient aussi d'un
+  port erroné ou d'un agent arrêté, et l'indice égarerait. Un tel agent
+  se désigne par `http://[::1]:PORT`, ou par `https://[::1]:PORT`, qui
+  exige alors un certificat portant l'adresse IP `::1` dans son SAN (le
+  nom `localhost` n'y suffit pas).
 - En fin de commande, `pgpp` annule une transaction restée ouverte par un
   `ROLLBACK` brut, sans mettre à jour le compteur de transactions de sqlx :
   sans effet, la connexion étant fermée juste après.
