@@ -134,7 +134,13 @@ pub struct VaultConfig {
     /// HTTP client built once (with the extra root certificates) and used
     /// for every request: token preflight and secret write.
     client: reqwest::Client,
+    /// Longest duration of a request, connection and response included
+    /// ([`REQUEST_TIMEOUT`] unless changed by [`VaultConfig::with_timeout`]).
+    timeout: Duration,
 }
+
+/// Default longest duration of a Vault request.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl VaultConfig {
     /// Builds a configuration; `addr` must use `https://`, or `http://` on a
@@ -166,7 +172,14 @@ impl VaultConfig {
             token,
             namespace,
             client: build_client(root_certs, &pinned)?,
+            timeout: REQUEST_TIMEOUT,
         })
+    }
+
+    /// Same configuration with another request timeout (tests).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Reads the environment and validates everything (address, token,
@@ -188,6 +201,7 @@ impl VaultConfig {
         let mut req = self
             .client
             .request(method, url)
+            .timeout(self.timeout)
             .header("X-Vault-Token", self.token.clone())
             .header("X-Vault-Request", "true");
         if let Some(ns) = &self.namespace {
@@ -256,9 +270,7 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// (`http://localhost`) replaces the resolution of that name by the loopback
 /// addresses checked by `check_addr_pinned`.
 fn build_client(root_certs: &[Certificate], pinned: &Pinned) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some((host, addrs)) = pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -558,6 +570,18 @@ async fn send_checked(
         }
         Call::Preflight => bail!("{request} to {url} failed: HTTP {status}{body}"),
     }
+}
+
+/// True when a failed Vault request may have been received by Vault: the
+/// error came after the connection was established (no answer within the
+/// timeout, connection closed while waiting for or reading the response,
+/// unreadable body).  An error raised before anything was sent (DNS,
+/// connection refused or timed out, TLS handshake, invalid request) or an
+/// answer of Vault (HTTP status, redirect) gives `false`.
+pub fn may_have_been_received(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<reqwest::Error>())
+        .is_some_and(|e| !e.is_connect() && !e.is_builder())
 }
 
 /// Capabilities of the token on `path` in a `sys/capabilities-self` answer:

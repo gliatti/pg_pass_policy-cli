@@ -573,10 +573,11 @@ async fn rotate_writes_to_vault_mock() {
 /// Ctrl-C (SIGINT sent to pgpp) while the new password is being written to
 /// Vault: pgpp does not die silently (the password would be lost without a
 /// word) but abandons the write, skips the deliveries still to come
-/// (`--exec`), and exits with 1 asking to rotate again.
+/// (`--exec`), and exits with 1 asking to check Vault before rotating
+/// again (the request may have been received).
 #[tokio::test]
 #[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
-async fn interruption_during_the_vault_write_asks_to_rotate_again() {
+async fn interruption_during_the_vault_write_asks_to_check_vault() {
     let url = db_url!();
     let mut conn = admin().await;
     fresh_login_role(&mut conn, "pgpp_t_vault_int").await;
@@ -651,8 +652,11 @@ async fn interruption_during_the_vault_write_asks_to_rotate_again() {
     );
     assert!(stderr.contains("2 delivery error(s)"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+    // the abandoned request may have reached Vault
     assert!(
-        stdout.contains("nothing delivered: rotate again"),
+        stdout.contains(
+            "the secret may or may not have been written: check Vault before rotating again"
+        ),
         "{stdout}"
     );
     assert!(!marker.exists(), "the --exec command must not run");

@@ -284,19 +284,24 @@ async fn deliver(
     let mut delivered: Vec<&str> = Vec::new();
     let mut failed: Vec<&str> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    // failed Vault write that may have reached Vault all the same
+    let mut vault_unknown = false;
 
     if let Some((cfg, target)) = &opts.vault {
         match vault_delivery(cfg, target, &rot.role, &password, interrupt).await {
             Ok(()) => delivered.push("vault"),
             Err(f) => {
                 failed.push("vault");
-                failures.push(f);
+                vault_unknown = f.unknown;
+                failures.push(f.message);
             }
         }
     }
 
     if let Some(cmd) = &opts.exec {
-        if interrupt.received() {
+        // a Ctrl-C delivered since the Vault write ended (no wait was in
+        // progress) is taken here, before the command is started
+        if interrupt.poll_received().await {
             failed.push("exec");
             failures.push(format!(
                 "--exec delivery not attempted: interrupted (Ctrl-C); command: {cmd}"
@@ -332,29 +337,54 @@ async fn deliver(
     for f in &failures {
         crate::report_text(crate::Report::Error, f);
     }
-    let printed = print_rotation(rot, &password, &delivered, &failed, opts.show, fmt);
+    let outcome = Outcome {
+        delivered: &delivered,
+        failed: &failed,
+        vault_unknown,
+    };
+    let printed = print_rotation(rot, &password, &outcome, opts.show, fmt);
     drop(password);
-    delivery_outcome(&delivered, &failed, opts.show, printed)
+    delivery_outcome(&outcome, opts.show, printed)
+}
+
+/// Deliveries of a rotation: those that succeeded, those that failed, and
+/// whether a failed Vault write may have been received by Vault all the
+/// same (`vault_unknown`: no answer, connection lost while waiting for it,
+/// Ctrl-C during the request).
+#[derive(Clone, Copy)]
+struct Outcome<'a> {
+    delivered: &'a [&'a str],
+    failed: &'a [&'a str],
+    vault_unknown: bool,
 }
 
 /// What to do after a failed delivery (`failed` not empty), for a
 /// password that is not shown.  Once in Vault, the password is not lost:
 /// rotating again would only replace a delivered secret (and run the
 /// failed `--exec` again with another password); the failed delivery is to
-/// be completed from Vault.  Otherwise the password is lost (or only held
-/// by the `--exec` command): rotate again.
-fn retry_advice(delivered: &[&str], failed: &[&str]) -> String {
-    let what = if delivered.is_empty() {
-        "nothing delivered".to_string()
-    } else {
-        format!(
-            "delivered to {}, {} failed",
-            delivered.join(", "),
-            failed.join(", ")
-        )
-    };
-    if delivered.contains(&"vault") {
+/// be completed from Vault.  When the Vault write failed after the request
+/// was sent (`vault_unknown`), the password may be in Vault: check it before
+/// rotating again.  Otherwise the password is lost (or only held by the
+/// `--exec` command): rotate again.
+fn retry_advice(o: &Outcome) -> String {
+    let unknown = "the secret may or may not have been written: check Vault before rotating \
+                   again";
+    if o.delivered.is_empty() {
+        return if o.vault_unknown {
+            unknown.to_string()
+        } else {
+            "nothing delivered: rotate again".to_string()
+        };
+    }
+    let what = format!(
+        "delivered to {}, {} failed",
+        o.delivered.join(", "),
+        o.failed.join(", ")
+    );
+    if o.delivered.contains(&"vault") {
         format!("{what}: the password is in Vault, do not rotate again")
+    } else if o.vault_unknown {
+        format!("{what}: {unknown}")
     } else {
         format!("{what}: rotate again")
     }
@@ -363,22 +393,33 @@ fn retry_advice(delivered: &[&str], failed: &[&str]) -> String {
 /// Advice printed with the outcome of a rotation ([`retry_advice`]): none
 /// when nothing failed, nor when the password is printed (`--show`) without
 /// being in Vault (the printed password is then the one to deliver by hand).
-fn advice(delivered: &[&str], failed: &[&str], show: bool) -> Option<String> {
-    (!failed.is_empty() && (!show || delivered.contains(&"vault")))
-        .then(|| retry_advice(delivered, failed))
+fn advice(o: &Outcome, show: bool) -> Option<String> {
+    (!o.failed.is_empty() && (!show || o.delivered.contains(&"vault"))).then(|| retry_advice(o))
 }
 
-/// Writes the secret to Vault, the message of the failure otherwise.  A
-/// Ctrl-C received before the request is polled for the first time means
-/// the request was never sent (« not attempted »); one received while it
-/// runs abandons it, and the secret may or may not have been written.
+/// Failed Vault delivery: message, and whether the secret may have been
+/// written all the same.
+#[derive(Debug, PartialEq)]
+struct VaultFailure {
+    message: String,
+    unknown: bool,
+}
+
+/// Writes the secret to Vault, the failure otherwise.  A Ctrl-C received
+/// before the request is polled for the first time means the request was
+/// never sent (« not attempted »); one received while it runs abandons it,
+/// and the secret may or may not have been written, as after an error
+/// raised once the request was sent (no answer within the timeout,
+/// connection lost while waiting for it: [`vault::may_have_been_received`]).
+/// An error before the request was sent (DNS, connection refused) or an
+/// answer of Vault (HTTP status) means nothing was written.
 async fn vault_delivery(
     cfg: &VaultConfig,
     target: &VaultTarget,
     role: &str,
     password: &Secret,
     interrupt: &mut Interrupt,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), VaultFailure> {
     let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut payload = build_payload(role, password, &rotated_at);
     let started = std::cell::Cell::new(false);
@@ -398,17 +439,25 @@ async fn vault_delivery(
     if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
         s.zeroize();
     }
+    let unknown = "the secret may or may not have been written";
     match result {
         Some(Ok(())) => Ok(()),
-        Some(Err(e)) => Err(format!("Vault delivery failed: {e:#}")),
-        None if !started.get() => {
-            Err("Vault delivery not attempted: interrupted (Ctrl-C)".to_string())
-        }
-        None => Err(
-            "Vault delivery failed: interrupted (Ctrl-C); the secret may or may not have \
-             been written"
-                .to_string(),
-        ),
+        Some(Err(e)) if vault::may_have_been_received(&e) => Err(VaultFailure {
+            message: format!("Vault delivery failed: {e:#}; {unknown}"),
+            unknown: true,
+        }),
+        Some(Err(e)) => Err(VaultFailure {
+            message: format!("Vault delivery failed: {e:#}"),
+            unknown: false,
+        }),
+        None if !started.get() => Err(VaultFailure {
+            message: "Vault delivery not attempted: interrupted (Ctrl-C)".to_string(),
+            unknown: false,
+        }),
+        None => Err(VaultFailure {
+            message: format!("Vault delivery failed: interrupted (Ctrl-C); {unknown}"),
+            unknown: true,
+        }),
     }
 }
 
@@ -423,15 +472,13 @@ async fn vault_delivery(
 /// failed delivery is added to the error (a full disk must not go unseen).
 /// After successful deliveries, such a failure says that the password was
 /// rotated and where it was delivered.
-fn delivery_outcome(
-    delivered: &[&str],
-    failed: &[&str],
-    show: bool,
-    printed: Result<()>,
-) -> Result<()> {
+fn delivery_outcome(o: &Outcome, show: bool, printed: Result<()>) -> Result<()> {
+    let Outcome {
+        delivered, failed, ..
+    } = *o;
     let failures = failed.len();
     if failures > 0 {
-        let advice = retry_advice(delivered, failed);
+        let advice = retry_advice(o);
         match printed {
             Err(e) if show => {
                 let cause = if is_broken_pipe(&e) {
@@ -480,18 +527,20 @@ fn delivery_outcome(
 fn print_rotation(
     rot: &Rotation,
     password: &Secret,
-    delivered: &[&str],
-    failed: &[&str],
+    o: &Outcome,
     show: bool,
     fmt: Format,
 ) -> Result<()> {
+    let Outcome {
+        delivered, failed, ..
+    } = *o;
     match fmt {
         Format::Json => {
             let out = RotationOutput {
                 rotation: rot,
                 delivered_to: delivered,
                 failed,
-                advice: advice(delivered, failed, show),
+                advice: advice(o, show),
                 password: show.then_some(password.as_str()),
             };
             // exact-size, wiped buffer, newline included (no reallocation
@@ -527,10 +576,7 @@ fn print_rotation(
             } else if failed.is_empty() {
                 write_line("password: (not shown; use --show to print it)")
             } else {
-                write_line(format_args!(
-                    "password: (not shown; {})",
-                    retry_advice(delivered, failed)
-                ))
+                write_line(format_args!("password: (not shown; {})", retry_advice(o)))
             }
         }
     }
@@ -1209,6 +1255,15 @@ pub async fn worker_status(conn: &mut PgConnection, fmt: Format) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Deliveries without a Vault write of unknown outcome.
+    fn o<'a>(delivered: &'a [&'a str], failed: &'a [&'a str]) -> Outcome<'a> {
+        Outcome {
+            delivered,
+            failed,
+            vault_unknown: false,
+        }
+    }
+
     #[test]
     fn reads_only_the_first_line() {
         let mut input: &[u8] = b"first\r\nsecond\n";
@@ -1428,7 +1483,78 @@ mod tests {
         let err = vault_delivery(&cfg, &target, "app", &password, &mut interrupt)
             .await
             .unwrap_err();
-        assert_eq!(err, "Vault delivery not attempted: interrupted (Ctrl-C)");
+        assert_eq!(
+            err,
+            VaultFailure {
+                message: "Vault delivery not attempted: interrupted (Ctrl-C)".to_string(),
+                unknown: false,
+            }
+        );
+    }
+
+    /// A Vault write that fails before the request is sent (connection
+    /// refused) wrote nothing; one that fails after (no answer within the
+    /// timeout: the server got the request) may have written the secret,
+    /// and the advice asks to check Vault rather than to rotate again.
+    #[tokio::test]
+    async fn a_vault_failure_after_the_request_was_sent_asks_to_check_vault() {
+        let target = VaultTarget::parse("secret/db/app", None).unwrap();
+        let password = Zeroizing::new("pw".to_string());
+        let mut interrupt = Interrupt::never();
+        let refused = VaultConfig::new("http://127.0.0.1:9", "t", None).unwrap();
+        let err = vault_delivery(&refused, &target, "app", &password, &mut interrupt)
+            .await
+            .unwrap_err();
+        assert!(!err.unknown, "{err:?}");
+        assert!(
+            err.message.starts_with("Vault delivery failed: "),
+            "{err:?}"
+        );
+        assert!(!err.message.contains("may or may not"), "{err:?}");
+
+        let server = httpmock::MockServer::start_async().await;
+        let slow = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/secret/data/db/app");
+                then.status(200)
+                    .delay(Duration::from_secs(3))
+                    .json_body(json!({"data": {"version": 1}}));
+            })
+            .await;
+        let cfg = VaultConfig::new(server.base_url(), "t", None)
+            .unwrap()
+            .with_timeout(Duration::from_millis(300));
+        let err = vault_delivery(&cfg, &target, "app", &password, &mut interrupt)
+            .await
+            .unwrap_err();
+        assert_eq!(slow.hits_async().await, 1);
+        assert!(err.unknown, "{err:?}");
+        assert!(
+            err.message
+                .ends_with("; the secret may or may not have been written"),
+            "{err:?}"
+        );
+        let uncertain = |delivered| Outcome {
+            delivered,
+            failed: &["vault"],
+            vault_unknown: true,
+        };
+        let check =
+            "the secret may or may not have been written: check Vault before rotating again";
+        assert_eq!(retry_advice(&uncertain(&[])), check);
+        assert_eq!(
+            retry_advice(&uncertain(&["exec"])),
+            format!("delivered to exec, vault failed: {check}")
+        );
+        let m = format!(
+            "{:#}",
+            delivery_outcome(&uncertain(&[]), false, Ok(())).unwrap_err()
+        );
+        assert_eq!(
+            m,
+            format!("password rotated but 1 delivery error(s) occurred; {check}")
+        );
     }
 
     #[test]
@@ -1460,28 +1586,28 @@ mod tests {
         };
         let none: &[&str] = &[];
         // --show, a delivery failed and the password could not be printed
-        let m = msg(delivery_outcome(none, &["exec"], true, closed()));
+        let m = msg(delivery_outcome(&o(none, &["exec"]), true, closed()));
         assert!(m.contains("1 delivery error(s)"), "{m}");
         assert!(
             m.contains("password could not be printed (the standard output was closed)"),
             "{m}"
         );
         assert!(m.ends_with("nothing delivered: rotate again"), "{m}");
-        let m = msg(delivery_outcome(&["vault"], &["exec"], true, other()));
+        let m = msg(delivery_outcome(&o(&["vault"], &["exec"]), true, other()));
         assert!(m.contains("could not be printed (disk full)"), "{m}");
         assert!(m.ends_with("do not rotate again"), "{m}");
         // printed with --show: the delivery error alone
-        let m = msg(delivery_outcome(&["exec"], &["vault"], true, Ok(())));
+        let m = msg(delivery_outcome(&o(&["exec"], &["vault"]), true, Ok(())));
         assert_eq!(m, "password rotated but 1 delivery error(s) occurred");
-        let m = msg(delivery_outcome(none, &["vault", "exec"], true, Ok(())));
+        let m = msg(delivery_outcome(&o(none, &["vault", "exec"]), true, Ok(())));
         assert_eq!(m, "password rotated but 2 delivery error(s) occurred");
         // not shown: the advice says whether to rotate again
-        let m = msg(delivery_outcome(none, &["exec"], false, closed()));
+        let m = msg(delivery_outcome(&o(none, &["exec"]), false, closed()));
         assert_eq!(
             m,
             "password rotated but 1 delivery error(s) occurred; nothing delivered: rotate again"
         );
-        let m = msg(delivery_outcome(&["exec"], &["vault"], false, Ok(())));
+        let m = msg(delivery_outcome(&o(&["exec"], &["vault"]), false, Ok(())));
         assert_eq!(
             m,
             "password rotated but 1 delivery error(s) occurred; delivered to exec, vault \
@@ -1489,7 +1615,7 @@ mod tests {
         );
         // in Vault, the password is not lost: shown or not, no new rotation
         for show in [false, true] {
-            let m = msg(delivery_outcome(&["vault"], &["exec"], show, Ok(())));
+            let m = msg(delivery_outcome(&o(&["vault"], &["exec"]), show, Ok(())));
             assert_eq!(
                 m,
                 "password rotated but 1 delivery error(s) occurred; delivered to vault, exec \
@@ -1497,20 +1623,20 @@ mod tests {
             );
         }
         // not shown: another print failure is kept in the message
-        let m = msg(delivery_outcome(none, &["exec"], false, other()));
+        let m = msg(delivery_outcome(&o(none, &["exec"]), false, other()));
         assert_eq!(
             m,
             "password rotated but 1 delivery error(s) occurred (and the outcome could not \
              be printed: disk full); nothing delivered: rotate again"
         );
         // no delivery error
-        assert!(delivery_outcome(&["exec"], none, true, Ok(())).is_ok());
-        let m = msg(delivery_outcome(none, none, true, closed()));
+        assert!(delivery_outcome(&o(&["exec"], none), true, Ok(())).is_ok());
+        let m = msg(delivery_outcome(&o(none, none), true, closed()));
         assert!(m.contains("could not be printed"), "{m}");
         // delivered elsewhere: a closed stdout stays a quiet broken pipe
-        let e = delivery_outcome(&["exec"], none, true, closed()).unwrap_err();
+        let e = delivery_outcome(&o(&["exec"], none), true, closed()).unwrap_err();
         assert!(is_broken_pipe(&e));
-        let e = delivery_outcome(&["vault"], none, false, closed()).unwrap_err();
+        let e = delivery_outcome(&o(&["vault"], none), false, closed()).unwrap_err();
         assert!(is_broken_pipe(&e));
     }
 
@@ -1522,7 +1648,7 @@ mod tests {
         let none: &[&str] = &[];
         let other = || Err(anyhow::anyhow!("disk full"));
         for show in [false, true] {
-            let e = delivery_outcome(&["vault"], none, show, other()).unwrap_err();
+            let e = delivery_outcome(&o(&["vault"], none), show, other()).unwrap_err();
             assert!(!is_broken_pipe(&e));
             assert_eq!(
                 crate::format_error(&e),
@@ -1530,7 +1656,7 @@ mod tests {
                  disk full"
             );
         }
-        let e = delivery_outcome(&["vault", "exec"], none, false, other()).unwrap_err();
+        let e = delivery_outcome(&o(&["vault", "exec"], none), false, other()).unwrap_err();
         assert_eq!(
             crate::format_error(&e),
             "password rotated and delivered to vault, exec; the result could not be printed: \
@@ -1569,7 +1695,7 @@ mod tests {
                 rotation: &rot,
                 delivered_to: delivered,
                 failed,
-                advice: advice(delivered, failed, show),
+                advice: advice(&o(delivered, failed), show),
                 password: show.then_some("pw"),
             };
             serde_json::to_value(&out).unwrap()
@@ -1581,7 +1707,7 @@ mod tests {
         let v = json_of(&["vault"], &["exec"], false);
         assert_eq!(v["delivered_to"], json!(["vault"]));
         assert_eq!(v["failed"], json!(["exec"]));
-        assert_eq!(v["advice"], retry_advice(&["vault"], &["exec"]));
+        assert_eq!(v["advice"], retry_advice(&o(&["vault"], &["exec"])));
         assert_eq!(
             v["advice"],
             "delivered to vault, exec failed: the password is in Vault, do not rotate again"
@@ -1591,7 +1717,7 @@ mod tests {
         assert_eq!(v["advice"], "nothing delivered: rotate again");
         // with --show: the advice only when the password is in Vault
         let v = json_of(&["vault"], &["exec"], true);
-        assert_eq!(v["advice"], retry_advice(&["vault"], &["exec"]));
+        assert_eq!(v["advice"], retry_advice(&o(&["vault"], &["exec"])));
         let v = json_of(&["exec"], &["vault"], true);
         assert_eq!(v["failed"], json!(["vault"]));
         assert!(v["advice"].is_null(), "{v}");

@@ -177,8 +177,41 @@ impl Interrupt {
         }
     }
 
-    /// True once a Ctrl-C was received.
+    /// An `Interrupt` that never receives anything (tests).
+    #[cfg(test)]
+    pub(crate) fn never() -> Self {
+        Interrupt {
+            signal: None,
+            received: false,
+        }
+    }
+
+    /// An `Interrupt` listening to another signal (tests: `SIGUSR1`, which
+    /// nothing else in the test process uses, rather than `SIGINT`).
+    #[cfg(test)]
+    fn on(kind: tokio::signal::unix::SignalKind) -> Self {
+        Interrupt {
+            signal: Some(tokio::signal::unix::signal(kind).unwrap()),
+            received: false,
+        }
+    }
+
+    /// True once a Ctrl-C was received (as seen by a [`Interrupt::wait`]
+    /// that ended).
     pub fn received(&self) -> bool {
+        self.received
+    }
+
+    /// Same as [`Interrupt::received`], after taking without waiting a
+    /// Ctrl-C delivered to the process but not yet seen by a wait (between
+    /// two steps, when no wait is in progress).  The runtime first gets one
+    /// turn (`yield_now`) so that a signal already delivered reaches the
+    /// listener; the wait is then polled once (zero delay).
+    pub async fn poll_received(&mut self) -> bool {
+        if !self.received {
+            tokio::task::yield_now().await;
+            let _ = tokio::time::timeout(Duration::ZERO, self.wait()).await;
+        }
         self.received
     }
 
@@ -269,6 +302,35 @@ async fn run_exec_with(
     timeout: Option<Duration>,
     interrupt: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    let deadline = async {
+        match timeout {
+            Some(t) => tokio::time::sleep(t).await,
+            None => std::future::pending().await,
+        }
+    };
+    run_exec_until(
+        cmd,
+        password,
+        env,
+        write_timeout,
+        timeout,
+        deadline,
+        interrupt,
+    )
+    .await
+}
+
+/// [`run_exec_with`] with the `--exec-timeout` given as a future
+/// (`deadline`); `timeout` is only used in the message.
+async fn run_exec_until(
+    cmd: &str,
+    password: &Secret,
+    env: Env<'_>,
+    write_timeout: Duration,
+    timeout: Option<Duration>,
+    deadline: impl std::future::Future<Output = ()>,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let (tx, rx) = pipe::pipe().context("cannot create the pipe for --exec")?;
     // The child gets a blocking descriptor; pgpp keeps another one on the
     // same pipe to check afterwards that the password was consumed.
@@ -301,12 +363,6 @@ async fn run_exec_with(
     drop(command);
     let mut child = spawned.with_context(|| format!("cannot run --exec command: {cmd}"))?;
 
-    let deadline = async {
-        match timeout {
-            Some(t) => tokio::time::sleep(t).await,
-            None => std::future::pending().await,
-        }
-    };
     tokio::pin!(deadline);
     tokio::pin!(interrupt);
 
@@ -345,6 +401,16 @@ async fn run_exec_with(
         match wait_or_stop(child.wait(), &mut interrupt, &mut deadline).await {
             Ok(status) => exited = Some(status),
             Err(s) => stop = Some(s),
+        }
+    }
+    // The delay expired while the command was exiting: if it has already
+    // exited (reaped right now, without waiting) after the line was
+    // entirely written, it finished in time and is checked as usual (exit
+    // status, unread bytes) rather than reported as killed.
+    if stop == Some(Stop::TimedOut) && matches!(written, Written::Complete) {
+        if let Ok(Some(status)) = child.try_wait() {
+            exited = Some(Ok(status));
+            stop = None;
         }
     }
     // the command was killed by pgpp, rather than exited by itself
@@ -535,6 +601,25 @@ mod tests {
 
     fn secret(s: &str) -> Secret {
         Zeroizing::new(s.to_string())
+    }
+
+    /// A signal delivered while no wait is in progress is seen by
+    /// `poll_received` (not by `received`), without blocking otherwise.
+    #[tokio::test]
+    async fn a_signal_between_two_steps_is_seen_without_waiting() {
+        let mut interrupt = Interrupt::on(tokio::signal::unix::SignalKind::user_defined1());
+        let started = std::time::Instant::now();
+        assert!(!interrupt.poll_received().await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // SAFETY: plain system call; SIGUSR1 is caught by the listener above.
+        unsafe {
+            libc::raise(libc::SIGUSR1);
+        }
+        assert!(!interrupt.received());
+        assert!(interrupt.poll_received().await);
+        assert!(interrupt.received());
+        assert!(Interrupt::already_received().poll_received().await);
+        assert!(!Interrupt::never().poll_received().await);
     }
 
     /// `run_exec` without the Ctrl-C handler (which would stay installed in
@@ -853,6 +938,66 @@ mod tests {
     /// A command that closed its stdin but keeps running (the line is
     /// written, the pipe stays open on the side of pgpp) is bounded by
     /// `--exec-timeout`: its whole group is killed and the delivery fails.
+    /// `--exec-timeout` expiring while the command exits: the deadline
+    /// blocks the runtime until the command (which read the whole line) has
+    /// exited, then fires before the exit is seen by the wait; the command is reaped right after the delay and
+    /// the delivery succeeds instead of « killed ».  A command still running
+    /// at the deadline, or one that exited without reading the line, still
+    /// fails.
+    #[tokio::test]
+    async fn a_command_that_exits_just_before_the_deadline_succeeds() {
+        let env = || Env {
+            role: "app",
+            valid_until: None,
+            extra: &[],
+        };
+        // expires after 0.1 s (the line is written by then), but blocks the
+        // (single-threaded) runtime for 0.8 s before firing
+        let late_deadline = || async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::thread::sleep(Duration::from_millis(800));
+        };
+        let pw = secret("pw-Test-123");
+        run_exec_until(
+            "read l; sleep 0.2; exit 0",
+            &pw,
+            env(),
+            EXEC_WRITE_TIMEOUT,
+            Some(Duration::from_millis(800)),
+            late_deadline(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        let err = run_exec_until(
+            "sleep 0.2; exit 0",
+            &pw,
+            env(),
+            EXEC_WRITE_TIMEOUT,
+            Some(Duration::from_millis(800)),
+            late_deadline(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("without reading"), "{err:#}");
+        let err = run_exec_until(
+            "read l; sleep 100000",
+            &pw,
+            env(),
+            EXEC_WRITE_TIMEOUT,
+            Some(Duration::from_millis(800)),
+            late_deadline(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("within 0.8 s (--exec-timeout"),
+            "{err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn the_run_time_is_bounded_by_the_exec_timeout() {
         let pidfile = temp_path("timeout-pid");

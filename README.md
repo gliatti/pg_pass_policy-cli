@@ -120,7 +120,7 @@ l'audit ni dans les journaux. La sortie indique le rôle, le nouveau
 (booléen) indique si cette valeur a pu être relue : `false` signifie
 « inconnue », pas « illimitée ». `failed` liste les remises échouées (`[]`
 si tout a réussi) et `advice` reprend le conseil décrit plus bas (« rotate
-again », « do not rotate again ») : `null` si aucune remise n'a échoué, ou
+again », « do not rotate again », « check Vault before rotating again ») : `null` si aucune remise n'a échoué, ou
 si le mot de passe est imprimé (`--show`) sans être dans Vault.
 
 ```json
@@ -162,6 +162,15 @@ Politique d'affichage :
   - « delivered to exec, vault failed: rotate again » : seul le hook a reçu
     le mot de passe, Vault ne l'a pas, relancer la rotation une fois Vault
     corrigé ;
+  - « the secret may or may not have been written: check Vault before
+    rotating again » (précédé de « delivered to exec, vault failed: » si le
+    hook a abouti) : l'écriture Vault a échoué après l'envoi de la requête
+    (pas de réponse dans le délai de 30 s, connexion coupée en attendant ou
+    en lisant la réponse, Ctrl-C pendant la requête). Vault a pu enregistrer
+    le secret : le consulter avant de relancer la rotation. Une erreur
+    survenue avant l'envoi (nom introuvable, connexion refusée, échec TLS)
+    ou une réponse d'erreur de Vault (code HTTP) n'a rien écrit et donne
+    « rotate again » ;
 
   en JSON, `delivered_to` donne les remises réussies (`["vault"]` dans le
   deuxième cas), `failed` les remises échouées (`["exec"]`) et `advice` le
@@ -173,9 +182,12 @@ Politique d'affichage :
   la remise en cours est abandonnée, celles qui restent ne sont pas tentées
   (message « not attempted » ; une écriture Vault abandonnée en cours de
   route a pu, ou non, aboutir) et `pgpp` termine comme pour une remise
-  échouée (code 1, message « rotate again », ou « do not rotate again » si
-  l'écriture Vault avait abouti, mot de passe affiché seulement
-  avec `--show`) ;
+  échouée (code 1, message « rotate again », « do not rotate again » si
+  l'écriture Vault avait abouti, « check Vault before rotating again » si
+  elle a été abandonnée en cours de route, mot de passe affiché seulement
+  avec `--show`). Un Ctrl-C reçu entre la fin de l'écriture Vault et le
+  lancement du hook est lui aussi pris en compte : le hook n'est pas
+  lancé ;
 - avec `--show`, l'affichage compte comme une remise : s'il échoue (sortie
   standard fermée, par exemple) alors qu'il était la seule remise ou qu'une
   autre remise a échoué, le message le dit (« password could not be
@@ -308,6 +320,18 @@ code 2 sans se connecter (la lecture s'arrête à la limite, le tampon est
 effacé). Il n'est jamais passé en argument de ligne de commande. Un Ctrl-C à
 l'invite rétablit l'écho du terminal avant d'interrompre `pgpp`.
 
+Limite connue de l'invite : sur un terminal, `pgpp` rouvre l'entrée standard
+par `/dev/stdin` (et non `/dev/tty`, absent sans terminal de contrôle), sans
+l'option `O_NOCTTY` que rpassword ne permet pas de passer. Si `pgpp` est
+leader de session sans terminal de contrôle et que son entrée standard est
+une tty (par exemple `setsid pgpp check app_user < /dev/pts/3`), cette tty
+devient le terminal de contrôle de sa session à l'ouverture. La lecture du
+mot de passe n'en est pas affectée, mais la session reçoit dès lors les
+signaux de ce terminal (`SIGHUP` à sa fermeture, Ctrl-C tapé dessus). Pour
+l'éviter, passer le mot de passe par un tube
+(`printf '%s\n' "$CANDIDATE" | setsid pgpp check app_user`) plutôt que de
+rediriger une tty.
+
 Journal du serveur : un paramètre lié n'apparaît pas dans le texte de la
 requête, mais PostgreSQL l'écrit dans la ligne `DETAIL:  parameters: …` dès
 que `log_statement = 'all'` ou `log_min_duration_statement >= 0` est actif,
@@ -400,7 +424,11 @@ les cas suivants :
 - le hook dure plus que `--exec-timeout` (300 s par défaut ; durée comme
   `90s`, `5m`, `1h`, ou nombre de secondes ; `0` ou `0s` supprime la limite). C'est
   le cas d'un hook qui a fermé son entrée sans se terminer
-  (`exec 0<&-; sleep 100000`) ou qui est suspendu (voir ci-dessous) ;
+  (`exec 0<&-; sleep 100000`) ou qui est suspendu (voir ci-dessous). Un
+  hook qui a lu toute la ligne et se termine à l'instant où le délai
+  expire n'est pas compté comme tué : s'il est déjà terminé quand `pgpp`
+  constate le dépassement, sa remise est vérifiée comme d'habitude (code de
+  retour, ligne lue) ;
 - `pgpp` reçoit un Ctrl-C (`SIGINT`) pendant que le hook tourne : le
   terminal n'envoie ce signal qu'au groupe de `pgpp`, qui le relaie en tuant
   celui du hook, puis termine avec le code 1 (rotation faite, remise

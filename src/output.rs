@@ -118,7 +118,9 @@ impl ResultSet {
             let mut out = Vec::with_capacity(rs.columns.len());
             for (i, col) in row.columns().iter().enumerate() {
                 let v = match col.type_info().name() {
-                    "TEXT" | "VARCHAR" | "NAME" | "BPCHAR" => {
+                    // sqlx names bpchar (char(n)) "CHAR"; the one-byte
+                    // internal type "char" is "\"CHAR\"" and stays unsupported.
+                    "TEXT" | "VARCHAR" | "NAME" | "CHAR" => {
                         row.try_get::<Option<String>, _>(i)?.map(Value::from)
                     }
                     "INT2" => row.try_get::<Option<i16>, _>(i)?.map(Value::from),
@@ -315,6 +317,37 @@ mod tests {
         write_stderr_to(&mut buf, "line", true).unwrap();
         write_stderr_to(&mut buf, "prompt: ", false).unwrap();
         assert_eq!(buf, b"line\nprompt: ");
+    }
+
+    /// Column types as named by sqlx for values sent by a real server
+    /// (PGPP_TEST_URL): char(n) is "CHAR", not "BPCHAR".
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn from_rows_decodes_the_types_sent_by_the_server() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        let rows = sqlx::query(
+            "SELECT 'ab'::char(3) AS c, 'v'::varchar AS v, 't'::text AS t, \
+             'n'::name AS n, NULL::char(2) AS z",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let rs = ResultSet::from_rows(&rows).unwrap();
+        assert_eq!(
+            rs.to_json(),
+            json!([{"c": "ab ", "v": "v", "t": "t", "n": "n", "z": null}])
+        );
+        let rows = sqlx::query("SELECT 'x'::\"char\" AS c")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        let err = ResultSet::from_rows(&rows).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported column type"),
+            "{err:#}"
+        );
     }
 
     #[test]
