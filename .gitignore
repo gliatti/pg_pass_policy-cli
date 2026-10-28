@@ -1,1 +1,6 @@
+# rust
 target/
+# divers
+*.swp
+.env
+.claude/

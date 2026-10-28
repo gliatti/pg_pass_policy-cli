@@ -1,5 +1,44 @@
 # pgpp — client en ligne de commande de pg_pass_policy
 
+Ce dépôt contient le client en ligne de commande de l'extension PostgreSQL
+[`pg_pass_policy`](https://github.com/gliatti/pg_pass_policy), qui se trouve
+dans un dépôt séparé. Version minimale de l'extension : **1.0**. Le contrat
+technique de l'extension (API SQL, codes d'erreur) est décrit dans
+[`docs/SPEC.md`](https://github.com/gliatti/pg_pass_policy/blob/main/docs/SPEC.md).
+Les tests d'intégration ont besoin d'une copie du dépôt de l'extension,
+désignée par la variable `PG_PASS_POLICY_SRC` (voir [Tests](#tests)).
+
+> [!CAUTION]
+> **À la charge de l'exploitation.** `rotate_password()` et `switch_rotation_pair()`
+> renvoient le nouveau mot de passe en clair à l'appelant, une seule fois. Le
+> serveur ne le stocke ni ne le journalise, mais sa protection en dehors du
+> serveur dépend de votre configuration :
+>
+> - **Transport** : sans TLS, le mot de passe circule en clair sur le réseau.
+>   Imposez `hostssl` dans `pg_hba.conf` pour les comptes d'administration, et
+>   `sslmode=verify-full` côté client.
+> - **Client** : le résultat peut être conservé par l'outil qui l'affiche
+>   (défilement du terminal, grilles de résultats de pgAdmin ou DBeaver, logs
+>   applicatifs qui écrivent les lignes renvoyées). Préférez
+>   `pgpp rotate --vault-kv` ou `--exec`, qui ne passent ni par l'écran ni par une
+>   variable d'environnement.
+> - **Rôle `pass_policy_admin`** : un membre peut obtenir le mot de passe de tout
+>   rôle non privilégié. Accordez-le avec parcimonie.
+> - **Superutilisateur** : ajoutez `pg_pass_policy.exempt_roles = 'postgres'`
+>   (ou votre compte d'administration) pour ne pas vous verrouiller dehors :
+>   pendant la fenêtre de démarrage, tout rôle non exempté est refusé
+>   (`57P03`), quelle que soit la méthode (`trust` et `peer` compris). Seule
+>   exception, la voie de secours, désactivée par défaut : un
+>   superutilisateur listé dans `pg_pass_policy.rescue_roles` et authentifié
+>   en `peer` passe (sauf verrou déjà en mémoire partagée, mais **même s'il
+>   est verrouillé dans `role_state`** : ce verrou n'est pas encore connu) ;
+>   n'y listez qu'un compte d'administration lié à un compte système, avec
+>   une ligne `local … peer` dans `pg_hba.conf`. `trust` n'y donne pas accès
+>   et la liste est vide par défaut : le refus `57P03` porte un HINT qui
+>   rappelle cette voie (« … through peer authentication as a superuser
+>   listed in pg_pass_policy.rescue_roles », même texte pour tout client).
+>   Un rôle exempté ne peut être ni expiré ni verrouillé par l'extension.
+
 `pgpp` pilote l'extension PostgreSQL `pg_pass_policy` (schéma SQL
 `pass_policy`) depuis le terminal : état des mots de passe, rotation,
 verrouillage, profils de politique, audit, vérification d'un mot de passe
@@ -14,9 +53,9 @@ Rust (édition 2021, toolchain ≥ 1.80) est nécessaire. Avec rustup :
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-cargo install --path cli            # depuis la racine du dépôt
+cargo install --path .              # depuis la racine du dépôt
 # ou, sans installer :
-cargo build --release --manifest-path cli/Cargo.toml   # binaire dans cli/target/release/pgpp
+cargo build --release              # binaire dans target/release/pgpp
 ```
 
 Le binaire est autonome (TLS fourni par rustls : aucune dépendance à
@@ -124,8 +163,9 @@ consulte `pg_extension`, sans analyser le texte du message (traduit selon
 serveur. Si elle l'est, l'erreur est affichée telle quelle, sans indice :
 une construction de développement antérieure à la publication porte elle
 aussi le numéro `1.0` et ne se distingue pas de la version publiée (face à
-une telle construction, réinstaller l'extension livrée avec ce dépôt, voir
-le README de l'extension à la racine du dépôt). Le message `this pgpp
+une telle construction, réinstaller l'extension depuis son dépôt
+[`pg_pass_policy`](https://github.com/gliatti/pg_pass_policy), voir son README).
+Le message `this pgpp
 requires a newer pg_pass_policy (reinstall the extension)` est réservé à
 une prochaine version de l'extension dont `pgpp` dépendrait : il ne
 s'affiche que face à une version strictement inférieure à la version
@@ -141,8 +181,9 @@ cause.
 `worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
 les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
 fermée). Tant qu'il est faux, les connexions par mot de passe ou secret des
-rôles non exemptés sont refusées (SQLSTATE `57P03`, voir le README de
-l'extension). Avec une version de l'extension qui ne renvoie pas encore
+rôles non exemptés sont refusées (SQLSTATE `57P03`, voir le
+[README de l'extension](https://github.com/gliatti/pg_pass_policy#readme)).
+Avec une version de l'extension qui ne renvoie pas encore
 cette colonne, la valeur est vide (`null` en JSON).
 
 ### Rotation d'un mot de passe
@@ -767,13 +808,32 @@ secours) ou relancer la rotation après correction du jeton.
 ## Tests
 
 ```bash
-cd cli
 cargo test                        # tests unitaires + mock Vault + tests sans base ; les tests base sont marqués ignored
+```
+
+Les tests d'intégration ont besoin d'une instance PostgreSQL de test où
+l'extension est installée et chargée par `shared_preload_libraries` (voir le
+[README de l'extension](https://github.com/gliatti/pg_pass_policy#readme),
+version 1.0 ou ultérieure). L'extension se compile depuis une copie de son
+dépôt, désignée par la variable `PG_PASS_POLICY_SRC` :
+
+```bash
+git clone https://github.com/gliatti/pg_pass_policy /chemin/vers/pg_pass_policy
+export PG_PASS_POLICY_SRC=/chemin/vers/pg_pass_policy
+make -C "$PG_PASS_POLICY_SRC" install   # PG_CONFIG=/chemin/vers/pg_config si besoin
+```
+
+Puis, contre cette instance :
+
+```bash
 export PGPP_TEST_URL=postgres://pgpp_admin@127.0.0.1:5432/postgres   # membre de pass_policy_admin + CREATEROLE
 export PGPASSFILE=/chemin/vers/pgpass
 cargo test -- --include-ignored   # ajoute les tests d'intégration contre la base
 cargo test --test integration -- --ignored   # seulement ceux-là
 ```
+
+`PG_PASS_POLICY_SRC` ne sert qu'à installer l'extension : `pgpp` et ses
+tests ne lisent que la base désignée par `PGPP_TEST_URL`.
 
 Les tests base sont annotés `#[ignore]` et, une fois lancés avec
 `--ignored` / `--include-ignored`, échouent si `PGPP_TEST_URL` est absente

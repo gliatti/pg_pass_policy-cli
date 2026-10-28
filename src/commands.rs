@@ -206,7 +206,8 @@ pub async fn expiring(
 /// yet in a warning state are not among its rows: the outer query reads
 /// `v_role_status`, so that each role is one row, and `v_expiring` is
 /// evaluated once more as a subquery (two evaluations of the view, not a
-/// single scan; accepted review finding, docs/SPEC.md §12: the extension
+/// single scan; accepted review finding,
+/// https://github.com/gliatti/pg_pass_policy/blob/main/docs/SPEC.md §12: the extension
 /// does not expose the filter, and copying it here was refused).  The
 /// integration test checks that every row of `v_expiring` is listed.
 fn expiring_within_sql() -> String {

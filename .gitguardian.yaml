@@ -1,0 +1,6 @@
+# Configuration GitGuardian (ggshield) : les dossiers de test ne contiennent que
+# des mots de passe factices, utilisés par des instances PostgreSQL jetables.
+version: 2
+secret:
+  ignored_paths:
+    - "tests/**"
