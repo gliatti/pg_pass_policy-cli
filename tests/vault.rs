@@ -4,8 +4,12 @@
 
 use httpmock::prelude::*;
 use httpmock::{Mock, MockServer};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use pgpp::vault::{
-    build_payload, preflight, write_secret, VaultConfig, VaultTarget, METADATA_DISAPPEARED,
+    build_payload, preflight, write_secret, write_secret_tracked, VaultConfig, VaultTarget,
+    METADATA_DISAPPEARED, REFUSED_SINCE_PREFLIGHT,
 };
 use serde_json::{json, Value};
 
@@ -223,8 +227,9 @@ async fn preflight_checks_the_token_and_the_write_capability() {
     ] {
         let server = MockServer::start_async().await;
         let (lookup, cap) = preflight_mocks(&server, 200, 200, caps.clone()).await;
-        let warnings = preflight(&cfg(&server), &target()).await.unwrap();
-        assert!(warnings.is_empty(), "{caps}: {warnings:?}");
+        let pre = preflight(&cfg(&server), &target()).await.unwrap();
+        assert!(pre.warnings.is_empty(), "{caps}: {pre:?}");
+        assert!(!pre.update_only, "{caps}: {pre:?}");
         lookup.assert_async().await;
         cap.assert_async().await;
     }
@@ -300,7 +305,7 @@ async fn preflight_refuses_a_403() {
     // unreadable answer: warning only (the token itself was accepted)
     let server = MockServer::start_async().await;
     preflight_mocks(&server, 200, 200, json!({"unexpected": true})).await;
-    let warnings = preflight(&cfg(&server), &target()).await.unwrap();
+    let warnings = preflight(&cfg(&server), &target()).await.unwrap().warnings;
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("unexpected answer"), "{warnings:?}");
 }
@@ -421,7 +426,7 @@ async fn path_prefix_of_vault_addr_is_kept() {
         .await;
     let cfg = VaultConfig::new(format!("{}/vault/", server.base_url()), "tok", None).unwrap();
     let target = target();
-    assert!(preflight(&cfg, &target).await.unwrap().is_empty());
+    assert!(preflight(&cfg, &target).await.unwrap().warnings.is_empty());
     write_secret(&cfg, &target, &build_payload("app", "x", "now"))
         .await
         .unwrap();
@@ -521,7 +526,7 @@ async fn preflight_reuses_the_connection() {
     let (addr, accepted) = counting_vault().await;
     let cfg = VaultConfig::new(addr, "good-token", None).unwrap();
     let target = VaultTarget::parse("secret/db/app", None).unwrap();
-    let warnings = preflight(&cfg, &target).await.unwrap();
+    let warnings = preflight(&cfg, &target).await.unwrap().warnings;
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
         accepted.load(std::sync::atomic::Ordering::SeqCst),
@@ -561,8 +566,9 @@ async fn preflight_accepts_update_alone_on_an_existing_secret() {
         let server = MockServer::start_async().await;
         preflight_mocks(&server, 200, 200, caps.clone()).await;
         let meta = metadata_mock(&server, 200).await;
-        let warnings = preflight(&cfg(&server), &target()).await.unwrap();
-        assert!(warnings.is_empty(), "{caps}: {warnings:?}");
+        let pre = preflight(&cfg(&server), &target()).await.unwrap();
+        assert!(pre.warnings.is_empty(), "{caps}: {pre:?}");
+        assert!(pre.update_only, "{caps}: {pre:?}");
         meta.assert_async().await;
     }
 
@@ -708,31 +714,81 @@ async fn loopback_writes_with_a_proxy_in_the_environment() {
     assert!(!format!("{err:#}").contains("502"), "{addr}: {err:#}");
 }
 
-/// The secret found by the preflight of an `update`-only token may be
-/// deleted before the write (check-then-act): the 403 of the write then
-/// says why.
-#[tokio::test]
-async fn a_write_refused_after_an_update_only_preflight_says_why() {
-    let server = MockServer::start_async().await;
-    preflight_mocks(&server, 200, 200, json!({"capabilities": ["update"]})).await;
-    metadata_mock(&server, 200).await;
+/// Mocks a write refused with 403 "permission denied".
+async fn refused_write(server: &MockServer) -> Mock<'_> {
     server
         .mock_async(|when, then| {
             when.method(POST).path("/v1/secret/data/db/app");
             then.status(403)
                 .json_body(json!({"errors": ["permission denied"]}));
         })
-        .await;
-    let checked = cfg(&server);
-    preflight(&checked, &target()).await.unwrap();
-    let err = write_secret(&checked, &target(), &build_payload("app", "x", "now"))
+        .await
+}
+
+/// The secret found by the preflight of an `update`-only token may be
+/// deleted before the write (check-then-act): the 403 of the write is then
+/// confirmed by a new read of the metadata.  A 404 there says that the
+/// secret disappeared; any other answer (the metadata still readable, or
+/// refused too) is a permission withdrawn since the preflight (token
+/// expired or revoked, policy changed), not a deletion.
+#[tokio::test]
+async fn a_write_refused_after_an_update_only_preflight_says_why() {
+    let write = |cfg: VaultConfig, update_only: bool| async move {
+        let err = write_secret_tracked(
+            &cfg,
+            &target(),
+            &build_payload("app", "x", "now"),
+            update_only,
+            Arc::new(AtomicBool::new(false)),
+        )
         .await
         .unwrap_err();
-    let m = format!("{err:#}");
+        assert!(!pgpp::vault::may_have_been_received(&err), "{err:#}");
+        format!("{err:#}")
+    };
+
+    // the secret was deleted after the preflight
+    let server = MockServer::start_async().await;
+    preflight_mocks(&server, 200, 200, json!({"capabilities": ["update"]})).await;
+    let meta = metadata_mock(&server, 200).await;
+    refused_write(&server).await;
+    let checked = cfg(&server);
+    let pre = preflight(&checked, &target()).await.unwrap();
+    assert!(pre.update_only, "{pre:?}");
+    meta.delete_async().await;
+    let gone = metadata_mock(&server, 404).await;
+    let m = write(checked.clone(), pre.update_only).await;
+    gone.assert_async().await;
     assert!(m.contains("HTTP 403"), "{m}");
     assert!(m.contains(METADATA_DISAPPEARED), "{m}");
+    assert!(!m.contains(REFUSED_SINCE_PREFLIGHT), "{m}");
 
-    // without that preflight (new configuration), a 403 is reported as it is
+    // the secret is still there (or its metadata now refused): the
+    // permission changed, the message does not claim a deletion
+    for status in [200, 403] {
+        let server = MockServer::start_async().await;
+        preflight_mocks(&server, 200, 200, json!({"capabilities": ["update"]})).await;
+        refused_write(&server).await;
+        let meta = metadata_mock(&server, status).await;
+        let m = write(cfg(&server), true).await;
+        meta.assert_async().await;
+        assert!(m.contains("HTTP 403"), "{status}: {m}");
+        assert!(m.contains(REFUSED_SINCE_PREFLIGHT), "{status}: {m}");
+        assert!(m.contains(&format!("HTTP {status}")), "{status}: {m}");
+        assert!(!m.contains(METADATA_DISAPPEARED), "{status}: {m}");
+        assert!(!m.contains("good-token"), "{m}");
+    }
+
+    // without that preflight result, a 403 is reported as it is and the
+    // metadata is not read
+    let server = MockServer::start_async().await;
+    refused_write(&server).await;
+    let meta = metadata_mock(&server, 404).await;
+    let m = write(cfg(&server), false).await;
+    assert_eq!(meta.hits_async().await, 0);
+    assert!(m.contains("HTTP 403"), "{m}");
+    assert!(!m.contains(METADATA_DISAPPEARED), "{m}");
+    assert!(!m.contains(REFUSED_SINCE_PREFLIGHT), "{m}");
     let err = write_secret(&cfg(&server), &target(), &build_payload("app", "x", "now"))
         .await
         .unwrap_err();

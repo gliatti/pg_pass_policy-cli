@@ -35,66 +35,82 @@ const STATUS_COLUMNS: &str = "v.role_name, v.profile, v.password_changed_at::tex
      v.expires_at::text, v.grace_until::text, v.days_left, v.locked_until::text, \
      v.failed_count, v.status, v.expiry_state";
 
-/// Message added to an error raised because the installed extension is
-/// older than this pgpp: an unknown column (`42703`, `expiry_state` or
-/// `is_exempt` of `v_role_status`) or relation (`42P01`, `v_expiring`).
+/// Message added to an error on an unknown object of the extension
+/// (see [`SCHEMA_SQLSTATES`]) when `pg_pass_policy` is installed: the
+/// installed version is older than this pgpp.
 pub const NEWER_EXTENSION: &str =
     "this pgpp requires a newer pg_pass_policy (reinstall the extension)";
 
-/// Message added to an unknown relation of the schema `pass_policy` when
-/// the extension is not installed in the database at all.
+/// Message added to the same error when the extension is not installed in
+/// the database at all.
 pub const NOT_INSTALLED: &str = "pg_pass_policy is not installed in this database";
 
-/// What an error of a query on the views says about the extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchemaGap {
-    /// The extension is older than this pgpp.
-    Older,
-    /// A relation of `pass_policy` is unknown: the extension is either
-    /// older or not installed (checked in `pg_extension`).
-    Relation,
+/// Message added to the same error when `pg_extension` could not be read
+/// to tell the two cases apart; the error of that check follows.
+pub const UNVERIFIED_INSTALLATION: &str =
+    "an object of pg_pass_policy is missing; the installation of the extension could not \
+     be checked";
+
+/// SQLSTATEs of an object the server does not know: schema (`3F000`),
+/// relation (`42P01`), column (`42703`), function (`42883`).  Each one is
+/// diagnosed by [`diagnose`] from `pg_extension`, never from the text of
+/// the message (localised by `lc_messages`).
+const SCHEMA_SQLSTATES: [&str; 4] = ["3F000", "42P01", "42703", "42883"];
+
+/// SQLSTATE of the database error at the root of `err`, if any.
+fn sqlstate(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<sqlx::Error>())
+        .and_then(|e| e.as_database_error())
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned())
 }
 
-/// [`SchemaGap`] of an error from its SQLSTATE and message, `None` for an
-/// error unrelated to the schema.
-fn schema_gap(sqlstate: Option<&str>, message: &str) -> Option<SchemaGap> {
-    match sqlstate {
-        Some("42703") => Some(SchemaGap::Older),
-        Some("42P01") if message.contains("pass_policy.") => Some(SchemaGap::Relation),
-        Some("42P01") => Some(SchemaGap::Older),
-        _ => None,
-    }
-}
-
-/// Error of a query on the views (or tables) of the extension, with
-/// [`NEWER_EXTENSION`] or [`NOT_INSTALLED`] in front of the server message
-/// when the schema is too old or missing.  When the check of
-/// `pg_extension` itself fails, the server message is left alone.
-async fn view_error(conn: &mut PgConnection, err: sqlx::Error) -> anyhow::Error {
-    let gap = err
-        .as_database_error()
-        .and_then(|d| schema_gap(d.code().as_deref(), d.message()));
-    let hint = match gap {
-        None => return err.into(),
-        Some(SchemaGap::Older) => Some(NEWER_EXTENSION),
-        Some(SchemaGap::Relation) => {
-            match sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension \
-                  WHERE extname = 'pg_pass_policy')",
-            )
-            .fetch_one(conn)
-            .await
-            {
-                Ok(true) => Some(NEWER_EXTENSION),
-                Ok(false) => Some(NOT_INSTALLED),
-                Err(_) => None,
-            }
-        }
+/// Single error path of every command ([`crate::run`] calls it on any
+/// error of a command): an error of the server on an unknown object
+/// ([`SCHEMA_SQLSTATES`]) gets [`NEWER_EXTENSION`] or [`NOT_INSTALLED`] in
+/// front, after a look at `pg_extension`.  Any other error is returned as
+/// it is.
+///
+/// Contract: the check is a new query on `conn`.  The commands run their
+/// statements outside any transaction except `check`, whose transaction
+/// is rolled back before its error is returned (and a `Transaction`
+/// dropped by `?` queues its ROLLBACK, sent ahead of the next query).  A
+/// transaction still open here (aborted by the error) is rolled back
+/// first, so that the check never runs in an aborted transaction.  When
+/// that rollback or the check fails (connection lost, Ctrl-C during the
+/// command, permission), the original error is kept, with
+/// [`UNVERIFIED_INSTALLATION`] and the reason in front: the hint that an
+/// object is missing is not lost.
+pub async fn diagnose(conn: &mut PgConnection, err: anyhow::Error) -> anyhow::Error {
+    let Some(code) = sqlstate(&err) else {
+        return err;
     };
-    match hint {
-        Some(hint) => anyhow::Error::new(err).context(hint),
-        None => err.into(),
+    if !SCHEMA_SQLSTATES.contains(&code.as_str()) {
+        return err;
     }
+    match extension_installed(conn).await {
+        Ok(true) => err.context(NEWER_EXTENSION),
+        Ok(false) => err.context(NOT_INSTALLED),
+        Err(e) => err.context(format!("{UNVERIFIED_INSTALLATION} ({e:#})")),
+    }
+}
+
+/// Whether `pg_pass_policy` is in `pg_extension`, after the rollback of a
+/// transaction left open on `conn`.
+async fn extension_installed(conn: &mut PgConnection) -> Result<bool> {
+    if conn.is_in_transaction() {
+        conn.execute("ROLLBACK")
+            .await
+            .context("cannot roll back the failed transaction")?;
+    }
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension \
+          WHERE extname = 'pg_pass_policy')",
+    )
+    .fetch_one(conn)
+    .await
+    .context("cannot read pg_extension")
 }
 
 pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) -> Result<()> {
@@ -102,10 +118,7 @@ pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) ->
         "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
          WHERE $1::text IS NULL OR v.role_name = $1 ORDER BY v.role_name"
     );
-    let rows = match sqlx::query(&sql).bind(role).fetch_all(&mut *conn).await {
-        Ok(rows) => rows,
-        Err(e) => return Err(view_error(conn, e).await),
-    };
+    let rows = sqlx::query(&sql).bind(role).fetch_all(conn).await?;
     if rows.is_empty() {
         if let Some(r) = role {
             bail!("role \"{r}\" not found among login roles");
@@ -115,45 +128,48 @@ pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) ->
 }
 
 /// Rows of the view `v_expiring` (expiry state warning, grace or expired,
-/// exempt roles left out: the selection is the one of the extension, not a
-/// copy of it).  With `within`, also the roles not exempt whose password
-/// expires before `now() + within`: one scan of `v_role_status`, so that a
-/// role found by both criteria appears once, sorted on the raw timestamp.
+/// exempt roles left out).  With `within`, also the roles not exempt whose
+/// password expires before `now() + within`, in a single scan of
+/// `v_role_status` ([`expiring_within_sql`]): a role found by both
+/// criteria appears once, sorted on the raw timestamp.
 pub async fn expiring(
     conn: &mut PgConnection,
     within: Option<Duration>,
     fmt: Format,
 ) -> Result<()> {
-    let read = match within {
+    let rows = match within {
         None => {
             let sql = format!(
                 "SELECT {STATUS_COLUMNS} FROM pass_policy.v_expiring v \
                  ORDER BY v.expires_at NULLS LAST, v.role_name"
             );
-            sqlx::query(&sql).fetch_all(&mut *conn).await
+            sqlx::query(&sql).fetch_all(conn).await?
         }
         Some(within) => {
             sqlx::query(&expiring_within_sql())
                 .bind(to_pg_interval(within)?)
-                .fetch_all(&mut *conn)
-                .await
+                .fetch_all(conn)
+                .await?
         }
-    };
-    let rows = match read {
-        Ok(rows) => rows,
-        Err(e) => return Err(view_error(conn, e).await),
     };
     ResultSet::from_rows(&rows)?.print(fmt, "no expiring role")
 }
 
-/// `expiring --within`: the roles of `v_expiring` (its filter is not
-/// copied, only its `role_oid` are read) or not exempt and expiring before
-/// `now() + $1`, in a single scan of `v_role_status`: each role is one row.
+/// `expiring --within`: one scan of `v_role_status`, each role one row.
+/// The filter of `v_expiring` (`expiry_state IN ('warning', 'grace',
+/// 'expired') AND NOT is_exempt`, sql/pg_pass_policy--1.0.sql) is
+/// reproduced here on the columns of `v_role_status`, of which `v_expiring`
+/// is a plain selection, instead of being read through
+/// `IN (SELECT ... FROM v_expiring)`, which would compute the view a second
+/// time.  A change of that filter in the extension must be carried over
+/// here; the integration test checks that every row of `v_expiring` is
+/// listed.
 fn expiring_within_sql() -> String {
     format!(
         "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
-          WHERE v.role_oid IN (SELECT e.role_oid FROM pass_policy.v_expiring e) \
-             OR (NOT v.is_exempt AND v.expires_at <= now() + $1::interval) \
+          WHERE NOT v.is_exempt \
+            AND (v.expiry_state IN ('warning', 'grace', 'expired') \
+                 OR v.expires_at <= now() + $1::interval) \
           ORDER BY v.expires_at NULLS LAST, v.role_name"
     )
 }
@@ -163,16 +179,12 @@ fn expiring_within_sql() -> String {
 /// that `locked_by` / `lock_reason` were empty after an
 /// `ALTER ROLE ... RENAME`); an older extension still shows that gap.
 pub async fn locked(conn: &mut PgConnection, fmt: Format) -> Result<()> {
-    let read = sqlx::query(
+    let rows = sqlx::query(
         "SELECT role_name, locked_until::text, locked_by, lock_reason, failed_count \
            FROM pass_policy.v_locked ORDER BY role_name",
     )
-    .fetch_all(&mut *conn)
-    .await;
-    let rows = match read {
-        Ok(rows) => rows,
-        Err(e) => return Err(view_error(conn, e).await),
-    };
+    .fetch_all(conn)
+    .await?;
     ResultSet::from_rows(&rows)?.print(fmt, "no locked role")
 }
 
@@ -226,7 +238,16 @@ pub struct Delivery {
     pub exec: Option<String>,
     /// `--exec-timeout` (`None`: no limit).
     pub exec_timeout: Option<Duration>,
-    pub vault: Option<(VaultConfig, VaultTarget)>,
+    pub vault: Option<VaultDelivery>,
+}
+
+/// Vault delivery of a rotation: configuration, target, and the result of
+/// the preflight ([`vault::Preflight`], the default one when it was skipped
+/// with `--vault-skip-preflight`), handed to the write.
+pub struct VaultDelivery {
+    pub cfg: VaultConfig,
+    pub target: VaultTarget,
+    pub preflight: vault::Preflight,
 }
 
 /// Why [`Delivery::prepare`] refused the delivery options.  Both are
@@ -276,28 +297,38 @@ impl Delivery {
         if opts.exec.is_some() {
             check_shell().map_err(PrepareError::Invalid)?;
         }
-        if let Some((cfg, target, skip_preflight)) = &vault {
-            if *skip_preflight {
-                crate::warn(
-                    "Vault preflight skipped (--vault-skip-preflight): \
-                     VAULT_TOKEN and its permission on the path are only checked by the \
-                     write, after the rotation",
-                );
-            } else {
-                let warnings = vault::preflight(cfg, target)
-                    .await
-                    .map_err(PrepareError::Preflight)?;
-                for w in warnings {
-                    crate::warn(&w);
-                }
+        let vault = match vault {
+            Some((cfg, target, skip_preflight)) => {
+                let preflight = if skip_preflight {
+                    crate::warn(
+                        "Vault preflight skipped (--vault-skip-preflight): \
+                         VAULT_TOKEN and its permission on the path are only checked by the \
+                         write, after the rotation",
+                    );
+                    vault::Preflight::default()
+                } else {
+                    let preflight = vault::preflight(&cfg, &target)
+                        .await
+                        .map_err(PrepareError::Preflight)?;
+                    for w in &preflight.warnings {
+                        crate::warn(w);
+                    }
+                    preflight
+                };
+                Some(VaultDelivery {
+                    cfg,
+                    target,
+                    preflight,
+                })
             }
-        }
+            None => None,
+        };
         Ok(Delivery {
             length: opts.length,
             show: opts.show,
             exec: opts.exec.clone(),
             exec_timeout: opts.exec_timeout.0,
-            vault: vault.map(|(cfg, target, _)| (cfg, target)),
+            vault,
         })
     }
 }
@@ -384,8 +415,18 @@ async fn deliver(
     // failed Vault write that may have reached Vault all the same
     let mut vault_unknown = false;
 
-    if let Some((cfg, target)) = &opts.vault {
-        match vault_delivery(cfg, target, &rot.role, &password, interrupt).await {
+    if let Some(v) = &opts.vault {
+        let update_only = v.preflight.update_only;
+        match vault_delivery(
+            &v.cfg,
+            &v.target,
+            update_only,
+            &rot.role,
+            &password,
+            interrupt,
+        )
+        .await
+        {
             Ok(()) => delivered.push("vault"),
             Err(f) => {
                 failed.push("vault");
@@ -502,7 +543,9 @@ struct VaultFailure {
     unknown: bool,
 }
 
-/// Writes the secret to Vault, the failure otherwise.  Whether the secret
+/// Writes the secret to Vault, the failure otherwise.  `update_only` is
+/// [`vault::Preflight::update_only`] of the preflight of this delivery
+/// (false when it was skipped).  Whether the secret
 /// may have been written rests on the body of the request: until the HTTP
 /// client starts to send it ([`vault::write_secret_tracked`]), Vault has at
 /// most an incomplete request and writes nothing.  A Ctrl-C received
@@ -519,6 +562,7 @@ struct VaultFailure {
 async fn vault_delivery(
     cfg: &VaultConfig,
     target: &VaultTarget,
+    update_only: bool,
     role: &str,
     password: &Secret,
     interrupt: &mut Interrupt,
@@ -527,7 +571,7 @@ async fn vault_delivery(
     let mut payload = build_payload(role, password, &rotated_at);
     let body_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = {
-        let write = write_secret_tracked(cfg, target, &payload, body_sent.clone());
+        let write = write_secret_tracked(cfg, target, &payload, update_only, body_sent.clone());
         // biased: a Ctrl-C already received wins before the request starts
         tokio::select! {
             biased;
@@ -903,7 +947,7 @@ pub async fn expire(conn: &mut PgConnection, role: &str, fmt: Format) -> Result<
 }
 
 pub async fn profile_list(conn: &mut PgConnection, fmt: Format) -> Result<()> {
-    let read = sqlx::query(
+    let rows = sqlx::query(
         "SELECT p.name, p.min_length, p.max_length, p.min_classes, p.history_count, \
                 p.max_age::text, p.grace_period::text, p.warn_before::text, \
                 p.max_failures, p.failure_window::text, p.lock_duration::text, \
@@ -911,24 +955,16 @@ pub async fn profile_list(conn: &mut PgConnection, fmt: Format) -> Result<()> {
                   WHERE rp.profile_id = p.profile_id) AS roles \
          FROM pass_policy.profile p ORDER BY (p.name <> 'default'), p.name",
     )
-    .fetch_all(&mut *conn)
-    .await;
-    let rows = match read {
-        Ok(rows) => rows,
-        Err(e) => return Err(view_error(conn, e).await),
-    };
+    .fetch_all(conn)
+    .await?;
     ResultSet::from_rows(&rows)?.print(fmt, "no profile")
 }
 
 pub async fn profile_show(conn: &mut PgConnection, name: &str, fmt: Format) -> Result<()> {
-    let read = sqlx::query("SELECT to_jsonb(p) FROM pass_policy.profile p WHERE p.name = $1")
+    let row = sqlx::query("SELECT to_jsonb(p) FROM pass_policy.profile p WHERE p.name = $1")
         .bind(name)
-        .fetch_optional(&mut *conn)
-        .await;
-    let row = match read {
-        Ok(row) => row,
-        Err(e) => return Err(view_error(conn, e).await),
-    };
+        .fetch_optional(conn)
+        .await?;
     let Some(row) = row else {
         bail!("profile \"{name}\" does not exist");
     };
@@ -1028,7 +1064,7 @@ pub async fn audit(
     limit: i64,
     fmt: Format,
 ) -> Result<()> {
-    let read = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id, event_time::text, event_type, role_name, actor, database, \
                 client_addr::text, application_name, details \
          FROM pass_policy.audit_log \
@@ -1041,12 +1077,8 @@ pub async fn audit(
     .bind(role)
     .bind(event_type)
     .bind(limit)
-    .fetch_all(&mut *conn)
-    .await;
-    let rows = match read {
-        Ok(rows) => rows,
-        Err(e) => return Err(view_error(conn, e).await),
-    };
+    .fetch_all(conn)
+    .await?;
     ResultSet::from_rows(&rows)?.print(fmt, "no audit event")
 }
 
@@ -1310,12 +1342,27 @@ pub async fn check(
     fmt: Format,
 ) -> Result<i32> {
     let mut tx = conn.begin().await?;
-    mask_parameters(&mut tx).await?;
-    let row = sqlx::query("SELECT pass_policy.check_password($1::text, $2::text)")
-        .bind(role)
-        .bind(password.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
+    let call = async {
+        mask_parameters(&mut tx).await?;
+        let row = sqlx::query("SELECT pass_policy.check_password($1::text, $2::text)")
+            .bind(role)
+            .bind(password.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+        anyhow::Ok(row)
+    };
+    let row = match call.await {
+        Ok(row) => row,
+        Err(e) => {
+            // the transaction is aborted: rolled back here, so that
+            // [`diagnose`] reads pg_extension on a clean connection.  A
+            // failed rollback is not reported on its own: the transaction
+            // is then dropped, which queues its ROLLBACK ahead of the next
+            // query, and `diagnose` says when that query fails.
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+    };
     let reason: Option<String> = column(&row, 0, "the result of check_password")?;
     drop(password);
     tx.commit().await?;
@@ -1565,24 +1612,12 @@ mod tests {
 
     #[test]
     fn an_older_extension_is_reported_as_such() {
+        // only an error of the server carries a SQLSTATE
+        assert_eq!(sqlstate(&anyhow::anyhow!("relation does not exist")), None);
         assert_eq!(
-            schema_gap(Some("42703"), "column v.expiry_state does not exist"),
-            Some(SchemaGap::Older)
+            sqlstate(&anyhow::Error::new(sqlx::Error::RowNotFound).context("outer")),
+            None
         );
-        assert_eq!(
-            schema_gap(Some("42P01"), "relation \"v_expiring\" does not exist"),
-            Some(SchemaGap::Older)
-        );
-        assert_eq!(
-            schema_gap(
-                Some("42P01"),
-                "relation \"pass_policy.v_expiring\" does not exist"
-            ),
-            Some(SchemaGap::Relation)
-        );
-        for code in [Some("42501"), Some("42883"), Some("XX000"), None] {
-            assert_eq!(schema_gap(code, "pass_policy.x"), None, "{code:?}");
-        }
         let err = anyhow::anyhow!("column v.expiry_state does not exist").context(NEWER_EXTENSION);
         assert_eq!(
             crate::format_error(&err),
@@ -1591,34 +1626,64 @@ mod tests {
         );
     }
 
-    /// The same message on real errors of the server: unknown column and
-    /// unknown view of an installed extension; an unknown relation of
-    /// `pass_policy` in a database without the extension says so; another
-    /// error is left as it is.
+    /// SQLSTATE of a failed query of the test server, for the assertions.
+    fn code_of(err: &anyhow::Error) -> String {
+        sqlstate(err).unwrap_or_default()
+    }
+
+    /// The same message on real errors of the server, whatever the
+    /// command (read or write): unknown column, view and function of an
+    /// installed extension; a transaction left open is rolled back before
+    /// the check; when the check itself fails, the original error is kept
+    /// with [`UNVERIFIED_INSTALLATION`]; another error is left as it is.
     #[tokio::test]
     #[ignore = "needs PGPP_TEST_URL"]
     async fn an_unknown_column_or_view_asks_for_a_newer_extension() {
         use sqlx::Connection;
         let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
         let mut conn = PgConnection::connect(&url).await.unwrap();
-        for sql in [
-            "SELECT v.pgpp_no_such_column FROM pass_policy.v_role_status v",
-            "SELECT * FROM pass_policy.v_pgpp_no_such_view",
+        for (sql, code) in [
+            (
+                "SELECT v.pgpp_no_such_column FROM pass_policy.v_role_status v",
+                "42703",
+            ),
+            ("SELECT * FROM pass_policy.v_pgpp_no_such_view", "42P01"),
+            (
+                "SELECT pass_policy.pgpp_no_such_function($1::name)",
+                "42883",
+            ),
         ] {
-            let e = sqlx::query(sql).fetch_all(&mut conn).await.unwrap_err();
-            let err = view_error(&mut conn, e).await;
-            let m = crate::format_error(&err);
+            let e = sqlx::query(sql)
+                .bind("x")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap_err();
+            let e = anyhow::Error::new(e).context("outer");
+            assert_eq!(code_of(&e), code, "{sql}");
+            let m = crate::format_error(&diagnose(&mut conn, e).await);
             assert!(m.starts_with(&format!("{NEWER_EXTENSION}: ")), "{sql}: {m}");
-            assert!(m.contains("does not exist"), "{sql}: {m}");
         }
         let e = sqlx::query("SELECT 1/0")
             .fetch_all(&mut conn)
             .await
             .unwrap_err();
-        let err = view_error(&mut conn, e).await;
+        let err = diagnose(&mut conn, e.into()).await;
         assert!(!crate::format_error(&err).contains(NEWER_EXTENSION));
-        // `expiring --within` is valid against this extension, and lists
-        // each role once
+
+        // error inside a transaction still open (aborted): rolled back
+        // before the check
+        let mut tx = conn.begin().await.unwrap();
+        let e = sqlx::query("SELECT * FROM pass_policy.v_pgpp_no_such_view")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap_err();
+        std::mem::forget(tx);
+        assert!(conn.is_in_transaction());
+        let m = crate::format_error(&diagnose(&mut conn, e.into()).await);
+        assert!(m.starts_with(&format!("{NEWER_EXTENSION}: ")), "{m}");
+
+        // `expiring --within` is valid against this extension, lists each
+        // role once, every role of `v_expiring` included
         let rows = sqlx::query(&expiring_within_sql())
             .bind("100 years")
             .fetch_all(&mut conn)
@@ -1636,30 +1701,106 @@ mod tests {
         let names: std::collections::HashSet<String> =
             rows.iter().map(|r| r.get::<String, _>(0)).collect();
         assert_eq!(names.len(), rows.len(), "a role listed twice");
-
-        // a database without the extension: `template1`, unless it has it
-        let mut opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-        opts = opts.database("template1");
-        let Ok(mut other) = PgConnection::connect_with(&opts).await else {
-            eprintln!("skipped: cannot connect to the database template1");
-            return;
-        };
-        let installed: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_pass_policy')",
-        )
-        .fetch_one(&mut other)
-        .await
-        .unwrap();
-        if installed {
-            eprintln!("skipped: pg_pass_policy is installed in the database template1");
-            return;
+        let expiring: Vec<String> =
+            sqlx::query_scalar("SELECT role_name::text FROM pass_policy.v_expiring")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        for r in &expiring {
+            assert!(names.contains(r), "{r} of v_expiring not listed");
         }
-        let e = sqlx::query("SELECT * FROM pass_policy.v_locked")
-            .fetch_all(&mut other)
+        // a zero interval adds nothing to v_expiring but the passwords
+        // expired (their expiry state is `grace` or `expired` anyway)
+        let rows = sqlx::query(&expiring_within_sql())
+            .bind("0 seconds")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        let zero: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.get::<String, _>(0)).collect();
+        assert!(expiring.iter().all(|r| zero.contains(r)));
+
+        // the check fails (connection terminated): the original error is
+        // kept, with the mention that the installation was not checked
+        let e = sqlx::query("SELECT * FROM pass_policy.v_pgpp_no_such_view")
+            .fetch_all(&mut conn)
             .await
             .unwrap_err();
-        let m = crate::format_error(&view_error(&mut other, e).await);
-        assert!(m.starts_with(&format!("{NOT_INSTALLED}: ")), "{m}");
+        let _ = sqlx::query("SELECT pg_terminate_backend(pg_backend_pid())")
+            .execute(&mut conn)
+            .await;
+        let m = crate::format_error(&diagnose(&mut conn, e.into()).await);
+        assert!(
+            m.starts_with(UNVERIFIED_INSTALLATION) && m.contains("v_pgpp_no_such_view"),
+            "{m}"
+        );
+        assert!(
+            !m.contains(NEWER_EXTENSION) && !m.contains(NOT_INSTALLED),
+            "{m}"
+        );
+    }
+
+    /// A database without the extension, created for the test and dropped
+    /// afterwards (never `template1`): a read of a view, a write call and
+    /// an unknown schema all say that the extension is not installed.
+    /// Skipped when the role of PGPP_TEST_URL may not create a database.
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn a_database_without_the_extension_says_so() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        let db = format!("pgpp_t_noext_{}", std::process::id());
+        let create = sqlx::query(&format!("CREATE DATABASE {db}"))
+            .execute(&mut conn)
+            .await;
+        if let Err(e) = create {
+            let e = anyhow::Error::new(e);
+            if code_of(&e) == "42501" {
+                eprintln!("skipped: the role of PGPP_TEST_URL may not create a database");
+                return;
+            }
+            panic!("CREATE DATABASE {db}: {e:#}");
+        }
+        let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let messages = async {
+            let mut other = PgConnection::connect_with(&opts.database(&db)).await?;
+            let mut messages = Vec::new();
+            for sql in [
+                "SELECT * FROM pass_policy.v_locked",
+                "SELECT pass_policy.unlock_role('x'::name)",
+                "SELECT * FROM pass_policy.failed_attempts()",
+            ] {
+                let e = sqlx::query(sql).fetch_all(&mut other).await.unwrap_err();
+                let e = anyhow::Error::new(e);
+                let code = code_of(&e);
+                let m = crate::format_error(&diagnose(&mut other, e).await);
+                messages.push((sql, code, m));
+            }
+            other.close().await?;
+            anyhow::Ok(messages)
+        }
+        .await;
+        let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let force = if version >= 130_000 {
+            " WITH (FORCE)"
+        } else {
+            ""
+        };
+        sqlx::query(&format!("DROP DATABASE {db}{force}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for (sql, code, m) in messages.unwrap() {
+            assert!(
+                ["3F000", "42P01", "42883"].contains(&code.as_str()),
+                "{sql}: {code}"
+            );
+            assert!(m.starts_with(&format!("{NOT_INSTALLED}: ")), "{sql}: {m}");
+        }
     }
 
     /// Same check on values sent by a real server (PGPP_TEST_URL).
@@ -1698,7 +1839,7 @@ mod tests {
         let target = VaultTarget::parse("secret/db/app", None).unwrap();
         let mut interrupt = Interrupt::already_received();
         let password = Zeroizing::new("pw".to_string());
-        let err = vault_delivery(&cfg, &target, "app", &password, &mut interrupt)
+        let err = vault_delivery(&cfg, &target, false, "app", &password, &mut interrupt)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1720,7 +1861,7 @@ mod tests {
         let password = Zeroizing::new("pw".to_string());
         let mut interrupt = Interrupt::never();
         let refused = VaultConfig::new("http://127.0.0.1:9", "t", None).unwrap();
-        let err = vault_delivery(&refused, &target, "app", &password, &mut interrupt)
+        let err = vault_delivery(&refused, &target, false, "app", &password, &mut interrupt)
             .await
             .unwrap_err();
         assert!(!err.unknown, "{err:?}");
@@ -1743,7 +1884,7 @@ mod tests {
         let cfg =
             VaultConfig::with_timeout(server.base_url(), "t", None, Duration::from_millis(300))
                 .unwrap();
-        let err = vault_delivery(&cfg, &target, "app", &password, &mut interrupt)
+        let err = vault_delivery(&cfg, &target, false, "app", &password, &mut interrupt)
             .await
             .unwrap_err();
         assert_eq!(slow.hits_async().await, 1);
@@ -1847,9 +1988,16 @@ mod tests {
         assert!(!vault::may_have_been_received(&err), "{err:#}");
 
         let password = Zeroizing::new("pw".to_string());
-        let failure = vault_delivery(&cfg, &target, "app", &password, &mut Interrupt::never())
-            .await
-            .unwrap_err();
+        let failure = vault_delivery(
+            &cfg,
+            &target,
+            false,
+            "app",
+            &password,
+            &mut Interrupt::never(),
+        )
+        .await
+        .unwrap_err();
         assert!(!failure.unknown, "{failure:?}");
         assert!(!failure.message.contains("may or may not"), "{failure:?}");
     }
@@ -1874,7 +2022,7 @@ mod tests {
             }
         };
         let (failure, ()) = tokio::join!(
-            vault_delivery(&cfg, &target, "app", &password, &mut interrupt),
+            vault_delivery(&cfg, &target, false, "app", &password, &mut interrupt),
             raise
         );
         assert_eq!(

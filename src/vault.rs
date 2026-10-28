@@ -152,10 +152,17 @@ pub struct VaultConfig {
     /// Longest duration of a request, connection and response included
     /// ([`REQUEST_TIMEOUT`] unless given to [`VaultConfig::with_timeout`]).
     timeout: Duration,
-    /// Set by the preflight when it accepted the token on `update` alone
-    /// because the secret existed ([`check_update_only`]); only the wording
-    /// of a 403 on the write depends on it.
-    update_only: Arc<AtomicBool>,
+}
+
+/// Outcome of a successful [`preflight`]: the warnings to print, and
+/// whether the token was accepted on `update` alone because the secret
+/// existed ([`check_update_only`]).  The caller keeps it with the delivery
+/// and hands `update_only` to [`write_secret_tracked`]: only the handling of
+/// a 403 on the write depends on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preflight {
+    pub warnings: Vec<String>,
+    pub update_only: bool,
 }
 
 /// Default longest duration of a Vault request.
@@ -218,7 +225,6 @@ impl VaultConfig {
             namespace,
             client: build_client(root_certs, &pinned, direct, connect_timeout_for(timeout))?,
             timeout,
-            update_only: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -400,12 +406,24 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
 
 /// True when `VAULT_ADDR` designates this host: a literal loopback address
 /// (`http://` or `https://`), `http://localhost` pinned to its checked
-/// loopback addresses, or `https://localhost` (not resolved by
-/// `check_addr_pinned`: TLS verifies the certificate, but a proxy would
-/// resolve `localhost` on its own side, so it is reached directly too).
+/// loopback addresses, or a `localhost` name with `https://` (not resolved
+/// by `check_addr_pinned`: TLS verifies the certificate, but a proxy would
+/// resolve the name on its own side, so it is reached directly too).  See
+/// [`is_localhost_name`] for the names.
 fn is_loopback_target(url: &Url, pinned: &Pinned) -> bool {
     let host = url.host_str().unwrap_or("");
-    pinned.is_some() || host == "localhost" || literal_loopback(host)
+    pinned.is_some() || is_localhost_name(host) || literal_loopback(host)
+}
+
+/// True for `localhost` and the names under it (`vault.localhost`), with
+/// or without the final dot of a fully qualified name (`localhost.`,
+/// `vault.localhost.`): RFC 6761 reserves them for the loopback interface.
+/// `host` is lower-cased by `url`; the comparison ignores ASCII case all
+/// the same.  A name that merely contains `localhost`
+/// (`localhost.example.net`, `my-localhost`) is not one of them.
+fn is_localhost_name(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost")
 }
 
 /// True for a literal loopback address as `url` prints it (`127.0.0.1`,
@@ -553,9 +571,12 @@ async fn drain(mut resp: reqwest::Response) {
 ///
 /// A token created with `-no-default-policy` fails the first request: the
 /// caller skips this preflight on an explicit request only
-/// (`--vault-skip-preflight`).  Returns the warnings, which the caller prints.
-pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<String>> {
+/// (`--vault-skip-preflight`).  Returns the warnings, which the caller
+/// prints, and whether the token was accepted on `update` alone
+/// ([`Preflight`]).
+pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Preflight> {
     let mut warnings = Vec::new();
+    let mut update_only = false;
 
     // Two requests on purpose: `capabilities-self` alone would also refuse
     // an expired, revoked or unknown token, but its error does not tell a
@@ -593,10 +614,14 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
         Some(caps) if can_write(&caps) => {}
         Some(caps) if has_capability(&caps, "update") => {
             check_update_only(cfg, target, &caps).await?;
+            update_only = true;
         }
         Some(caps) => bail!(cannot_write_message(&path, &caps, "")),
     }
-    Ok(warnings)
+    Ok(Preflight {
+        warnings,
+        update_only,
+    })
 }
 
 /// Refusal of the preflight for a token whose capabilities on `path` are
@@ -621,16 +646,16 @@ fn cannot_write_message(path: &str, caps: &[String], why: &str) -> String {
 ///
 /// This is a check-then-act: the secret may be deleted (metadata included)
 /// between this check and the write after the rotation, which then needs
-/// `create` and is refused with 403.  The write reports that case as such
-/// ([`Call::WriteUpdateOnly`]); nothing else is changed (the rotation is
-/// already done by then).
+/// `create` and is refused with 403.  The write reads the metadata again to
+/// tell that case from a token expired, revoked or deprived of its policy
+/// since ([`explain_update_only_refusal`]); nothing else is changed (the
+/// rotation is already done by then).
 async fn check_update_only(cfg: &VaultConfig, target: &VaultTarget, caps: &[String]) -> Result<()> {
     let path = target.api_path();
     let url = target.metadata_url(&cfg.addr);
     let why = match cfg.request(reqwest::Method::GET, url.clone()).send().await {
         Ok(resp) if resp.status() == StatusCode::OK => {
             drain(resp).await;
-            cfg.update_only.store(true, Ordering::Relaxed);
             return Ok(());
         }
         Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
@@ -677,17 +702,37 @@ fn has_capability(caps: &[String], name: &str) -> bool {
 enum Call {
     /// Preflight request, before the rotation.
     Preflight,
-    /// Write of the secret, after the rotation.
+    /// Write of the secret, after the rotation: a refusal is a
+    /// [`WriteRefused`].
     Write,
-    /// Write of the secret after a preflight that accepted `update` alone
-    /// ([`check_update_only`]): a 403 then most likely means that the secret
-    /// was deleted since.
-    WriteUpdateOnly,
 }
 
-/// Explanation added to a 403 on [`Call::WriteUpdateOnly`].
+/// Explanation added to a 403 on a write after a preflight that accepted
+/// `update` alone, when a new read of the metadata answers 404
+/// ([`explain_update_only_refusal`]).
 pub const METADATA_DISAPPEARED: &str = "secret metadata disappeared: the token needs create \
      (the preflight accepted update alone because the secret existed; it was deleted since)";
+
+/// Explanation added to that 403 when the metadata did not answer 404: the
+/// secret may still exist, the permission itself changed.
+pub const REFUSED_SINCE_PREFLIGHT: &str = "permission denied since the preflight: the token \
+     may have expired or been revoked, or its policy may have changed";
+
+/// HTTP status other than 2xx or a redirect answered to the write of the
+/// secret ([`Call::Write`]); its text is the whole message.
+#[derive(Debug)]
+struct WriteRefused {
+    status: StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for WriteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WriteRefused {}
 
 /// Sends a request and returns the response when its status is 2xx.  A
 /// network error, a redirect (never followed) or any other status is an
@@ -701,7 +746,7 @@ async fn send_checked(
 ) -> Result<reqwest::Response> {
     let request = match call {
         Call::Preflight => "Vault preflight request",
-        Call::Write | Call::WriteUpdateOnly => "Vault request",
+        Call::Write => "Vault request",
     };
     let resp = req
         .send()
@@ -716,12 +761,10 @@ async fn send_checked(
     }
     let body = error_body(resp).await;
     match call {
-        Call::WriteUpdateOnly if status == StatusCode::FORBIDDEN => {
-            bail!("Vault refused the write to {url}: HTTP {status}{body}: {METADATA_DISAPPEARED}")
-        }
-        Call::Write | Call::WriteUpdateOnly => {
-            bail!("Vault refused the write to {url}: HTTP {status}{body}")
-        }
+        Call::Write => Err(anyhow::Error::new(WriteRefused {
+            status,
+            message: format!("Vault refused the write to {url}: HTTP {status}{body}"),
+        })),
         Call::Preflight if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
             bail!(
                 "Vault refused VAULT_TOKEN at {url}: HTTP {status}{body} (expired, revoked or \
@@ -789,18 +832,29 @@ async fn error_body(resp: reqwest::Response) -> String {
 /// status and the response body, which Vault fills with its own error list;
 /// the payload itself is never included.  The body is serialised into a
 /// buffer wiped when reqwest drops it (see [`zeroizing_json`]).
+/// Without a preflight result: a 403 is reported as it is.
 pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
-    write_secret_tracked(cfg, target, payload, Arc::new(AtomicBool::new(false))).await
+    write_secret_tracked(
+        cfg,
+        target,
+        payload,
+        false,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
 }
 
 /// [`write_secret`], setting `body_sent` once the HTTP client starts to
 /// send the body (see [`TrackedBody`]).  While it is still false, Vault
 /// cannot have written the secret, whatever the error (or the
 /// interruption): the request is incomplete without its body.
+/// `update_only` is [`Preflight::update_only`] (false without a preflight):
+/// a 403 is then explained by [`explain_update_only_refusal`].
 pub async fn write_secret_tracked(
     cfg: &VaultConfig,
     target: &VaultTarget,
     payload: &Value,
+    update_only: bool,
     body_sent: Arc<AtomicBool>,
 ) -> Result<()> {
     let url = target.url(&cfg.addr);
@@ -813,13 +867,45 @@ pub async fn write_secret_tracked(
         .request(reqwest::Method::POST, url.clone())
         .header(CONTENT_TYPE, "application/json")
         .body(reqwest::Body::wrap(body));
-    let call = if cfg.update_only.load(Ordering::Relaxed) {
-        Call::WriteUpdateOnly
-    } else {
-        Call::Write
+    match send_checked(req, &url, Call::Write).await {
+        Ok(_) => Ok(()),
+        Err(e)
+            if update_only
+                && e.downcast_ref::<WriteRefused>()
+                    .is_some_and(|r| r.status == StatusCode::FORBIDDEN) =>
+        {
+            Err(explain_update_only_refusal(cfg, target, &e).await)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 403 on the write after a preflight that accepted `update` alone: the
+/// secret may have been deleted since (its write then needs `create`), or
+/// the token may have expired, been revoked or lost its policy.  A second
+/// read of the metadata tells them apart: 404 confirms the deletion
+/// ([`METADATA_DISAPPEARED`]); any other answer, or a failed request,
+/// gives the cautious [`REFUSED_SINCE_PREFLIGHT`] with what that read
+/// found.  The error of that read is only quoted as text: the result stays
+/// an answer of Vault to the write ([`may_have_been_received`] is false).
+async fn explain_update_only_refusal(
+    cfg: &VaultConfig,
+    target: &VaultTarget,
+    refused: &anyhow::Error,
+) -> anyhow::Error {
+    let url = target.metadata_url(&cfg.addr);
+    let found = match cfg.request(reqwest::Method::GET, url.clone()).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            drain(resp).await;
+            if status == StatusCode::NOT_FOUND {
+                return anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}");
+            }
+            format!("{url} answered HTTP {status}")
+        }
+        Err(e) => format!("request to {url} failed ({e})"),
     };
-    send_checked(req, &url, call).await?;
-    Ok(())
+    anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT} ({found})")
 }
 
 /// Request body made of a single chunk, which raises `sent` when the HTTP
@@ -1153,6 +1239,10 @@ mod tests {
             "http://localhost:8200",
             "https://localhost:8200",
             "https://LocalHost:8200/vault",
+            "https://localhost.:8200",
+            "https://vault.localhost:8200",
+            "https://Vault.LocalHost.:8200/v",
+            "https://a.b.localhost:8200",
         ] {
             let (url, pinned) = check_addr_pinned(addr).unwrap();
             assert!(is_loopback_target(&url, &pinned), "{addr}");
@@ -1162,10 +1252,40 @@ mod tests {
             "https://vault.example.net:8200",
             "https://10.0.0.5:8200",
             "https://localhost.example.net:8200",
+            "https://localhost.example.net.:8200",
+            "https://my-localhost:8200",
+            "https://notlocalhost:8200",
+            "https://localhost..:8200",
             "https://[::ffff:127.0.0.1]:8200",
         ] {
             let (url, pinned) = check_addr_pinned(addr).unwrap();
             assert!(!is_loopback_target(&url, &pinned), "{addr}");
+        }
+    }
+
+    #[test]
+    fn localhost_names_are_recognised() {
+        for name in [
+            "localhost",
+            "localhost.",
+            "LOCALHOST",
+            "vault.localhost",
+            "vault.localhost.",
+            "a.b.localhost",
+        ] {
+            assert!(is_localhost_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "localhost..",
+            "localhost.example.net",
+            "my-localhost",
+            "notlocalhost",
+            "localhostx",
+            "127.0.0.1",
+        ] {
+            assert!(!is_localhost_name(name), "{name}");
         }
     }
 

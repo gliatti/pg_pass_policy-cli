@@ -98,27 +98,36 @@ pgpp worker-status               # pid, dernier passage et rechargement du worke
 `status` et `expiring` affichent, après `status`, la colonne
 `expiry_state` : l'état du mot de passe seul (`ok`, `warning`, `grace`,
 `expired`, `never_expires`, `unknown`), que `status` masque par `locked` ou
-`exempt`. `expiring` lit la vue `v_expiring` de l'extension sans recopier son
-filtre : un rôle verrouillé dont le mot de passe expire y figure (avec
-`status = locked`), un rôle exempté (`pg_pass_policy.exempt_roles`) jamais,
-pas plus qu'avec `--within`. Avec `--within`, `pgpp` envoie une seule
-requête, un seul parcours de `v_role_status` : les rôles présents dans
-`v_expiring` ou non exemptés et dont le mot de passe expire avant
-`now() + durée`. Chaque rôle n'apparaît qu'une fois.
+`exempt`. `expiring` lit la vue `v_expiring` de l'extension : un rôle
+verrouillé dont le mot de passe expire y figure (avec `status = locked`), un
+rôle exempté (`pg_pass_policy.exempt_roles`) jamais, pas plus qu'avec
+`--within`. Avec `--within`, `pgpp` envoie une seule requête, un seul
+parcours de `v_role_status` : les rôles non exemptés dont `expiry_state` vaut
+`warning`, `grace` ou `expired` (le filtre de `v_expiring`, reproduit sur
+les colonnes de `v_role_status` dont la vue n'est qu'une sélection) ou dont
+le mot de passe expire avant `now() + durée`. Chaque rôle n'apparaît qu'une
+fois.
 
 Version de l'extension : `status` et `expiring` demandent une version de
 `pg_pass_policy` dont `v_role_status` a les colonnes `expiry_state` et
 `is_exempt` et qui fournit la vue `v_expiring`. Face à une extension plus
-ancienne, le serveur répond par une colonne ou une relation inconnue
-(SQLSTATE `42703` ou `42P01`) : `pgpp` affiche alors `this pgpp requires a
-newer pg_pass_policy (reinstall the extension)` suivi du message du serveur.
-Il suffit de réinstaller l'extension livrée avec ce dépôt (voir le README
-de l'extension à la racine du dépôt). Quand la relation inconnue est une
-relation du schéma `pass_policy`, `pgpp` consulte `pg_extension` : si
-l'extension n'est pas installée dans la base, le message devient
-`pg_pass_policy is not installed in this database`. Ce traitement vaut pour
-toutes les lectures des vues et tables de l'extension (`status`,
-`expiring`, `locked`, `audit`, `profile list`, `profile show`).
+ancienne, le serveur répond par un objet inconnu. Toute commande (lecture
+comme écriture : `status`, `expiring`, `locked`, `audit`, `profile`,
+`lock`, `unlock`, `expire`, `rotate`, `switch-pair`, `check`,
+`maintenance`, `failed-attempts`, `worker-status`) passe par le même
+traitement d'erreur : sur un schéma, une relation, une colonne ou une
+fonction inconnus (SQLSTATE `3F000`, `42P01`, `42703`, `42883`), `pgpp`
+consulte `pg_extension`, sans analyser le texte du message (traduit selon
+`lc_messages`). Si l'extension est installée, il affiche `this pgpp
+requires a newer pg_pass_policy (reinstall the extension)` suivi du message
+du serveur : il suffit de réinstaller l'extension livrée avec ce dépôt (voir
+le README de l'extension à la racine du dépôt). Si elle ne l'est pas, le
+message devient `pg_pass_policy is not installed in this database`. Ce
+contrôle est une nouvelle requête, envoyée hors transaction (celle de
+`check` est annulée avant) ; s'il échoue (connexion perdue, par exemple),
+l'erreur d'origine est conservée, précédée de `an object of pg_pass_policy
+is missing; the installation of the extension could not be checked` et de
+la cause.
 
 `worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
 les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
@@ -572,16 +581,20 @@ couvert, le contournement reste `--exec` avec le client officiel :
 
 Mandataire HTTP (proxy) : vers une adresse de boucle locale (adresse IP
 littérale `127.0.0.0/8` ou `[::1]`, en `http://` comme en `https://`,
-`http://localhost` épinglé comme décrit ci-dessus, ou `https://localhost`), le client se connecte
-toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
+`http://localhost` épinglé comme décrit ci-dessus, ou en `https://` un nom
+`localhost` : `localhost`, `localhost.` ou un nom en `.localhost` comme
+`vault.localhost`, avec ou sans point final, réservés à la boucle locale par
+la RFC 6761), le client se connecte toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
 un mandataire résoudrait `localhost` de son côté et verrait passer le jeton
 (et, en `http://`, le mot de passe) en clair. Vers une adresse distante, les
 réglages de mandataire du système s'appliquent (`HTTPS_PROXY`, `NO_PROXY`
 compris), comme avec le client officiel : le mandataire relaie alors un
 tunnel TLS (`CONNECT`) dont le certificat reste vérifié pour l'hôte de
 `VAULT_ADDR`, il voit l'hôte et le port contactés mais pas le contenu.
-`https://localhost` n'est pas résolu par `pgpp` (TLS vérifie le
-certificat), mais il est lui aussi joint directement, sans mandataire.
+Un nom `localhost` en `https://` n'est pas résolu par `pgpp` (TLS vérifie
+le certificat), mais il est lui aussi joint directement, sans mandataire.
+Un nom qui contient seulement `localhost` (`localhost.example.net`,
+`my-localhost`) est une adresse distante.
 
 Les redirections HTTP ne sont jamais suivies : une réponse 301/302/307/308
 est une erreur (code 1). Suivre une redirection rejouerait le jeton et le mot
@@ -628,9 +641,15 @@ HTTP que pour l'écriture (redirections refusées) :
    Le corps des métadonnées est lu puis ignoré, jamais analysé. Cette
    vérification précède l'action sans la garantir : si le secret est
    supprimé (métadonnées comprises) entre le préflight et l'écriture, celle-ci
-   demande `create` et Vault la refuse par un 403, après la rotation. Le
-   message d'erreur le signale alors par `secret metadata disappeared: the
-   token needs create`.
+   demande `create` et Vault la refuse par un 403, après la rotation. Un 403
+   ne prouve pas la suppression (le jeton a pu expirer, être révoqué ou
+   perdre sa politique depuis le préflight) : `pgpp` relit alors les
+   métadonnées. Un 404 confirme la suppression, le message le signale par
+   `secret metadata disappeared: the token needs create`. Toute autre
+   réponse donne un message prudent, `permission denied since the
+   preflight: the token may have expired or been revoked, or its policy may
+   have changed`, suivi de ce qu'a répondu cette relecture. Dans les deux
+   cas, Vault a répondu à l'écriture : le secret n'a pas été écrit.
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme

@@ -172,13 +172,18 @@ pub async fn run(cli: Cli) -> Result<i32> {
         _ => None,
     };
     let mut conn = db::connect(&connect_options).await?;
-    let result = dispatch(&mut conn, cli.command, fmt, settings, password, delivery).await;
+    let result = match dispatch(&mut conn, cli.command, fmt, settings, password, delivery).await {
+        Err(e) => Err(commands::diagnose(&mut conn, e).await),
+        ok => ok,
+    };
     db::close(conn).await;
     result
 }
 
-/// Runs the command on the open connection; [`run`] closes it afterwards,
-/// whatever the result.
+/// Runs the command on the open connection; [`run`] passes any error to
+/// [`commands::diagnose`] (the single error path that tells a missing or
+/// older extension) and closes the connection afterwards, whatever the
+/// result.
 async fn dispatch(
     conn: &mut sqlx::PgConnection,
     command: Command,
