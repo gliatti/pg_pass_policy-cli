@@ -88,12 +88,22 @@ en silence.
 pgpp status                      # vue v_role_status : tous les rôles LOGIN
 pgpp status --role app_user      # un seul rôle (erreur si absent)
 pgpp status -f json | jq '.[] | select(.status != "ok")'
-pgpp expiring                    # status warning / grace / expired
-pgpp expiring --within 14d       # idem + expiration dans moins de 14 jours
+pgpp expiring                    # vue v_expiring : expiry_state warning / grace / expired, hors rôles exemptés
+pgpp expiring --within 14d       # idem + rôles non exemptés qui expirent dans moins de 14 jours
 pgpp locked                      # rôles verrouillés (mêmes colonnes que la vue v_locked)
 pgpp failed-attempts             # compteurs d'échecs en mémoire partagée
 pgpp worker-status               # pid, dernier passage et rechargement du worker, locks_loaded
 ```
+
+`status` et `expiring` affichent, après `status`, la colonne
+`expiry_state` : l'état du mot de passe seul (`ok`, `warning`, `grace`,
+`expired`, `never_expires`, `unknown`), que `status` masque par `locked` ou
+`exempt`. `expiring` lit la vue `v_expiring` de l'extension sans recopier son
+filtre : un rôle verrouillé dont le mot de passe expire y figure (avec
+`status = locked`), un rôle exempté (`pg_pass_policy.exempt_roles`) jamais,
+pas plus qu'avec `--within`. Ces deux commandes demandent une version de
+l'extension dont `v_role_status` a les colonnes `expiry_state` et
+`is_exempt`.
 
 `worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
 les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
@@ -164,13 +174,17 @@ Politique d'affichage :
     corrigé ;
   - « the secret may or may not have been written: check Vault before
     rotating again » (précédé de « delivered to exec, vault failed: » si le
-    hook a abouti) : l'écriture Vault a échoué après l'envoi de la requête
-    (pas de réponse dans le délai de 30 s, connexion coupée en attendant ou
-    en lisant la réponse, Ctrl-C pendant la requête). Vault a pu enregistrer
-    le secret : le consulter avant de relancer la rotation. Une erreur
-    survenue avant l'envoi (nom introuvable, connexion refusée, échec TLS)
-    ou une réponse d'erreur de Vault (code HTTP) n'a rien écrit et donne
-    « rotate again » ;
+    hook a abouti) : l'écriture Vault a échoué après l'envoi du corps de la
+    requête (pas de réponse dans le délai de 30 s, connexion coupée en
+    attendant ou en lisant la réponse, Ctrl-C pendant la requête). Vault a
+    pu enregistrer le secret : le consulter avant de relancer la rotation.
+    Une erreur survenue avant l'envoi du corps (nom introuvable, connexion
+    refusée ou non établie en 10 s, échec TLS) ou une réponse d'erreur de
+    Vault (code HTTP) n'a rien écrit et donne « rotate again ». `pgpp` sait
+    si le corps est parti : le client HTTP ne le lit qu'une fois la
+    connexion établie et la requête en cours d'envoi ; sans corps complet,
+    Vault n'écrit rien. Une fois le corps remis à la connexion, `pgpp` ne
+    peut pas savoir si ses octets sont arrivés : le message reste prudent ;
 
   en JSON, `delivered_to` donne les remises réussies (`["vault"]` dans le
   deuxième cas), `failed` les remises échouées (`["exec"]`) et `advice` le
@@ -180,8 +194,10 @@ Politique d'affichage :
   (le serveur a pu changer le mot de passe : relancer la rotation) ; pendant
   la remise (relecture de `rolvaliduntil`, écriture Vault, hook `--exec`),
   la remise en cours est abandonnée, celles qui restent ne sont pas tentées
-  (message « not attempted » ; une écriture Vault abandonnée en cours de
-  route a pu, ou non, aboutir) et `pgpp` termine comme pour une remise
+  (message « not attempted », y compris pour une écriture Vault
+  interrompue avant l'envoi du corps de la requête, pendant la connexion
+  par exemple ; une écriture Vault abandonnée après cet envoi a pu, ou non,
+  aboutir) et `pgpp` termine comme pour une remise
   échouée (code 1, message « rotate again », « do not rotate again » si
   l'écriture Vault avait abouti, « check Vault before rotating again » si
   elle a été abandonnée en cours de route, mot de passe affiché seulement
@@ -263,7 +279,9 @@ Chaque `--set` est un couple `clé=valeur` dont la clé est une colonne de
 `reject_dictionary`, `reject_prehashed`, `max_repeat`, `history_count`,
 `history_days`, `max_age`, `min_age`, `grace_period`, `warn_before`,
 `max_failures`, `failure_window`, `lock_duration`). Les entiers et les
-booléens (`true/false`, `on/off`, `yes/no`) sont typés, `null` efface une
+booléens (`true/false`, `on/off`, `yes/no`) sont typés ; un entier ne l'est
+que sous sa forme décimale canonique (`16`, `-1`) : `+16`, `016` ou `-0`
+restent des chaînes, transmises telles quelles. `null` efface une
 valeur optionnelle (`max_age`, `lock_duration`), le reste est transmis tel
 quel (intervalles PostgreSQL : `"30 days"`, `"1 hour"`). Les mots-clés `true`,
 `false`, `on`, `off`, `yes`, `no` et `null` sont insensibles à la casse (`TRUE`,
@@ -331,6 +349,16 @@ signaux de ce terminal (`SIGHUP` à sa fermeture, Ctrl-C tapé dessus). Pour
 l'éviter, passer le mot de passe par un tube
 (`printf '%s\n' "$CANDIDATE" | setsid pgpp check app_user`) plutôt que de
 rediriger une tty.
+
+Autre limite de l'invite : la limite de 4096 octets n'y est contrôlée
+qu'après la saisie. rpassword lit le terminal caractère par caractère
+jusqu'à Entrée, sans borne de longueur, et `pgpp` ne reçoit la ligne qu'une
+fois complète : un texte très long collé à l'invite est donc entièrement
+gardé en mémoire avant d'être refusé (code 2). Le tampon de rpassword est
+effacé à sa libération, mais il grandit par réallocations pendant la
+saisie et les copies laissées par chaque réallocation ne sont pas effacées.
+Les entrées par tube ou par fichier n'ont pas cette limite : la lecture s'y
+arrête à 4096 octets.
 
 Journal du serveur : un paramètre lié n'apparaît pas dans le texte de la
 requête, mais PostgreSQL l'écrit dans la ligne `DETAIL:  parameters: …` dès
@@ -551,9 +579,18 @@ HTTP que pour l'écriture (redirections refusées) :
    inconnu : un 403 est donc un refus ;
 2. `POST {VAULT_ADDR}/v1/sys/capabilities-self` avec
    `{"paths": ["{mount}/data/{chemin}"]}` : un refus de cette requête (403
-   compris) ou des droits sur ce chemin qui ne comprennent ni `create`, ni
-   `update`, ni `root` sortent avec le code 1. Si la réponse est illisible,
-   `pgpp` avertit et tente l'écriture après la rotation.
+   compris) ou des droits sur ce chemin qui ne comprennent ni `root`, ni à
+   la fois `create` et `update` sortent avec le code 1. Les deux sont
+   exigés : `create` écrit la première version du secret, `update` toutes
+   les suivantes, donc chaque rotation après la première. Un jeton limité à
+   `create` passerait la vérification puis serait refusé par Vault après la
+   deuxième rotation, le mot de passe déjà changé. `sudo` n'ouvre que les
+   chemins protégés et ne donne aucun droit d'écriture : il ne suffit pas.
+   La règle est plus stricte que nécessaire pour un jeton qui n'écrirait
+   qu'un secret neuf (ou qu'un secret existant) : `capabilities-self` ne
+   dit pas si le secret existe, `--vault-skip-preflight` reste possible
+   dans ce cas. Si la réponse est illisible, `pgpp` avertit et tente
+   l'écriture après la rotation.
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme
@@ -673,6 +710,12 @@ groupe `pgpp_t_grp`) dans la base désignée : à n'utiliser que sur une
 instance de test. Le test Vault utilise un serveur HTTP simulé (`httpmock`)
 qui vérifie le chemin, les en-têtes `X-Vault-Token` / `X-Vault-Namespace`, le
 corps envoyé et les deux requêtes de vérification préalable.
+
+Le test `expiring_uses_the_view_and_leaves_exempt_roles_out` vérifie en
+outre l'exclusion des rôles exemptés quand le serveur liste
+`pgpp_t_xv_exempt` dans `pg_pass_policy.exempt_roles` (réglage `SIGHUP` du
+`postgresql.conf` de l'instance de test) ; sinon, il saute cette partie et le
+signale sur la sortie d'erreur.
 
 ## Choix techniques
 

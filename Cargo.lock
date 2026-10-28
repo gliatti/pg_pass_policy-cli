@@ -1672,6 +1672,7 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "http-body 1.1.0",
  "httpmock",
  "libc",
  "reqwest",

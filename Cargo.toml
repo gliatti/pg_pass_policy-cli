@@ -23,6 +23,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "time", "signal"] }
 zeroize = { version = "1", features = ["std"] }
 bytes = "1.9"
+http-body = "1"
 libc = "0.2"
 
 [dev-dependencies]

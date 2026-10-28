@@ -3,6 +3,10 @@
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -137,10 +141,26 @@ pub struct VaultConfig {
     /// Longest duration of a request, connection and response included
     /// ([`REQUEST_TIMEOUT`] unless changed by [`VaultConfig::with_timeout`]).
     timeout: Duration,
+    /// What the client was built from, kept to rebuild it with another
+    /// connection timeout ([`VaultConfig::with_timeout`]).
+    root_certs: Vec<Certificate>,
+    pinned: Pinned,
 }
 
 /// Default longest duration of a Vault request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest duration of the connection (TCP and TLS handshake) to Vault,
+/// shorter than the request timeout: a connection that does not succeed in
+/// time then fails as a connection error (`is_connect()`), which says that
+/// nothing was sent, instead of a request timeout, which does not.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connection timeout used with a request timeout: [`CONNECT_TIMEOUT`],
+/// at most half of the request timeout.
+fn connect_timeout_for(request: Duration) -> Duration {
+    CONNECT_TIMEOUT.min(request / 2)
+}
 
 impl VaultConfig {
     /// Builds a configuration; `addr` must use `https://`, or `http://` on a
@@ -171,14 +191,19 @@ impl VaultConfig {
             addr,
             token,
             namespace,
-            client: build_client(root_certs, &pinned)?,
+            client: build_client(root_certs, &pinned, connect_timeout_for(REQUEST_TIMEOUT))?,
             timeout: REQUEST_TIMEOUT,
+            root_certs: root_certs.to_vec(),
+            pinned,
         })
     }
 
-    /// Same configuration with another request timeout (tests).
+    /// Same configuration with another request timeout (tests); the
+    /// connection timeout follows ([`connect_timeout_for`]).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self.client = build_client(&self.root_certs, &self.pinned, connect_timeout_for(timeout))
+            .expect("the HTTP client was already built with the same settings");
         self
     }
 
@@ -268,9 +293,16 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// host the `Location` header names, bypassing the loopback rule of
 /// `check_addr`.  A redirect is reported as an error instead.  `pinned`
 /// (`http://localhost`) replaces the resolution of that name by the loopback
-/// addresses checked by `check_addr_pinned`.
-fn build_client(root_certs: &[Certificate], pinned: &Pinned) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+/// addresses checked by `check_addr_pinned`.  `connect_timeout` bounds the
+/// connection alone (see [`CONNECT_TIMEOUT`]).
+fn build_client(
+    root_certs: &[Certificate],
+    pinned: &Pinned,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout);
     if let Some((host, addrs)) = pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -464,9 +496,9 @@ async fn drain(mut resp: reqwest::Response) {
 ///    read to its end and discarded, never parsed ([`drain`]).
 /// 2. `POST {addr}/v1/sys/capabilities-self` with the KV v2 data path: an
 ///    error when this request is refused, or when the capabilities of the
-///    token on that path contain none of `create`, `update`, `root`.  When
-///    the answer cannot be read, a warning is returned and the write is
-///    attempted after the rotation.
+///    token on that path are not enough to write it ([`can_write`]: `root`,
+///    or both `create` and `update`).  When the answer cannot be read, a
+///    warning is returned and the write is attempted after the rotation.
 ///
 /// A token created with `-no-default-policy` fails the first request: the
 /// caller skips this preflight on an explicit request only
@@ -507,20 +539,32 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
             "unexpected answer of {url}: the write permission of VAULT_TOKEN on \
              \"{path}\" could not be checked before the rotation"
         )),
-        Some(caps)
-            if !caps
-                .iter()
-                .any(|c| matches!(c.as_str(), "create" | "update" | "root")) =>
-        {
+        Some(caps) if !can_write(&caps) => {
             bail!(
                 "VAULT_TOKEN may not write \"{path}\": its capabilities there are [{}] \
-                 (create or update required)",
+                 (create and update required, or root; --vault-skip-preflight skips \
+                 this check)",
                 caps.join(", ")
             );
         }
         Some(_) => {}
     }
     Ok(warnings)
+}
+
+/// True when the capabilities of a token on a KV v2 data path let it write
+/// the secret whether it exists or not: `root`, or both `create` (first
+/// version of the secret) and `update` (any later version, i.e. every
+/// rotation after the first one).  `create` alone would pass the preflight
+/// and then be refused by Vault after the rotation once the secret exists;
+/// `update` alone would be refused for a secret not written yet.  `sudo`
+/// only opens root-protected paths and grants no write by itself, it is not
+/// enough either.  Requiring both is stricter than needed for one of the
+/// two cases (a new secret, or an existing one), which `capabilities-self`
+/// cannot tell apart without reading the secret.
+fn can_write(caps: &[String]) -> bool {
+    let has = |name: &str| caps.iter().any(|c| c == name);
+    has("root") || (has("create") && has("update"))
 }
 
 /// Kind of a request sent by [`send_checked`], for the wording of its
@@ -577,7 +621,11 @@ async fn send_checked(
 /// timeout, connection closed while waiting for or reading the response,
 /// unreadable body).  An error raised before anything was sent (DNS,
 /// connection refused or timed out, TLS handshake, invalid request) or an
-/// answer of Vault (HTTP status, redirect) gives `false`.
+/// answer of Vault (HTTP status, redirect) gives `false`.  A connection
+/// that does not succeed in time is a connection error ([`CONNECT_TIMEOUT`]
+/// is shorter than the request timeout), not a request timeout.  Callers
+/// that know whether the body was sent ([`write_secret_tracked`]) combine
+/// both.
 pub fn may_have_been_received(err: &anyhow::Error) -> bool {
     err.chain()
         .find_map(|e| e.downcast_ref::<reqwest::Error>())
@@ -625,14 +673,63 @@ async fn error_body(resp: reqwest::Response) -> String {
 /// the payload itself is never included.  The body is serialised into a
 /// buffer wiped when reqwest drops it (see [`zeroizing_json`]).
 pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Value) -> Result<()> {
+    write_secret_tracked(cfg, target, payload, Arc::new(AtomicBool::new(false))).await
+}
+
+/// [`write_secret`], setting `body_sent` once the HTTP client starts to
+/// send the body (see [`TrackedBody`]).  While it is still false, Vault
+/// cannot have written the secret, whatever the error (or the
+/// interruption): the request is incomplete without its body.
+pub async fn write_secret_tracked(
+    cfg: &VaultConfig,
+    target: &VaultTarget,
+    payload: &Value,
+    body_sent: Arc<AtomicBool>,
+) -> Result<()> {
     let url = target.url(&cfg.addr);
     let body = zeroizing_json(payload)?;
+    let body = TrackedBody {
+        data: Some(Bytes::from_owner(body)),
+        sent: body_sent,
+    };
     let req = cfg
         .request(reqwest::Method::POST, url.clone())
         .header(CONTENT_TYPE, "application/json")
-        .body(reqwest::Body::from(Bytes::from_owner(body)));
+        .body(reqwest::Body::wrap(body));
     send_checked(req, &url, Call::Write).await?;
     Ok(())
+}
+
+/// Request body made of a single chunk, which raises `sent` when the HTTP
+/// client polls it for the first time.  hyper polls a request body only
+/// once the request is on a connection (established, TLS included) and
+/// its headers are queued: as long as `sent` is false, no byte of the body
+/// has left the process.  The exact size is announced (`Content-Length`
+/// header, as with a plain buffer).
+struct TrackedBody {
+    data: Option<Bytes>,
+    sent: Arc<AtomicBool>,
+}
+
+impl http_body::Body for TrackedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
+        self.sent.store(true, Ordering::SeqCst);
+        Poll::Ready(self.data.take().map(|d| Ok(http_body::Frame::data(d))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.data.as_ref().map_or(0, |d| d.len() as u64))
+    }
 }
 
 /// JSON text of `payload` in a buffer allocated once at its exact size (a

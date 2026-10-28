@@ -215,8 +215,8 @@ async fn preflight_mocks(
 #[tokio::test]
 async fn preflight_checks_the_token_and_the_write_capability() {
     for caps in [
-        json!({"capabilities": ["create", "read"], "secret/data/db/app": ["create", "read"]}),
-        json!({"data": {"secret/data/db/app": ["update"]}}),
+        json!({"capabilities": ["create", "read", "update"], "secret/data/db/app": ["create", "read", "update"]}),
+        json!({"data": {"secret/data/db/app": ["update", "create"]}}),
         json!({"capabilities": ["root"]}),
     ] {
         let server = MockServer::start_async().await;
@@ -230,9 +230,15 @@ async fn preflight_checks_the_token_and_the_write_capability() {
 
 #[tokio::test]
 async fn preflight_refuses_a_token_that_cannot_write() {
+    // `create` alone fails on the second rotation (the secret exists),
+    // `update` alone on the first one; `sudo` grants no write by itself
     for caps in [
         json!({"capabilities": ["read", "list"]}),
         json!({"capabilities": ["deny"]}),
+        json!({"capabilities": ["create", "read"]}),
+        json!({"data": {"secret/data/db/app": ["update"]}}),
+        json!({"capabilities": ["sudo"]}),
+        json!({"capabilities": ["create", "sudo"]}),
     ] {
         let server = MockServer::start_async().await;
         preflight_mocks(&server, 200, 200, caps.clone()).await;
@@ -242,6 +248,10 @@ async fn preflight_refuses_a_token_that_cannot_write() {
         );
         assert!(
             text.contains("may not write") && text.contains("secret/data/db/app"),
+            "{caps}: {text}"
+        );
+        assert!(
+            text.contains("create and update required, or root"),
             "{caps}: {text}"
         );
         assert!(!text.contains("good-token"), "{text}");

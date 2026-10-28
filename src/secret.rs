@@ -186,10 +186,11 @@ impl Interrupt {
         }
     }
 
-    /// An `Interrupt` listening to another signal (tests: `SIGUSR1`, which
-    /// nothing else in the test process uses, rather than `SIGINT`).
+    /// An `Interrupt` listening to another signal (tests: `SIGUSR1` here,
+    /// `SIGUSR2` in the tests of `commands`, which nothing else in the test
+    /// process uses, rather than `SIGINT`).
     #[cfg(test)]
-    fn on(kind: tokio::signal::unix::SignalKind) -> Self {
+    pub(crate) fn on(kind: tokio::signal::unix::SignalKind) -> Self {
         Interrupt {
             signal: Some(tokio::signal::unix::signal(kind).unwrap()),
             received: false,

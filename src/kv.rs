@@ -4,7 +4,9 @@
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 
-/// Converts one `KEY=VALUE` item.  Booleans and integers are typed, `null`
+/// Converts one `KEY=VALUE` item.  Booleans and integers are typed (an
+/// integer in canonical decimal form only: `16`, `-1`; `+16`, `016` or
+/// `-0` stay strings), `null`
 /// becomes JSON null (clears an optional setting such as `max_age`), anything
 /// else stays a string (intervals such as `"30 days"`).  The keywords
 /// (`true`/`false`, `on`/`off`, `yes`/`no`, `null`) are case-insensitive, as
@@ -36,9 +38,11 @@ pub fn parse_kv(item: &str) -> Result<(String, Value)> {
         "true" | "on" | "yes" => Value::Bool(true),
         "false" | "off" | "no" => Value::Bool(false),
         "null" => Value::Null,
+        // only the canonical decimal form is a number: `+5`, `007` or `-0`
+        // (accepted by `i64::from_str`) stay strings, sent as typed
         _ => match value.parse::<i64>() {
-            Ok(n) => Value::from(n),
-            Err(_) => Value::String(value.to_string()),
+            Ok(n) if n.to_string() == value => Value::from(n),
+            _ => Value::String(value.to_string()),
         },
     };
     Ok((key.to_string(), json))
@@ -154,6 +158,30 @@ mod tests {
             assert_eq!(parse_kv(item).unwrap().1, expected, "{item}");
         }
         assert_eq!(parse_kv("max_age=90").unwrap().1, json!(90));
+    }
+
+    #[test]
+    fn only_canonical_integers_are_numbers() {
+        for (item, expected) in [
+            ("min_length=16", json!(16)),
+            ("min_length=0", json!(0)),
+            ("min_length=-1", json!(-1)),
+            ("min_length=9223372036854775807", json!(i64::MAX)),
+            // accepted by i64::from_str, but not in canonical form
+            ("min_length=+16", json!("+16")),
+            ("min_length=016", json!("016")),
+            ("min_length=00", json!("00")),
+            ("min_length=-016", json!("-016")),
+            ("min_length=-0", json!("-0")),
+            ("min_length=+0", json!("+0")),
+            // out of range
+            (
+                "min_length=9223372036854775808",
+                json!("9223372036854775808"),
+            ),
+        ] {
+            assert_eq!(parse_kv(item).unwrap().1, expected, "{item}");
+        }
     }
 
     #[test]

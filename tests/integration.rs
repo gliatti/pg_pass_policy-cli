@@ -1343,6 +1343,143 @@ async fn expiring_sorts_by_time_not_by_text() {
     }
 }
 
+/// `expiring` is the view `v_expiring` (expiry state warning / grace /
+/// expired, exempt roles left out, a locked role included); `--within`
+/// adds the roles not exempt that expire before the delay.  The exempt
+/// part needs `pg_pass_policy.exempt_roles` to list `pgpp_t_xv_exempt`
+/// (set by the test instance script); it is skipped, with a note, when the
+/// server does not.
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn expiring_uses_the_view_and_leaves_exempt_roles_out() {
+    let url = db_url!();
+    let mut conn = admin().await;
+    let profile = "pgpp_t_xv_p";
+    let roles = ["pgpp_t_xv_soon", "pgpp_t_xv_locked", "pgpp_t_xv_exempt"];
+    for role in roles {
+        fresh_login_role(&mut conn, role).await;
+    }
+    exec_lenient(
+        &mut conn,
+        &format!("SELECT pass_policy.drop_profile('{profile}')"),
+    )
+    .await;
+    run_ok(
+        &url,
+        &[
+            "profile",
+            "create",
+            profile,
+            "--set",
+            "max_age=30 days",
+            "--set",
+            "warn_before=1 day",
+        ],
+    );
+    for role in roles {
+        run_ok(&url, &["profile", "assign", role, profile]);
+        run_ok(&url, &["rotate", role, "--exec", "cat >/dev/null"]);
+    }
+    let names = |args: &[&str]| -> Vec<(String, String, String)> {
+        run_json(&url, args)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["role_name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("pgpp_t_xv_"))
+            })
+            .map(|r| {
+                (
+                    r["role_name"].as_str().unwrap().to_string(),
+                    r["status"].as_str().unwrap_or("").to_string(),
+                    r["expiry_state"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    };
+    let exempt: bool = sqlx::query_scalar("SELECT pass_policy._is_exempt('pgpp_t_xv_exempt')")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    if !exempt {
+        eprintln!(
+            "note: pgpp_t_xv_exempt is not in pg_pass_policy.exempt_roles, \
+             the exempt part of this test is skipped"
+        );
+    }
+
+    // nothing about to expire yet (30 days left, warning 1 day before)
+    assert_eq!(names(&["expiring"]), []);
+    // --within: the roles expiring before the delay, exempt ones left out
+    let mut expected = vec![
+        (
+            "pgpp_t_xv_locked".to_string(),
+            "ok".to_string(),
+            "ok".to_string(),
+        ),
+        (
+            "pgpp_t_xv_soon".to_string(),
+            "ok".to_string(),
+            "ok".to_string(),
+        ),
+    ];
+    if !exempt {
+        expected.insert(
+            0,
+            (
+                "pgpp_t_xv_exempt".to_string(),
+                "ok".to_string(),
+                "ok".to_string(),
+            ),
+        );
+    }
+    let mut within = names(&["expiring", "--within", "31d"]);
+    within.sort();
+    assert_eq!(within, expected);
+    assert_eq!(names(&["expiring", "--within", "29d"]), []);
+
+    // expired then locked: listed by the view, status locked
+    run_ok(&url, &["expire", "pgpp_t_xv_locked"]);
+    run_ok(&url, &["lock", "pgpp_t_xv_locked", "--for", "1h"]);
+    let listed = names(&["expiring"]);
+    assert_eq!(
+        listed,
+        [(
+            "pgpp_t_xv_locked".to_string(),
+            "locked".to_string(),
+            "expired".to_string()
+        )]
+    );
+    let status = run_json(&url, &["status", "--role", "pgpp_t_xv_locked"]);
+    assert_eq!(status[0]["expiry_state"], "expired", "{status}");
+
+    if exempt {
+        // expire_password() refuses an exempt role: it never shows up
+        let out = run(&url, &["expire", "pgpp_t_xv_exempt"]);
+        assert_eq!(out.status.code(), Some(1));
+        let st = run_json(&url, &["status", "--role", "pgpp_t_xv_exempt"]);
+        assert_eq!(st[0]["status"], "exempt", "{st}");
+        assert_eq!(st[0]["expiry_state"], "ok", "{st}");
+        for args in [&["expiring"][..], &["expiring", "--within", "365d"]] {
+            assert!(
+                !names(args).iter().any(|r| r.0 == "pgpp_t_xv_exempt"),
+                "{args:?}"
+            );
+        }
+    }
+
+    run_ok(&url, &["unlock", "pgpp_t_xv_locked"]);
+    for role in roles {
+        run_ok(&url, &["profile", "unassign", role]);
+    }
+    run_ok(&url, &["profile", "drop", profile]);
+    for role in roles {
+        exec_lenient(&mut conn, &format!("DROP ROLE IF EXISTS {role}")).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
 async fn audit_filters() {

@@ -175,9 +175,9 @@ pub enum Command {
         role: Option<String>,
     },
 
-    /// Roles in warning / grace / expired state, or expiring within a delay
+    /// Roles of the view v_expiring (expiry state warning / grace / expired, exempt roles left out), or expiring within a delay
     Expiring {
-        /// Also list roles whose password expires within this delay (e.g. 14d, 12h, 30m)
+        /// Also list the roles not exempt whose password expires within this delay (e.g. 14d, 12h, 30m)
         #[arg(long, value_name = "DELAY", value_parser = duration_arg)]
         within: Option<Duration>,
     },

@@ -22,15 +22,18 @@ use crate::output::{
     is_broken_pipe, map_stdout_error, print_message, print_record, write_line, Format, ResultSet,
 };
 use crate::secret::{check_shell, run_exec, Interrupt, Secret, SigintGuard};
-use crate::vault::{self, build_payload, write_secret, VaultConfig, VaultTarget};
+use crate::vault::{self, build_payload, write_secret_tracked, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
 
 /// Columns of `v_role_status`, read through the alias `v`.  The ORDER BY
 /// clauses must name `v.<column>`: an unqualified `expires_at` would resolve
 /// to the output column `expires_at::text` and sort as text.
+/// `expiry_state` is the state of the password alone (`status` shows
+/// `locked` or `exempt` first): a locked role listed by `expiring` says
+/// there why it is.
 const STATUS_COLUMNS: &str = "v.role_name, v.profile, v.password_changed_at::text, \
      v.expires_at::text, v.grace_until::text, v.days_left, v.locked_until::text, \
-     v.failed_count, v.status";
+     v.failed_count, v.status, v.expiry_state";
 
 pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) -> Result<()> {
     let sql = format!(
@@ -46,23 +49,36 @@ pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) ->
     ResultSet::from_rows(&rows)?.print(fmt, "no login role")
 }
 
+/// Rows of the view `v_expiring` (expiry state warning, grace or expired,
+/// exempt roles left out: the selection is the one of the extension, not a
+/// copy of it).  With `within`, also the roles not exempt whose password
+/// expires before `now() + within`.
 pub async fn expiring(
     conn: &mut PgConnection,
     within: Option<Duration>,
     fmt: Format,
 ) -> Result<()> {
-    let sql = format!(
-        "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
-         WHERE v.status <> 'exempt' \
-           AND (v.status IN ('warning', 'grace', 'expired') \
-                OR ($1::interval IS NOT NULL AND v.expires_at IS NOT NULL \
-                    AND v.expires_at <= now() + $1)) \
-         ORDER BY v.expires_at NULLS LAST, v.role_name"
-    );
-    let rows = sqlx::query(&sql)
-        .bind(within.map(to_pg_interval).transpose()?)
-        .fetch_all(conn)
-        .await?;
+    let rows = match within {
+        None => {
+            let sql = format!(
+                "SELECT {STATUS_COLUMNS} FROM pass_policy.v_expiring v \
+                 ORDER BY v.expires_at NULLS LAST, v.role_name"
+            );
+            sqlx::query(&sql).fetch_all(conn).await?
+        }
+        Some(within) => {
+            let sql = format!(
+                "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
+                 WHERE v.role_oid IN (SELECT x.role_oid FROM pass_policy.v_expiring x) \
+                    OR (NOT v.is_exempt AND v.expires_at <= now() + $1::interval) \
+                 ORDER BY v.expires_at NULLS LAST, v.role_name"
+            );
+            sqlx::query(&sql)
+                .bind(to_pg_interval(within)?)
+                .fetch_all(conn)
+                .await?
+        }
+    };
     ResultSet::from_rows(&rows)?.print(fmt, "no expiring role")
 }
 
@@ -406,14 +422,20 @@ struct VaultFailure {
     unknown: bool,
 }
 
-/// Writes the secret to Vault, the failure otherwise.  A Ctrl-C received
-/// before the request is polled for the first time means the request was
-/// never sent (« not attempted »); one received while it runs abandons it,
-/// and the secret may or may not have been written, as after an error
-/// raised once the request was sent (no answer within the timeout,
-/// connection lost while waiting for it: [`vault::may_have_been_received`]).
-/// An error before the request was sent (DNS, connection refused) or an
-/// answer of Vault (HTTP status) means nothing was written.
+/// Writes the secret to Vault, the failure otherwise.  Whether the secret
+/// may have been written rests on the body of the request: until the HTTP
+/// client starts to send it ([`vault::write_secret_tracked`]), Vault has at
+/// most an incomplete request and writes nothing.  A Ctrl-C received
+/// before that (resolution, connection, TLS handshake, or before the
+/// request was even polled) means « not sent »; one received afterwards
+/// abandons the request, and the secret may or may not have been written,
+/// as after an error raised once the body was sent (no answer within the
+/// timeout, connection lost while waiting for it:
+/// [`vault::may_have_been_received`]).  An error before the body was sent
+/// (DNS, connection refused or timed out) or an answer of Vault (HTTP
+/// status) means nothing was written.  Once the body is handed to the
+/// connection, pgpp cannot tell whether its bytes reached Vault: the
+/// message stays « may or may not ».
 async fn vault_delivery(
     cfg: &VaultConfig,
     target: &VaultTarget,
@@ -423,12 +445,9 @@ async fn vault_delivery(
 ) -> std::result::Result<(), VaultFailure> {
     let rotated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut payload = build_payload(role, password, &rotated_at);
-    let started = std::cell::Cell::new(false);
+    let body_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = {
-        let write = async {
-            started.set(true);
-            write_secret(cfg, target, &payload).await
-        };
+        let write = write_secret_tracked(cfg, target, &payload, body_sent.clone());
         // biased: a Ctrl-C already received wins before the request starts
         tokio::select! {
             biased;
@@ -441,9 +460,10 @@ async fn vault_delivery(
         s.zeroize();
     }
     let unknown = "the secret may or may not have been written";
+    let sent = body_sent.load(std::sync::atomic::Ordering::SeqCst);
     match result {
         Some(Ok(())) => Ok(()),
-        Some(Err(e)) if vault::may_have_been_received(&e) => Err(VaultFailure {
+        Some(Err(e)) if sent && vault::may_have_been_received(&e) => Err(VaultFailure {
             message: format!("Vault delivery failed: {e:#}; {unknown}"),
             unknown: true,
         }),
@@ -451,7 +471,7 @@ async fn vault_delivery(
             message: format!("Vault delivery failed: {e:#}"),
             unknown: false,
         }),
-        None if !started.get() => Err(VaultFailure {
+        None if !sent => Err(VaultFailure {
             message: "Vault delivery not attempted: interrupted (Ctrl-C)".to_string(),
             unknown: false,
         }),
@@ -988,6 +1008,12 @@ fn read_password() -> Result<Secret> {
             bail!("interrupted (Ctrl-C)");
         }
         let pw = read.context("cannot read the password")?;
+        // Known limit: rpassword reads the terminal up to Enter without any
+        // bound and returns the whole line, so the limit is only checked
+        // here, once the line is in memory (its buffer, wiped when dropped,
+        // grows by reallocations whose copies are not wiped).  Bounding the
+        // read would need a terminal reader of pgpp's own; a pipe or a file
+        // is bounded by `read_first_line*`.
         if pw.len() > MAX_CANDIDATE_BYTES {
             return Err(too_long().into());
         }
@@ -1555,6 +1581,83 @@ mod tests {
         assert_eq!(
             m,
             format!("password rotated but 1 delivery error(s) occurred; {check}")
+        );
+    }
+
+    /// Loopback address whose connections hang: a listener that never
+    /// accepts, its accept queue filled by connections kept open, so that
+    /// the kernel drops the next SYN (the client keeps waiting for the
+    /// handshake).  The returned values must stay alive during the test.
+    fn hanging_connect_addr() -> (std::net::TcpListener, Vec<std::net::TcpStream>, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut fillers = Vec::new();
+        for _ in 0..4096 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                Ok(s) => fillers.push(s),
+                Err(_) => return (listener, fillers, format!("http://{addr}")),
+            }
+        }
+        panic!("the accept queue of the test listener never filled up");
+    }
+
+    /// A connection that does not succeed in time fails as a connection
+    /// error (connect timeout shorter than the request timeout), so that
+    /// it is not mistaken for a request Vault may have received.
+    #[tokio::test]
+    async fn a_connection_timeout_is_not_a_request_vault_may_have_received() {
+        let (_listener, _fillers, addr) = hanging_connect_addr();
+        let target = VaultTarget::parse("secret/db/app", None).unwrap();
+        let cfg = VaultConfig::new(&addr, "t", None)
+            .unwrap()
+            .with_timeout(Duration::from_millis(1200));
+        let started = std::time::Instant::now();
+        let err = vault::write_secret(&cfg, &target, &build_payload("app", "pw", "now"))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(1100), "{err:#}");
+        let reqwest_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<reqwest::Error>())
+            .expect("a reqwest error");
+        assert!(reqwest_err.is_connect(), "{err:#}");
+        assert!(!vault::may_have_been_received(&err), "{err:#}");
+
+        let password = Zeroizing::new("pw".to_string());
+        let failure = vault_delivery(&cfg, &target, "app", &password, &mut Interrupt::never())
+            .await
+            .unwrap_err();
+        assert!(!failure.unknown, "{failure:?}");
+        assert!(!failure.message.contains("may or may not"), "{failure:?}");
+    }
+
+    /// A Ctrl-C received while the connection is still being established
+    /// (the request was polled, its body not sent) means nothing reached
+    /// Vault: « not attempted », not « may or may not have been written ».
+    #[tokio::test]
+    async fn a_ctrl_c_before_the_body_is_sent_means_not_attempted() {
+        let (_listener, _fillers, addr) = hanging_connect_addr();
+        let target = VaultTarget::parse("secret/db/app", None).unwrap();
+        let cfg = VaultConfig::new(&addr, "t", None).unwrap();
+        let mut interrupt = Interrupt::on(tokio::signal::unix::SignalKind::user_defined2());
+        let password = Zeroizing::new("pw".to_string());
+        let raise = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // SAFETY: plain system call; SIGUSR2 is caught by the listener above.
+            unsafe {
+                libc::raise(libc::SIGUSR2);
+            }
+        };
+        let (failure, ()) = tokio::join!(
+            vault_delivery(&cfg, &target, "app", &password, &mut interrupt),
+            raise
+        );
+        assert_eq!(
+            failure.unwrap_err(),
+            VaultFailure {
+                message: "Vault delivery not attempted: interrupted (Ctrl-C)".to_string(),
+                unknown: false,
+            }
         );
     }
 
