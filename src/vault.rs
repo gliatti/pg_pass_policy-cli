@@ -152,6 +152,10 @@ pub struct VaultConfig {
     /// Longest duration of a request, connection and response included
     /// ([`REQUEST_TIMEOUT`] unless given to [`VaultConfig::with_timeout`]).
     timeout: Duration,
+    /// Set by the preflight when it accepted the token on `update` alone
+    /// because the secret existed ([`check_update_only`]); only the wording
+    /// of a 403 on the write depends on it.
+    update_only: Arc<AtomicBool>,
 }
 
 /// Default longest duration of a Vault request.
@@ -214,6 +218,7 @@ impl VaultConfig {
             namespace,
             client: build_client(root_certs, &pinned, direct, connect_timeout_for(timeout))?,
             timeout,
+            update_only: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -394,12 +399,13 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
 }
 
 /// True when `VAULT_ADDR` designates this host: a literal loopback address
-/// (`http://` or `https://`), or `http://localhost` pinned to its checked
-/// loopback addresses.  `https://localhost` is not resolved by
-/// `check_addr_pinned` and follows the proxy settings like a remote name
-/// (list it in `NO_PROXY`).
+/// (`http://` or `https://`), `http://localhost` pinned to its checked
+/// loopback addresses, or `https://localhost` (not resolved by
+/// `check_addr_pinned`: TLS verifies the certificate, but a proxy would
+/// resolve `localhost` on its own side, so it is reached directly too).
 fn is_loopback_target(url: &Url, pinned: &Pinned) -> bool {
-    pinned.is_some() || literal_loopback(url.host_str().unwrap_or(""))
+    let host = url.host_str().unwrap_or("");
+    pinned.is_some() || host == "localhost" || literal_loopback(host)
 }
 
 /// True for a literal loopback address as `url` prints it (`127.0.0.1`,
@@ -612,12 +618,19 @@ fn cannot_write_message(path: &str, caps: &[String], why: &str) -> String {
 /// discarded, never parsed.  An answer other than 200 or 404, or a
 /// failed request, cannot tell whether the secret exists: the token is
 /// then refused as without `create`.
+///
+/// This is a check-then-act: the secret may be deleted (metadata included)
+/// between this check and the write after the rotation, which then needs
+/// `create` and is refused with 403.  The write reports that case as such
+/// ([`Call::WriteUpdateOnly`]); nothing else is changed (the rotation is
+/// already done by then).
 async fn check_update_only(cfg: &VaultConfig, target: &VaultTarget, caps: &[String]) -> Result<()> {
     let path = target.api_path();
     let url = target.metadata_url(&cfg.addr);
     let why = match cfg.request(reqwest::Method::GET, url.clone()).send().await {
         Ok(resp) if resp.status() == StatusCode::OK => {
             drain(resp).await;
+            cfg.update_only.store(true, Ordering::Relaxed);
             return Ok(());
         }
         Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
@@ -666,7 +679,15 @@ enum Call {
     Preflight,
     /// Write of the secret, after the rotation.
     Write,
+    /// Write of the secret after a preflight that accepted `update` alone
+    /// ([`check_update_only`]): a 403 then most likely means that the secret
+    /// was deleted since.
+    WriteUpdateOnly,
 }
+
+/// Explanation added to a 403 on [`Call::WriteUpdateOnly`].
+pub const METADATA_DISAPPEARED: &str = "secret metadata disappeared: the token needs create \
+     (the preflight accepted update alone because the secret existed; it was deleted since)";
 
 /// Sends a request and returns the response when its status is 2xx.  A
 /// network error, a redirect (never followed) or any other status is an
@@ -680,7 +701,7 @@ async fn send_checked(
 ) -> Result<reqwest::Response> {
     let request = match call {
         Call::Preflight => "Vault preflight request",
-        Call::Write => "Vault request",
+        Call::Write | Call::WriteUpdateOnly => "Vault request",
     };
     let resp = req
         .send()
@@ -695,7 +716,12 @@ async fn send_checked(
     }
     let body = error_body(resp).await;
     match call {
-        Call::Write => bail!("Vault refused the write to {url}: HTTP {status}{body}"),
+        Call::WriteUpdateOnly if status == StatusCode::FORBIDDEN => {
+            bail!("Vault refused the write to {url}: HTTP {status}{body}: {METADATA_DISAPPEARED}")
+        }
+        Call::Write | Call::WriteUpdateOnly => {
+            bail!("Vault refused the write to {url}: HTTP {status}{body}")
+        }
         Call::Preflight if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
             bail!(
                 "Vault refused VAULT_TOKEN at {url}: HTTP {status}{body} (expired, revoked or \
@@ -787,7 +813,12 @@ pub async fn write_secret_tracked(
         .request(reqwest::Method::POST, url.clone())
         .header(CONTENT_TYPE, "application/json")
         .body(reqwest::Body::wrap(body));
-    send_checked(req, &url, Call::Write).await?;
+    let call = if cfg.update_only.load(Ordering::Relaxed) {
+        Call::WriteUpdateOnly
+    } else {
+        Call::Write
+    };
+    send_checked(req, &url, call).await?;
     Ok(())
 }
 
@@ -1120,15 +1151,17 @@ mod tests {
             "http://[::1]:8200",
             "https://[::1]:8200/vault",
             "http://localhost:8200",
+            "https://localhost:8200",
+            "https://LocalHost:8200/vault",
         ] {
             let (url, pinned) = check_addr_pinned(addr).unwrap();
             assert!(is_loopback_target(&url, &pinned), "{addr}");
         }
-        // remote or not pinned: the system proxy settings apply
+        // remote: the system proxy settings apply
         for addr in [
             "https://vault.example.net:8200",
             "https://10.0.0.5:8200",
-            "https://localhost:8200",
+            "https://localhost.example.net:8200",
             "https://[::ffff:127.0.0.1]:8200",
         ] {
             let (url, pinned) = check_addr_pinned(addr).unwrap();

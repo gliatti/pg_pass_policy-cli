@@ -102,9 +102,9 @@ pgpp worker-status               # pid, dernier passage et rechargement du worke
 filtre : un rôle verrouillé dont le mot de passe expire y figure (avec
 `status = locked`), un rôle exempté (`pg_pass_policy.exempt_roles`) jamais,
 pas plus qu'avec `--within`. Avec `--within`, `pgpp` envoie une seule
-requête : l'union (`UNION`) des lignes de `v_expiring` et des rôles non
-exemptés qui expirent avant `now() + durée` ; un rôle présent des deux côtés
-n'apparaît qu'une fois.
+requête, un seul parcours de `v_role_status` : les rôles présents dans
+`v_expiring` ou non exemptés et dont le mot de passe expire avant
+`now() + durée`. Chaque rôle n'apparaît qu'une fois.
 
 Version de l'extension : `status` et `expiring` demandent une version de
 `pg_pass_policy` dont `v_role_status` a les colonnes `expiry_state` et
@@ -113,7 +113,12 @@ ancienne, le serveur répond par une colonne ou une relation inconnue
 (SQLSTATE `42703` ou `42P01`) : `pgpp` affiche alors `this pgpp requires a
 newer pg_pass_policy (reinstall the extension)` suivi du message du serveur.
 Il suffit de réinstaller l'extension livrée avec ce dépôt (voir le README
-de l'extension à la racine du dépôt).
+de l'extension à la racine du dépôt). Quand la relation inconnue est une
+relation du schéma `pass_policy`, `pgpp` consulte `pg_extension` : si
+l'extension n'est pas installée dans la base, le message devient
+`pg_pass_policy is not installed in this database`. Ce traitement vaut pour
+toutes les lectures des vues et tables de l'extension (`status`,
+`expiring`, `locked`, `audit`, `profile list`, `profile show`).
 
 `worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
 les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
@@ -566,8 +571,8 @@ couvert, le contournement reste `--exec` avec le client officiel :
 `--exec 'read -r pw; printf "%s" "$pw" | vault kv put -mount=secret db/app password=-'`.
 
 Mandataire HTTP (proxy) : vers une adresse de boucle locale (adresse IP
-littérale `127.0.0.0/8` ou `[::1]`, en `http://` comme en `https://`, ou
-`http://localhost` épinglé comme décrit ci-dessus), le client se connecte
+littérale `127.0.0.0/8` ou `[::1]`, en `http://` comme en `https://`,
+`http://localhost` épinglé comme décrit ci-dessus, ou `https://localhost`), le client se connecte
 toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
 un mandataire résoudrait `localhost` de son côté et verrait passer le jeton
 (et, en `http://`, le mot de passe) en clair. Vers une adresse distante, les
@@ -575,8 +580,8 @@ réglages de mandataire du système s'appliquent (`HTTPS_PROXY`, `NO_PROXY`
 compris), comme avec le client officiel : le mandataire relaie alors un
 tunnel TLS (`CONNECT`) dont le certificat reste vérifié pour l'hôte de
 `VAULT_ADDR`, il voit l'hôte et le port contactés mais pas le contenu.
-`https://localhost` n'est pas résolu par `pgpp` et suit lui aussi ces
-réglages : l'ajouter à `NO_PROXY` si un mandataire est configuré.
+`https://localhost` n'est pas résolu par `pgpp` (TLS vérifie le
+certificat), mais il est lui aussi joint directement, sans mandataire.
 
 Les redirections HTTP ne sont jamais suivies : une réponse 301/302/307/308
 est une erreur (code 1). Suivre une redirection rejouerait le jeton et le mot
@@ -620,7 +625,12 @@ HTTP que pour l'écriture (redirections refusées) :
    réponse (403 quand le jeton n'a pas `read` sur le chemin des
    métadonnées, erreur réseau, redirection) ne permet pas de conclure : la
    règle stricte s'applique et `create` et `update` sont exigés (code 1).
-   Le corps des métadonnées est lu puis ignoré, jamais analysé.
+   Le corps des métadonnées est lu puis ignoré, jamais analysé. Cette
+   vérification précède l'action sans la garantir : si le secret est
+   supprimé (métadonnées comprises) entre le préflight et l'écriture, celle-ci
+   demande `create` et Vault la refuse par un 403, après la rotation. Le
+   message d'erreur le signale alors par `secret metadata disappeared: the
+   token needs create`.
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme

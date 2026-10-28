@@ -4,7 +4,9 @@
 
 use httpmock::prelude::*;
 use httpmock::{Mock, MockServer};
-use pgpp::vault::{build_payload, preflight, write_secret, VaultConfig, VaultTarget};
+use pgpp::vault::{
+    build_payload, preflight, write_secret, VaultConfig, VaultTarget, METADATA_DISAPPEARED,
+};
 use serde_json::{json, Value};
 
 fn no_namespace_header(req: &HttpMockRequest) -> bool {
@@ -616,10 +618,15 @@ async fn preflight_reads_the_metadata_only_when_needed() {
     }
 }
 
+/// Environment variable that marks the child process of
+/// [`a_loopback_address_bypasses_the_proxy_of_the_environment`].
+const PROXY_CHILD: &str = "PGPP_TEST_PROXY_CHILD";
+
 /// A loopback VAULT_ADDR never goes through the proxy of the environment:
 /// the proxy would resolve `localhost` on its own side and see the token.
-/// The proxy variables are changed for the whole test binary, which only
-/// builds loopback clients (the ones this test is about).
+/// The proxy variables are set for a child process (this test binary,
+/// running [`loopback_writes_with_a_proxy_in_the_environment`] alone), never
+/// in this process: the other tests are left untouched.
 #[tokio::test]
 async fn a_loopback_address_bypasses_the_proxy_of_the_environment() {
     let proxy = MockServer::start_async().await;
@@ -629,11 +636,52 @@ async fn a_loopback_address_bypasses_the_proxy_of_the_environment() {
             then.status(502);
         })
         .await;
-    for var in ["NO_PROXY", "no_proxy"] {
-        std::env::remove_var(var);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "loopback_writes_with_a_proxy_in_the_environment",
+            "--include-ignored",
+            "--test-threads=1",
+        ])
+        .env(PROXY_CHILD, "1")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+    ] {
+        child.env(var, proxy.base_url());
     }
-    for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY"] {
-        std::env::set_var(var, proxy.base_url());
+    let out = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .unwrap()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child test did not run: {stdout}"
+    );
+    assert_eq!(relayed.hits_async().await, 0, "the proxy must not be used");
+}
+
+/// Body of [`a_loopback_address_bypasses_the_proxy_of_the_environment`],
+/// in the child process that has the proxy variables (does nothing
+/// elsewhere).  `https://localhost` points at the plain HTTP mock: the TLS
+/// handshake fails, directly (through the proxy, it would reach it).
+#[tokio::test]
+#[ignore = "run in a child process by a_loopback_address_bypasses_the_proxy_of_the_environment"]
+async fn loopback_writes_with_a_proxy_in_the_environment() {
+    if std::env::var_os(PROXY_CHILD).is_none() {
+        return;
     }
     let server = MockServer::start_async().await;
     let write = server
@@ -652,5 +700,44 @@ async fn a_loopback_address_bypasses_the_proxy_of_the_environment() {
             .unwrap_or_else(|e| panic!("{addr}: {e:#}"));
     }
     write.assert_hits_async(2).await;
-    assert_eq!(relayed.hits_async().await, 0, "the proxy must not be used");
+    let addr = format!("https://localhost:{}", server.port());
+    let cfg = VaultConfig::new(&addr, "tok", None).unwrap();
+    let err = write_secret(&cfg, &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
+    assert!(!format!("{err:#}").contains("502"), "{addr}: {err:#}");
+}
+
+/// The secret found by the preflight of an `update`-only token may be
+/// deleted before the write (check-then-act): the 403 of the write then
+/// says why.
+#[tokio::test]
+async fn a_write_refused_after_an_update_only_preflight_says_why() {
+    let server = MockServer::start_async().await;
+    preflight_mocks(&server, 200, 200, json!({"capabilities": ["update"]})).await;
+    metadata_mock(&server, 200).await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/secret/data/db/app");
+            then.status(403)
+                .json_body(json!({"errors": ["permission denied"]}));
+        })
+        .await;
+    let checked = cfg(&server);
+    preflight(&checked, &target()).await.unwrap();
+    let err = write_secret(&checked, &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
+    let m = format!("{err:#}");
+    assert!(m.contains("HTTP 403"), "{m}");
+    assert!(m.contains(METADATA_DISAPPEARED), "{m}");
+
+    // without that preflight (new configuration), a 403 is reported as it is
+    let err = write_secret(&cfg(&server), &target(), &build_payload("app", "x", "now"))
+        .await
+        .unwrap_err();
+    assert!(
+        !format!("{err:#}").contains(METADATA_DISAPPEARED),
+        "{err:#}"
+    );
 }
