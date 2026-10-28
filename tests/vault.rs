@@ -498,6 +498,12 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
             .any(|e| e.kind() == std::io::ErrorKind::ConnectionRefused),
         "{err:#}"
     );
+    // the rendered message the README quotes (Linux wording)
+    #[cfg(target_os = "linux")]
+    assert!(
+        pgpp::format_error(&err).contains("Connection refused"),
+        "{err:#}"
+    );
     drop((reserved, listener));
 }
 
