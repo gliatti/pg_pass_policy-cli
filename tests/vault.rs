@@ -8,10 +8,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use pgpp::vault::{
-    build_payload, preflight, write_secret, write_secret_tracked, VaultConfig, VaultTarget,
-    METADATA_DISAPPEARED, REFUSED_SINCE_PREFLIGHT,
+    build_payload, explain_refusal, preflight, send_write, write_secret, write_secret_tracked,
+    VaultConfig, VaultTarget, METADATA_DISAPPEARED, REFUSED_SINCE_PREFLIGHT,
 };
+use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 fn no_namespace_header(req: &HttpMockRequest) -> bool {
     match &req.headers {
@@ -774,7 +776,13 @@ async fn a_write_refused_after_an_update_only_preflight_says_why() {
         meta.assert_async().await;
         assert!(m.contains("HTTP 403"), "{status}: {m}");
         assert!(m.contains(REFUSED_SINCE_PREFLIGHT), "{status}: {m}");
-        assert!(m.contains(&format!("HTTP {status}")), "{status}: {m}");
+        // the status quoted is the one of the new read, not of the write
+        let reread = format!(
+            "{REFUSED_SINCE_PREFLIGHT} ({}/v1/secret/metadata/db/app answered HTTP {})",
+            server.base_url(),
+            StatusCode::from_u16(status).unwrap()
+        );
+        assert!(m.ends_with(&reread), "{status}: {m}");
         assert!(!m.contains(METADATA_DISAPPEARED), "{status}: {m}");
         assert!(!m.contains("good-token"), "{m}");
     }
@@ -796,4 +804,96 @@ async fn a_write_refused_after_an_update_only_preflight_says_why() {
         !format!("{err:#}").contains(METADATA_DISAPPEARED),
         "{err:#}"
     );
+}
+
+/// The 403 of the write is a refusal as soon as Vault answers it: a new
+/// read of the metadata that does not end (slow Vault) is abandoned at the
+/// timeout, or at once on Ctrl-C (`cancel`), and the result is the
+/// cautious refusal without detail, never a write that may have happened.
+#[tokio::test]
+async fn a_slow_reread_after_a_refused_write_stays_a_refusal() {
+    let server = MockServer::start_async().await;
+    refused_write(&server).await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/secret/metadata/db/app");
+            then.status(404).delay(Duration::from_secs(20));
+        })
+        .await;
+    let refused = || async {
+        let e = send_write(
+            &cfg(&server),
+            &target(),
+            &build_payload("app", "x", "now"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("HTTP 403"), "{e:#}");
+        e
+    };
+    let expected = |e: &anyhow::Error| format!("{e:#}: {REFUSED_SINCE_PREFLIGHT}");
+
+    // timeout of the new read
+    let e = refused().await;
+    let want = expected(&e);
+    let started = Instant::now();
+    let err = explain_refusal(
+        &cfg(&server),
+        &target(),
+        e,
+        true,
+        Duration::from_millis(300),
+        std::future::pending(),
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(5), "{err:#}");
+    assert_eq!(format!("{err:#}"), want);
+    assert!(!pgpp::vault::may_have_been_received(&err), "{err:#}");
+
+    // Ctrl-C during the new read
+    let e = refused().await;
+    let want = expected(&e);
+    let started = Instant::now();
+    let err = explain_refusal(
+        &cfg(&server),
+        &target(),
+        e,
+        true,
+        Duration::from_secs(60),
+        tokio::time::sleep(Duration::from_millis(300)),
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(5), "{err:#}");
+    assert_eq!(format!("{err:#}"), want);
+    assert!(
+        !format!("{err:#}").contains(METADATA_DISAPPEARED),
+        "{err:#}"
+    );
+    assert!(!pgpp::vault::may_have_been_received(&err), "{err:#}");
+
+    // a Ctrl-C already received: no new read at all
+    let server = MockServer::start_async().await;
+    refused_write(&server).await;
+    let meta = metadata_mock(&server, 404).await;
+    let e = send_write(
+        &cfg(&server),
+        &target(),
+        &build_payload("app", "x", "now"),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap_err();
+    let want = expected(&e);
+    let err = explain_refusal(
+        &cfg(&server),
+        &target(),
+        e,
+        true,
+        Duration::from_secs(60),
+        std::future::ready(()),
+    )
+    .await;
+    assert_eq!(format!("{err:#}"), want);
+    assert_eq!(meta.hits_async().await, 0);
 }

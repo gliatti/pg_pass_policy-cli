@@ -101,12 +101,13 @@ pgpp worker-status               # pid, dernier passage et rechargement du worke
 `exempt`. `expiring` lit la vue `v_expiring` de l'extension : un rôle
 verrouillé dont le mot de passe expire y figure (avec `status = locked`), un
 rôle exempté (`pg_pass_policy.exempt_roles`) jamais, pas plus qu'avec
-`--within`. Avec `--within`, `pgpp` envoie une seule requête, un seul
-parcours de `v_role_status` : les rôles non exemptés dont `expiry_state` vaut
-`warning`, `grace` ou `expired` (le filtre de `v_expiring`, reproduit sur
-les colonnes de `v_role_status` dont la vue n'est qu'une sélection) ou dont
-le mot de passe expire avant `now() + durée`. Chaque rôle n'apparaît qu'une
-fois.
+`--within`. Avec `--within`, `pgpp` envoie une seule requête : les rôles
+de `v_expiring`, lus dans la vue (son filtre n'est pas recopié dans `pgpp`),
+ou les rôles non exemptés dont le mot de passe expire avant
+`now() + durée`. Ces derniers ne figurent pas tous dans `v_expiring`
+(un rôle qui n'est pas encore en `warning` n'y est pas) : la requête lit donc
+`v_role_status` et évalue `v_expiring` en sous-requête, soit deux passages
+sur la vue. Chaque rôle n'apparaît qu'une fois.
 
 Version de l'extension : `status` et `expiring` demandent une version de
 `pg_pass_policy` dont `v_role_status` a les colonnes `expiry_state` et
@@ -118,16 +119,21 @@ comme écriture : `status`, `expiring`, `locked`, `audit`, `profile`,
 traitement d'erreur : sur un schéma, une relation, une colonne ou une
 fonction inconnus (SQLSTATE `3F000`, `42P01`, `42703`, `42883`), `pgpp`
 consulte `pg_extension`, sans analyser le texte du message (traduit selon
-`lc_messages`). Si l'extension est installée, il affiche `this pgpp
-requires a newer pg_pass_policy (reinstall the extension)` suivi du message
-du serveur : il suffit de réinstaller l'extension livrée avec ce dépôt (voir
-le README de l'extension à la racine du dépôt). Si elle ne l'est pas, le
-message devient `pg_pass_policy is not installed in this database`. Ce
-contrôle est une nouvelle requête, envoyée hors transaction (celle de
-`check` est annulée avant) ; s'il échoue (connexion perdue, par exemple),
-l'erreur d'origine est conservée, précédée de `an object of pg_pass_policy
-is missing; the installation of the extension could not be checked` et de
-la cause.
+`lc_messages`). Si l'extension n'est pas installée, le message devient
+`pg_pass_policy is not installed in this database` suivi du message du
+serveur. Si elle l'est dans une version strictement inférieure à la version
+minimale qu'exige `pgpp` (aujourd'hui `1.0`, comparée composante par
+composante comme des nombres), il affiche `this pgpp requires a newer
+pg_pass_policy (reinstall the extension)` suivi du message du serveur : il
+suffit de réinstaller l'extension livrée avec ce dépôt (voir le README de
+l'extension à la racine du dépôt). Avec une extension à jour, l'objet
+inconnu n'est pas celui de l'extension : l'erreur est affichée telle
+quelle. Ce contrôle est une nouvelle requête, envoyée hors transaction
+(celle de `check` est annulée avant) et bornée à 3 secondes ; s'il échoue
+(connexion perdue, par exemple) ou ne répond pas dans ce délai, l'erreur
+d'origine est conservée, précédée de `an object of pg_pass_policy is
+missing; the installation of the extension could not be checked` et de la
+cause.
 
 `worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
 les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
@@ -568,23 +574,25 @@ par segment, jamais par concaténation de texte.
 
 `VAULT_ADDR` doit être en `https://` ; `http://` n'est accepté que vers un
 hôte de boucle locale, par exemple un agent Vault local : une adresse IP
-littérale (`127.0.0.0/8`, `[::1]`), ou le nom `localhost` à condition que
-toutes les adresses qu'il résout (`/etc/hosts`, DNS) soient de boucle locale.
-Un nom peut en effet être dirigé n'importe où : si `localhost` résout vers
-une autre adresse, la commande est refusée (code 2). Le client HTTP se
-connecte ensuite aux seules adresses vérifiées, sans nouvelle résolution.
-Toute autre adresse en clair (y compris `localhost.` ou
-`[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe y
-circuleraient sans chiffrement. Pour un cas non
+littérale (`127.0.0.0/8`, `[::1]`), ou un nom `localhost` (les mêmes
+qu'en `https://` : `localhost`, `localhost.`, un nom en `.localhost` comme
+`vault.localhost`, avec ou sans point final) à condition que toutes les
+adresses qu'il résout (`/etc/hosts`, DNS) soient de boucle locale.
+Un nom peut en effet être dirigé n'importe où : si ce nom résout vers
+une autre adresse, ou ne résout pas, la commande est refusée (code 2). Le
+client HTTP se connecte ensuite aux seules adresses vérifiées, sans nouvelle
+résolution. Toute autre adresse en clair (y compris `localhost.example.net`
+ou `[::ffff:127.0.0.1]`) est refusée (code 2) : le jeton et le mot de passe
+y circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
 `--exec 'read -r pw; printf "%s" "$pw" | vault kv put -mount=secret db/app password=-'`.
 
 Mandataire HTTP (proxy) : vers une adresse de boucle locale (adresse IP
 littérale `127.0.0.0/8` ou `[::1]`, en `http://` comme en `https://`,
-`http://localhost` épinglé comme décrit ci-dessus, ou en `https://` un nom
-`localhost` : `localhost`, `localhost.` ou un nom en `.localhost` comme
-`vault.localhost`, avec ou sans point final, réservés à la boucle locale par
-la RFC 6761), le client se connecte toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
+ou un nom `localhost` : `localhost`, `localhost.` ou un nom en
+`.localhost` comme `vault.localhost`, avec ou sans point final, réservés à
+la boucle locale par la RFC 6761, épinglé comme décrit ci-dessus en
+`http://`), le client se connecte toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
 un mandataire résoudrait `localhost` de son côté et verrait passer le jeton
 (et, en `http://`, le mot de passe) en clair. Vers une adresse distante, les
 réglages de mandataire du système s'appliquent (`HTTPS_PROXY`, `NO_PROXY`
@@ -648,8 +656,12 @@ HTTP que pour l'écriture (redirections refusées) :
    `secret metadata disappeared: the token needs create`. Toute autre
    réponse donne un message prudent, `permission denied since the
    preflight: the token may have expired or been revoked, or its policy may
-   have changed`, suivi de ce qu'a répondu cette relecture. Dans les deux
-   cas, Vault a répondu à l'écriture : le secret n'a pas été écrit.
+   have changed`, suivi de ce qu'a répondu cette relecture. Dans tous les
+   cas, Vault a répondu à l'écriture : le secret n'a pas été écrit, et ce
+   refus est acquis dès la réponse. La relecture vient après, bornée à
+   5 secondes ; un Ctrl-C ou un Vault qui ne répond pas dans ce délai
+   l'abandonne et donne le même message prudent, sans détail, jamais
+   « may or may not have been written ».
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme
@@ -740,7 +752,7 @@ secours) ou relancer la rotation après correction du jeton.
   enfant hérite en revanche de l'environnement de `pgpp` (voir la section
   `--exec`).
 - Vault n'est joint qu'en TLS vérifié (ou en clair sur la boucle locale
-  uniquement, `localhost` étant résolu et vérifié), avec `VAULT_CACERT` /
+  uniquement, un nom `localhost` étant résolu et vérifié), avec `VAULT_CACERT` /
   `VAULT_CAPATH` pour une autorité privée.
 - Le rôle de connexion doit être membre de `pass_policy_admin` : les
   vérifications de droits sont faites par les fonctions `SECURITY DEFINER`

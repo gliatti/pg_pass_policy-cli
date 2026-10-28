@@ -22,7 +22,7 @@ use crate::output::{
     is_broken_pipe, map_stdout_error, print_message, print_record, write_line, Format, ResultSet,
 };
 use crate::secret::{check_shell, run_exec, Interrupt, Secret, SigintGuard};
-use crate::vault::{self, build_payload, write_secret_tracked, VaultConfig, VaultTarget};
+use crate::vault::{self, build_payload, VaultConfig, VaultTarget};
 use crate::{EXIT_OK, EXIT_REFUSED};
 
 /// Columns of `v_role_status`, read through the alias `v`.  The ORDER BY
@@ -35,9 +35,15 @@ const STATUS_COLUMNS: &str = "v.role_name, v.profile, v.password_changed_at::tex
      v.expires_at::text, v.grace_until::text, v.days_left, v.locked_until::text, \
      v.failed_count, v.status, v.expiry_state";
 
-/// Message added to an error on an unknown object of the extension
-/// (see [`SCHEMA_SQLSTATES`]) when `pg_pass_policy` is installed: the
-/// installed version is older than this pgpp.
+/// Oldest version of `pg_pass_policy` (`extversion` in `pg_extension`)
+/// this pgpp works with.  An error on an unknown object of the extension
+/// ([`SCHEMA_SQLSTATES`]) is put down to an older extension only when the
+/// installed version is strictly lower ([`diagnose`]).
+pub const MIN_EXTENSION_VERSION: &str = "1.0";
+
+/// Message added to an error on an unknown object (see
+/// [`SCHEMA_SQLSTATES`]) when the installed `pg_pass_policy` is older than
+/// [`MIN_EXTENSION_VERSION`].
 pub const NEWER_EXTENSION: &str =
     "this pgpp requires a newer pg_pass_policy (reinstall the extension)";
 
@@ -46,7 +52,7 @@ pub const NEWER_EXTENSION: &str =
 pub const NOT_INSTALLED: &str = "pg_pass_policy is not installed in this database";
 
 /// Message added to the same error when `pg_extension` could not be read
-/// to tell the two cases apart; the error of that check follows.
+/// to tell the cases apart; the error of that check follows.
 pub const UNVERIFIED_INSTALLATION: &str =
     "an object of pg_pass_policy is missing; the installation of the extension could not \
      be checked";
@@ -68,18 +74,22 @@ fn sqlstate(err: &anyhow::Error) -> Option<String> {
 
 /// Single error path of every command ([`crate::run`] calls it on any
 /// error of a command): an error of the server on an unknown object
-/// ([`SCHEMA_SQLSTATES`]) gets [`NEWER_EXTENSION`] or [`NOT_INSTALLED`] in
-/// front, after a look at `pg_extension`.  Any other error is returned as
-/// it is.
+/// ([`SCHEMA_SQLSTATES`]) gets [`NOT_INSTALLED`] in front when
+/// `pg_pass_policy` is absent from `pg_extension`, [`NEWER_EXTENSION`]
+/// when its `extversion` is lower than [`MIN_EXTENSION_VERSION`]
+/// ([`older_than_required`]).  With an extension recent enough (the
+/// unknown object is then not one of the extension, or the error has
+/// another cause), and for any other error, the error is returned as it
+/// is.
 ///
-/// Contract: the check is a new query on `conn`.  The commands run their
+/// Contract: the check is a new query on `conn`, which must be outside any
+/// transaction.  The callers guarantee it: the commands run their
 /// statements outside any transaction except `check`, whose transaction
 /// is rolled back before its error is returned (and a `Transaction`
-/// dropped by `?` queues its ROLLBACK, sent ahead of the next query).  A
-/// transaction still open here (aborted by the error) is rolled back
-/// first, so that the check never runs in an aborted transaction.  When
-/// that rollback or the check fails (connection lost, Ctrl-C during the
-/// command, permission), the original error is kept, with
+/// dropped by `?` queues its ROLLBACK, sent ahead of the next query).
+/// The check is bounded by [`crate::db::CLOSE_TIMEOUT`].  When it fails or
+/// times out (connection lost, Ctrl-C during the command, permission,
+/// unresponsive server), the original error is kept, with
 /// [`UNVERIFIED_INSTALLATION`] and the reason in front: the hint that an
 /// object is missing is not lost.
 pub async fn diagnose(conn: &mut PgConnection, err: anyhow::Error) -> anyhow::Error {
@@ -89,28 +99,49 @@ pub async fn diagnose(conn: &mut PgConnection, err: anyhow::Error) -> anyhow::Er
     if !SCHEMA_SQLSTATES.contains(&code.as_str()) {
         return err;
     }
-    match extension_installed(conn).await {
-        Ok(true) => err.context(NEWER_EXTENSION),
-        Ok(false) => err.context(NOT_INSTALLED),
-        Err(e) => err.context(format!("{UNVERIFIED_INSTALLATION} ({e:#})")),
+    let check = tokio::time::timeout(crate::db::CLOSE_TIMEOUT, extension_version(conn)).await;
+    match check {
+        Ok(Ok(None)) => err.context(NOT_INSTALLED),
+        Ok(Ok(Some(v))) if older_than_required(&v) => err.context(NEWER_EXTENSION),
+        Ok(Ok(Some(_))) => err,
+        Ok(Err(e)) => err.context(format!("{UNVERIFIED_INSTALLATION} ({e:#})")),
+        Err(_) => err.context(format!(
+            "{UNVERIFIED_INSTALLATION} (no answer within {}s)",
+            crate::db::CLOSE_TIMEOUT.as_secs()
+        )),
     }
 }
 
-/// Whether `pg_pass_policy` is in `pg_extension`, after the rollback of a
-/// transaction left open on `conn`.
-async fn extension_installed(conn: &mut PgConnection) -> Result<bool> {
-    if conn.is_in_transaction() {
-        conn.execute("ROLLBACK")
-            .await
-            .context("cannot roll back the failed transaction")?;
-    }
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension \
-          WHERE extname = 'pg_pass_policy')",
+/// `extversion` of `pg_pass_policy` in `pg_extension`, `None` when it is
+/// not installed.  `conn` must be outside any transaction (see
+/// [`diagnose`]).
+async fn extension_version(conn: &mut PgConnection) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT extversion::text FROM pg_catalog.pg_extension \
+          WHERE extname = 'pg_pass_policy'",
     )
-    .fetch_one(conn)
+    .fetch_optional(conn)
     .await
     .context("cannot read pg_extension")
+}
+
+/// True when the version `installed` is strictly lower than
+/// [`MIN_EXTENSION_VERSION`], compared component by component as numbers
+/// (`1.10` is above `1.9`, a missing component counts as 0: `1` equals
+/// `1.0`).  A version that is not made of dot-separated numbers (`1.1dev`)
+/// cannot be compared: it is not called older, and the error stays as it
+/// is.
+fn older_than_required(installed: &str) -> bool {
+    fn parse(v: &str) -> Option<Vec<u64>> {
+        v.trim().split('.').map(|c| c.parse().ok()).collect()
+    }
+    let (Some(mut have), Some(mut need)) = (parse(installed), parse(MIN_EXTENSION_VERSION)) else {
+        return false;
+    };
+    let len = have.len().max(need.len());
+    have.resize(len, 0);
+    need.resize(len, 0);
+    have < need
 }
 
 pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) -> Result<()> {
@@ -129,9 +160,9 @@ pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) ->
 
 /// Rows of the view `v_expiring` (expiry state warning, grace or expired,
 /// exempt roles left out).  With `within`, also the roles not exempt whose
-/// password expires before `now() + within`, in a single scan of
-/// `v_role_status` ([`expiring_within_sql`]): a role found by both
-/// criteria appears once, sorted on the raw timestamp.
+/// password expires before `now() + within`, in a single query
+/// ([`expiring_within_sql`]): a role found by both criteria appears once,
+/// sorted on the raw timestamp.
 pub async fn expiring(
     conn: &mut PgConnection,
     within: Option<Duration>,
@@ -155,21 +186,21 @@ pub async fn expiring(
     ResultSet::from_rows(&rows)?.print(fmt, "no expiring role")
 }
 
-/// `expiring --within`: one scan of `v_role_status`, each role one row.
-/// The filter of `v_expiring` (`expiry_state IN ('warning', 'grace',
-/// 'expired') AND NOT is_exempt`, sql/pg_pass_policy--1.0.sql) is
-/// reproduced here on the columns of `v_role_status`, of which `v_expiring`
-/// is a plain selection, instead of being read through
-/// `IN (SELECT ... FROM v_expiring)`, which would compute the view a second
-/// time.  A change of that filter in the extension must be carried over
-/// here; the integration test checks that every row of `v_expiring` is
-/// listed.
+/// `expiring --within`: the roles of `v_expiring`, read through the view
+/// (its filter is not copied here: a change of that filter in the
+/// extension applies as it is), or not exempt and expiring before
+/// `now() + $1`.  `v_expiring` selects rows of `v_role_status` (it is a
+/// `SELECT *` of it), and the roles expiring before the delay that are not
+/// yet in a warning state are not among its rows: the outer query reads
+/// `v_role_status`, so that each role is one row, and `v_expiring` is
+/// evaluated once more as a subquery (two evaluations of the view, not a
+/// single scan).  The integration test checks that every row of
+/// `v_expiring` is listed.
 fn expiring_within_sql() -> String {
     format!(
         "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
-          WHERE NOT v.is_exempt \
-            AND (v.expiry_state IN ('warning', 'grace', 'expired') \
-                 OR v.expires_at <= now() + $1::interval) \
+          WHERE v.role_oid IN (SELECT e.role_oid FROM pass_policy.v_expiring e) \
+             OR (NOT v.is_exempt AND v.expires_at <= now() + $1::interval) \
           ORDER BY v.expires_at NULLS LAST, v.role_name"
     )
 }
@@ -547,7 +578,7 @@ struct VaultFailure {
 /// [`vault::Preflight::update_only`] of the preflight of this delivery
 /// (false when it was skipped).  Whether the secret
 /// may have been written rests on the body of the request: until the HTTP
-/// client starts to send it ([`vault::write_secret_tracked`]), Vault has at
+/// client starts to send it ([`vault::send_write`]), Vault has at
 /// most an incomplete request and writes nothing.  A Ctrl-C received
 /// before that (resolution, connection, TLS handshake, or before the
 /// request was even polled) means « not sent »; one received afterwards
@@ -558,7 +589,10 @@ struct VaultFailure {
 /// (DNS, connection refused or timed out) or an answer of Vault (HTTP
 /// status) means nothing was written.  Once the body is handed to the
 /// connection, pgpp cannot tell whether its bytes reached Vault: the
-/// message stays « may or may not ».
+/// message stays « may or may not ».  A 403 answered by Vault is a refusal
+/// as soon as it is received: its explanation ([`vault::explain_refusal`])
+/// runs after the race with Ctrl-C, so that neither a Ctrl-C nor a slow
+/// Vault during that new read turns it into « may or may not ».
 async fn vault_delivery(
     cfg: &VaultConfig,
     target: &VaultTarget,
@@ -571,7 +605,7 @@ async fn vault_delivery(
     let mut payload = build_payload(role, password, &rotated_at);
     let body_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = {
-        let write = write_secret_tracked(cfg, target, &payload, update_only, body_sent.clone());
+        let write = vault::send_write(cfg, target, &payload, body_sent.clone());
         // biased: a Ctrl-C already received wins before the request starts
         tokio::select! {
             biased;
@@ -583,6 +617,21 @@ async fn vault_delivery(
     if let Some(Value::String(s)) = payload.pointer_mut("/data/password") {
         s.zeroize();
     }
+    // the answer of Vault is settled: a 403 is a certain refusal, whatever
+    // happens to the new read of the metadata that explains it (bounded,
+    // abandoned on Ctrl-C), out of the race above
+    let result = match result {
+        Some(Err(e)) => Some(Err(vault::explain_refusal(
+            cfg,
+            target,
+            e,
+            update_only,
+            vault::REREAD_TIMEOUT,
+            interrupt.wait(),
+        )
+        .await)),
+        other => other,
+    };
     let unknown = "the secret may or may not have been written";
     let sent = body_sent.load(std::sync::atomic::Ordering::SeqCst);
     match result {
@@ -1618,6 +1667,19 @@ mod tests {
             sqlstate(&anyhow::Error::new(sqlx::Error::RowNotFound).context("outer")),
             None
         );
+        // strictly lower than MIN_EXTENSION_VERSION (1.0) only, numbers
+        // compared component by component
+        assert_eq!(MIN_EXTENSION_VERSION, "1.0");
+        for older in ["0.9", "0.10", "0", "0.99.1", " 0.9 "] {
+            assert!(older_than_required(older), "{older}");
+        }
+        for recent in ["1.0", "1", "1.0.0", "1.1", "1.10", "2.0", "10"] {
+            assert!(!older_than_required(recent), "{recent}");
+        }
+        // not comparable: not called older
+        for odd in ["", "1.0dev", "v1", "1..0", "unknown"] {
+            assert!(!older_than_required(odd), "{odd}");
+        }
         let err = anyhow::anyhow!("column v.expiry_state does not exist").context(NEWER_EXTENSION);
         assert_eq!(
             crate::format_error(&err),
@@ -1631,17 +1693,28 @@ mod tests {
         sqlstate(err).unwrap_or_default()
     }
 
-    /// The same message on real errors of the server, whatever the
-    /// command (read or write): unknown column, view and function of an
-    /// installed extension; a transaction left open is rolled back before
-    /// the check; when the check itself fails, the original error is kept
-    /// with [`UNVERIFIED_INSTALLATION`]; another error is left as it is.
+    /// Real errors of the server on an unknown column, view or function,
+    /// whatever the command (read or write), with the extension installed
+    /// at a version not older than [`MIN_EXTENSION_VERSION`]: the object
+    /// is not one of the extension, nothing is put in front of the error
+    /// (only a version strictly lower asks for a newer extension, see
+    /// [`older_than_required`]); when the check itself fails, the original
+    /// error is kept with [`UNVERIFIED_INSTALLATION`]; another error is
+    /// left as it is.
     #[tokio::test]
     #[ignore = "needs PGPP_TEST_URL"]
-    async fn an_unknown_column_or_view_asks_for_a_newer_extension() {
+    async fn an_unknown_object_with_an_up_to_date_extension_is_left_as_it_is() {
         use sqlx::Connection;
         let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
         let mut conn = PgConnection::connect(&url).await.unwrap();
+        let installed: String = sqlx::query_scalar(
+            "SELECT extversion::text FROM pg_catalog.pg_extension \
+              WHERE extname = 'pg_pass_policy'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(!older_than_required(&installed), "{installed}");
         for (sql, code) in [
             (
                 "SELECT v.pgpp_no_such_column FROM pass_policy.v_role_status v",
@@ -1652,6 +1725,7 @@ mod tests {
                 "SELECT pass_policy.pgpp_no_such_function($1::name)",
                 "42883",
             ),
+            ("SELECT pgpp_no_such_schema.f()", "3F000"),
         ] {
             let e = sqlx::query(sql)
                 .bind("x")
@@ -1660,8 +1734,10 @@ mod tests {
                 .unwrap_err();
             let e = anyhow::Error::new(e).context("outer");
             assert_eq!(code_of(&e), code, "{sql}");
+            let before = crate::format_error(&e);
             let m = crate::format_error(&diagnose(&mut conn, e).await);
-            assert!(m.starts_with(&format!("{NEWER_EXTENSION}: ")), "{sql}: {m}");
+            assert_eq!(m, before, "{sql}");
+            assert!(m.starts_with("outer: "), "{sql}: {m}");
         }
         let e = sqlx::query("SELECT 1/0")
             .fetch_all(&mut conn)
@@ -1669,18 +1745,6 @@ mod tests {
             .unwrap_err();
         let err = diagnose(&mut conn, e.into()).await;
         assert!(!crate::format_error(&err).contains(NEWER_EXTENSION));
-
-        // error inside a transaction still open (aborted): rolled back
-        // before the check
-        let mut tx = conn.begin().await.unwrap();
-        let e = sqlx::query("SELECT * FROM pass_policy.v_pgpp_no_such_view")
-            .fetch_all(&mut *tx)
-            .await
-            .unwrap_err();
-        std::mem::forget(tx);
-        assert!(conn.is_in_transaction());
-        let m = crate::format_error(&diagnose(&mut conn, e.into()).await);
-        assert!(m.starts_with(&format!("{NEWER_EXTENSION}: ")), "{m}");
 
         // `expiring --within` is valid against this extension, lists each
         // role once, every role of `v_expiring` included
@@ -1740,10 +1804,13 @@ mod tests {
         );
     }
 
-    /// A database without the extension, created for the test and dropped
-    /// afterwards (never `template1`): a read of a view, a write call and
-    /// an unknown schema all say that the extension is not installed.
-    /// Skipped when the role of PGPP_TEST_URL may not create a database.
+    /// A database without the extension, created for the test from
+    /// `template0` (never from `template1`, which may hold the extension)
+    /// and dropped afterwards: a read of a view, a write call and an
+    /// unknown schema all say that the extension is not installed.  The
+    /// body collects its results without panicking, so that the database
+    /// is always dropped before the assertions.  Skipped when the role of
+    /// PGPP_TEST_URL may not create a database.
     #[tokio::test]
     #[ignore = "needs PGPP_TEST_URL"]
     async fn a_database_without_the_extension_says_so() {
@@ -1751,7 +1818,7 @@ mod tests {
         let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
         let mut conn = PgConnection::connect(&url).await.unwrap();
         let db = format!("pgpp_t_noext_{}", std::process::id());
-        let create = sqlx::query(&format!("CREATE DATABASE {db}"))
+        let create = sqlx::query(&format!("CREATE DATABASE {db} TEMPLATE template0"))
             .execute(&mut conn)
             .await;
         if let Err(e) = create {
@@ -1763,6 +1830,7 @@ mod tests {
             panic!("CREATE DATABASE {db}: {e:#}");
         }
         let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        // no unwrap / panic until the database is dropped
         let messages = async {
             let mut other = PgConnection::connect_with(&opts.database(&db)).await?;
             let mut messages = Vec::new();
@@ -1771,30 +1839,42 @@ mod tests {
                 "SELECT pass_policy.unlock_role('x'::name)",
                 "SELECT * FROM pass_policy.failed_attempts()",
             ] {
-                let e = sqlx::query(sql).fetch_all(&mut other).await.unwrap_err();
-                let e = anyhow::Error::new(e);
-                let code = code_of(&e);
-                let m = crate::format_error(&diagnose(&mut other, e).await);
-                messages.push((sql, code, m));
+                let m = match sqlx::query(sql).fetch_all(&mut other).await {
+                    Ok(rows) => Err(format!("{} row(s), an error was expected", rows.len())),
+                    Err(e) => {
+                        let e = anyhow::Error::new(e);
+                        let code = code_of(&e);
+                        Ok((code, crate::format_error(&diagnose(&mut other, e).await)))
+                    }
+                };
+                messages.push((sql, m));
             }
             other.close().await?;
             anyhow::Ok(messages)
         }
         .await;
-        let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-        let force = if version >= 130_000 {
-            " WITH (FORCE)"
-        } else {
-            ""
-        };
-        sqlx::query(&format!("DROP DATABASE {db}{force}"))
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        for (sql, code, m) in messages.unwrap() {
+        let dropped = async {
+            let version: i32 =
+                sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+                    .fetch_one(&mut conn)
+                    .await?;
+            let force = if version >= 130_000 {
+                " WITH (FORCE)"
+            } else {
+                ""
+            };
+            sqlx::query(&format!("DROP DATABASE {db}{force}"))
+                .execute(&mut conn)
+                .await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = dropped {
+            panic!("DROP DATABASE {db}: {e:#}");
+        }
+        let messages = messages.unwrap_or_else(|e| panic!("{db}: {e:#}"));
+        for (sql, m) in messages {
+            let (code, m) = m.unwrap_or_else(|e| panic!("{sql}: {e}"));
             assert!(
                 ["3F000", "42P01", "42883"].contains(&code.as_str()),
                 "{sql}: {code}"
@@ -2031,6 +2111,65 @@ mod tests {
                 message: "Vault delivery not attempted: interrupted (Ctrl-C)".to_string(),
                 unknown: false,
             }
+        );
+    }
+
+    /// A 403 on the write after an `update`-only preflight is a refusal as
+    /// soon as Vault answers it: a Ctrl-C during the new read of the
+    /// metadata that explains it (here a Vault that does not answer that
+    /// read) ends that read, and the failure stays a refusal without
+    /// detail, never « may or may not have been written ».  `SIGWINCH`
+    /// stands for Ctrl-C (ignored by default, used by no other test).
+    #[tokio::test]
+    async fn a_ctrl_c_during_the_reread_after_a_403_keeps_the_refusal() {
+        use httpmock::prelude::*;
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/secret/data/db/app");
+                then.status(403)
+                    .json_body(json!({"errors": ["permission denied"]}));
+            })
+            .await;
+        let meta = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/v1/secret/metadata/db/app");
+                then.status(404).delay(Duration::from_secs(20));
+            })
+            .await;
+        let target = VaultTarget::parse("secret/db/app", None).unwrap();
+        let cfg = VaultConfig::new(server.base_url(), "t", None).unwrap();
+        let mut interrupt = Interrupt::on(tokio::signal::unix::SignalKind::window_change());
+        let password = Zeroizing::new("pw".to_string());
+        let raise = async {
+            // the read of the metadata is in progress
+            while meta.hits_async().await == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // SAFETY: plain system call; SIGWINCH is caught by the listener above.
+            unsafe {
+                libc::raise(libc::SIGWINCH);
+            }
+        };
+        let started = std::time::Instant::now();
+        let (failure, ()) = tokio::join!(
+            vault_delivery(&cfg, &target, true, "app", &password, &mut interrupt),
+            raise
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let failure = failure.unwrap_err();
+        assert!(interrupt.received());
+        assert!(!failure.unknown, "{failure:?}");
+        assert!(!failure.message.contains("may or may not"), "{failure:?}");
+        assert!(failure.message.contains("HTTP 403"), "{failure:?}");
+        assert!(
+            failure.message.ends_with(vault::REFUSED_SINCE_PREFLIGHT),
+            "{failure:?}"
+        );
+        assert!(
+            !failure.message.contains(vault::METADATA_DISAPPEARED),
+            "{failure:?}"
         );
     }
 

@@ -40,8 +40,9 @@ pub async fn connect(opts: &PgConnectOptions) -> Result<PgConnection> {
         .context("cannot connect to PostgreSQL (check DATABASE_URL / PG* variables / PGPASSFILE)")
 }
 
-/// Longest wait of [`close`]: an unresponsive server must not hold pgpp.
-const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Longest wait of [`close`] (and of the check of `commands::diagnose`):
+/// an unresponsive server must not hold pgpp.
+pub(crate) const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Ends the session cleanly before the process exits, on success and on
 /// error alike: without it the server sees the socket close without a

@@ -157,8 +157,9 @@ pub struct VaultConfig {
 /// Outcome of a successful [`preflight`]: the warnings to print, and
 /// whether the token was accepted on `update` alone because the secret
 /// existed ([`check_update_only`]).  The caller keeps it with the delivery
-/// and hands `update_only` to [`write_secret_tracked`]: only the handling of
-/// a 403 on the write depends on it.
+/// and hands `update_only` to [`explain_refusal`] (or to
+/// [`write_secret_tracked`]): only the handling of a 403 on the write
+/// depends on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preflight {
     pub warnings: Vec<String>,
@@ -362,9 +363,10 @@ type Pinned = Option<(String, Vec<SocketAddr>)>;
 
 /// [`check_addr`], returning in addition the resolution of `localhost`.
 /// With `http://`, the host must be a literal loopback address
-/// (`127.0.0.0/8`, `[::1]`), or `localhost` provided that every address it
-/// resolves to (`/etc/hosts`, DNS) is loopback: a name can be made to point
-/// anywhere.  The HTTP client then connects to those addresses only, so
+/// (`127.0.0.0/8`, `[::1]`), or a localhost name ([`is_localhost_name`]:
+/// `localhost`, `localhost.`, `vault.localhost`, as with `https://`)
+/// provided that every address it resolves to (`/etc/hosts`, DNS) is
+/// loopback: a name can be made to point anywhere.  The HTTP client then connects to those addresses only, so
 /// that a later resolution cannot send the request elsewhere.
 fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
     // The value is never echoed in the messages: it may hold credentials
@@ -384,19 +386,20 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
             if literal_loopback(host) {
                 return Ok((url, None));
             }
-            if host != "localhost" {
+            if !is_localhost_name(host) {
                 bail!(
                     "VAULT_ADDR: plain http:// is only accepted for a loopback host \
-                     (127.0.0.0/8, [::1], localhost); use https:// (set VAULT_CACERT or \
-                     VAULT_CAPATH for a private CA)"
+                     (127.0.0.0/8, [::1], localhost or a name under it); use https:// \
+                     (set VAULT_CACERT or VAULT_CAPATH for a private CA)"
                 );
             }
+            // a localhost name (RFC 6761), safe to quote: no credentials
             let port = url.port_or_known_default().unwrap_or(80);
             let addrs = (host, port)
                 .to_socket_addrs()
-                .context("VAULT_ADDR: cannot resolve localhost")?
+                .with_context(|| format!("VAULT_ADDR: cannot resolve {host}"))?
                 .collect();
-            let addrs = require_loopback(addrs)?;
+            let addrs = require_loopback(host, addrs)?;
             let host = host.to_string();
             Ok((url, Some((host, addrs))))
         }
@@ -405,8 +408,8 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
 }
 
 /// True when `VAULT_ADDR` designates this host: a literal loopback address
-/// (`http://` or `https://`), `http://localhost` pinned to its checked
-/// loopback addresses, or a `localhost` name with `https://` (not resolved
+/// (`http://` or `https://`), a localhost name with `http://` pinned to
+/// its checked loopback addresses, or a `localhost` name with `https://` (not resolved
 /// by `check_addr_pinned`: TLS verifies the certificate, but a proxy would
 /// resolve the name on its own side, so it is reached directly too).  See
 /// [`is_localhost_name`] for the names.
@@ -433,15 +436,15 @@ fn literal_loopback(host: &str) -> bool {
     bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Accepts the resolution of `localhost` only when it is not empty and
-/// every address is loopback.
-fn require_loopback(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
+/// Accepts the resolution of the localhost name `host` only when it is not
+/// empty and every address is loopback.
+fn require_loopback(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
     if addrs.is_empty() {
-        bail!("VAULT_ADDR: localhost does not resolve to any address");
+        bail!("VAULT_ADDR: {host} does not resolve to any address");
     }
     if let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback()) {
         bail!(
-            "VAULT_ADDR: localhost resolves to the non-loopback address {} (check \
+            "VAULT_ADDR: {host} resolves to the non-loopback address {} (check \
              /etc/hosts); plain http:// is refused, use http://127.0.0.1 or https://",
             a.ip()
         );
@@ -709,7 +712,7 @@ enum Call {
 
 /// Explanation added to a 403 on a write after a preflight that accepted
 /// `update` alone, when a new read of the metadata answers 404
-/// ([`explain_update_only_refusal`]).
+/// ([`explain_refusal`]).
 pub const METADATA_DISAPPEARED: &str = "secret metadata disappeared: the token needs create \
      (the preflight accepted update alone because the secret existed; it was deleted since)";
 
@@ -849,12 +852,38 @@ pub async fn write_secret(cfg: &VaultConfig, target: &VaultTarget, payload: &Val
 /// cannot have written the secret, whatever the error (or the
 /// interruption): the request is incomplete without its body.
 /// `update_only` is [`Preflight::update_only`] (false without a preflight):
-/// a 403 is then explained by [`explain_update_only_refusal`].
+/// a 403 is then explained by [`explain_refusal`], within
+/// [`REREAD_TIMEOUT`] and without interruption.  A caller that races the
+/// write with Ctrl-C uses [`send_write`] and [`explain_refusal`] apart, so
+/// that the refusal is settled before the new read starts.
 pub async fn write_secret_tracked(
     cfg: &VaultConfig,
     target: &VaultTarget,
     payload: &Value,
     update_only: bool,
+    body_sent: Arc<AtomicBool>,
+) -> Result<()> {
+    match send_write(cfg, target, payload, body_sent).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(explain_refusal(
+            cfg,
+            target,
+            e,
+            update_only,
+            REREAD_TIMEOUT,
+            std::future::pending(),
+        )
+        .await),
+    }
+}
+
+/// The write request alone: a refusal of Vault is returned as it is
+/// (a [`WriteRefused`]), never explained.  See [`write_secret_tracked`]
+/// for `body_sent`.
+pub async fn send_write(
+    cfg: &VaultConfig,
+    target: &VaultTarget,
+    payload: &Value,
     body_sent: Arc<AtomicBool>,
 ) -> Result<()> {
     let url = target.url(&cfg.addr);
@@ -867,45 +896,68 @@ pub async fn write_secret_tracked(
         .request(reqwest::Method::POST, url.clone())
         .header(CONTENT_TYPE, "application/json")
         .body(reqwest::Body::wrap(body));
-    match send_checked(req, &url, Call::Write).await {
-        Ok(_) => Ok(()),
-        Err(e)
-            if update_only
-                && e.downcast_ref::<WriteRefused>()
-                    .is_some_and(|r| r.status == StatusCode::FORBIDDEN) =>
-        {
-            Err(explain_update_only_refusal(cfg, target, &e).await)
-        }
-        Err(e) => Err(e),
-    }
+    send_checked(req, &url, Call::Write).await.map(drop)
 }
 
-/// 403 on the write after a preflight that accepted `update` alone: the
-/// secret may have been deleted since (its write then needs `create`), or
-/// the token may have expired, been revoked or lost its policy.  A second
-/// read of the metadata tells them apart: 404 confirms the deletion
+/// Bound of the new read of the metadata made by [`explain_refusal`]: the
+/// refusal is already certain, the read only refines its explanation and
+/// must not hold the end of a rotation for the whole request timeout.
+pub const REREAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Error of a write sent by [`send_write`].  A 403 after a preflight that
+/// accepted `update` alone (`update_only`) is a refusal of Vault, certain
+/// from its answer: the secret was not written.  The secret may have been
+/// deleted since (its write then needs `create`), or the token may have
+/// expired, been revoked or lost its policy.  A second read of the
+/// metadata tells them apart: 404 confirms the deletion
 /// ([`METADATA_DISAPPEARED`]); any other answer, or a failed request,
 /// gives the cautious [`REFUSED_SINCE_PREFLIGHT`] with what that read
-/// found.  The error of that read is only quoted as text: the result stays
-/// an answer of Vault to the write ([`may_have_been_received`] is false).
-async fn explain_update_only_refusal(
+/// found.  That read is bounded by `timeout` and abandoned when `cancel`
+/// ends (Ctrl-C): the result is then [`REFUSED_SINCE_PREFLIGHT`] without
+/// detail, never « may or may not have been written ».  The error of that
+/// read is only quoted as text: the result stays an answer of Vault to the
+/// write ([`may_have_been_received`] is false).  Any other error is
+/// returned as it is.
+pub async fn explain_refusal(
     cfg: &VaultConfig,
     target: &VaultTarget,
-    refused: &anyhow::Error,
+    refused: anyhow::Error,
+    update_only: bool,
+    timeout: Duration,
+    cancel: impl std::future::Future<Output = ()>,
 ) -> anyhow::Error {
+    let forbidden = refused
+        .downcast_ref::<WriteRefused>()
+        .is_some_and(|r| r.status == StatusCode::FORBIDDEN);
+    if !(update_only && forbidden) {
+        return refused;
+    }
     let url = target.metadata_url(&cfg.addr);
-    let found = match cfg.request(reqwest::Method::GET, url.clone()).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            drain(resp).await;
-            if status == StatusCode::NOT_FOUND {
-                return anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}");
+    let reread = async {
+        match cfg.request(reqwest::Method::GET, url.clone()).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                drain(resp).await;
+                if status == StatusCode::NOT_FOUND {
+                    None
+                } else {
+                    Some(format!("{url} answered HTTP {status}"))
+                }
             }
-            format!("{url} answered HTTP {status}")
+            Err(e) => Some(format!("request to {url} failed ({e})")),
         }
-        Err(e) => format!("request to {url} failed ({e})"),
     };
-    anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT} ({found})")
+    // biased: a Ctrl-C already received skips the read
+    let found = tokio::select! {
+        biased;
+        () = cancel => return anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT}"),
+        r = tokio::time::timeout(timeout, reread) => r,
+    };
+    match found {
+        Ok(None) => anyhow::anyhow!("{refused:#}: {METADATA_DISAPPEARED}"),
+        Ok(Some(found)) => anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT} ({found})"),
+        Err(_) => anyhow::anyhow!("{refused:#}: {REFUSED_SINCE_PREFLIGHT}"),
+    }
 }
 
 /// Request body made of a single chunk, which raises `sent` when the HTTP
@@ -1211,6 +1263,28 @@ mod tests {
             assert_eq!(host, "localhost");
             assert!(!addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback()));
         }
+        // the other localhost names (is_localhost_name, as with https://)
+        // are accepted the same way: never refused as a remote host; their
+        // resolution depends on the system, and when it succeeds they are
+        // pinned to loopback addresses under their own name
+        for addr in [
+            "http://localhost.:8200",
+            "http://vault.localhost:8200",
+            "http://Vault.LocalHost.:8200",
+        ] {
+            match check_addr_pinned(addr) {
+                Ok((url, pinned)) => {
+                    let (host, addrs) = pinned.expect("a localhost name is pinned");
+                    assert_eq!(host, url.host_str().unwrap(), "{addr}");
+                    assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addr}");
+                }
+                Err(e) => {
+                    let m = format!("{e:#}");
+                    assert!(!m.contains("plain http:// is only accepted"), "{addr}: {m}");
+                    assert!(m.contains("resolve"), "{addr}: {m}");
+                }
+            }
+        }
         // https is never resolved nor restricted
         assert!(check_addr_pinned("https://localhost:8200")
             .unwrap()
@@ -1218,7 +1292,7 @@ mod tests {
             .is_none());
         // other names are refused without resolution, even close ones
         for bad in [
-            "http://localhost.:8200",
+            "http://localhost..:8200",
             "http://localhost.example.net:8200",
             "http://my-localhost:8200",
             "http://[::ffff:127.0.0.1]:8200",
@@ -1294,14 +1368,19 @@ mod tests {
         let lo4: SocketAddr = "127.0.0.1:8200".parse().unwrap();
         let lo6: SocketAddr = "[::1]:8200".parse().unwrap();
         let remote: SocketAddr = "192.0.2.10:8200".parse().unwrap();
-        assert_eq!(require_loopback(vec![lo4, lo6]).unwrap(), [lo4, lo6]);
-        let err = require_loopback(vec![lo4, remote]).unwrap_err().to_string();
+        assert_eq!(
+            require_loopback("localhost", vec![lo4, lo6]).unwrap(),
+            [lo4, lo6]
+        );
+        let err = require_loopback("localhost", vec![lo4, remote])
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("192.0.2.10") && err.contains("/etc/hosts"),
             "{err}"
         );
-        assert!(require_loopback(vec![remote]).is_err());
-        assert!(require_loopback(Vec::new()).is_err());
+        assert!(require_loopback("localhost", vec![remote]).is_err());
+        assert!(require_loopback("localhost", Vec::new()).is_err());
     }
 
     #[test]
