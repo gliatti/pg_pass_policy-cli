@@ -527,3 +527,130 @@ async fn preflight_reuses_the_connection() {
         "one connection for both preflight requests"
     );
 }
+
+/// Mocks the KV v2 metadata endpoint of the target with the given status.
+async fn metadata_mock(server: &MockServer, status: u16) -> Mock<'_> {
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/v1/secret/metadata/db/app")
+                .header("X-Vault-Token", "good-token")
+                .header("X-Vault-Namespace", "team-a");
+            let body = if status == 200 {
+                json!({"data": {"current_version": 4, "versions": {}}})
+            } else {
+                json!({"errors": []})
+            };
+            then.status(status).json_body(body);
+        })
+        .await
+}
+
+/// `update` without `create` is enough for a secret that already exists
+/// (every write is then an update): the metadata read by the preflight
+/// tells it.  A secret not written yet (404) needs `create`; metadata
+/// that cannot be read leaves the question open and both are required.
+#[tokio::test]
+async fn preflight_accepts_update_alone_on_an_existing_secret() {
+    for caps in [
+        json!({"capabilities": ["update"]}),
+        json!({"data": {"secret/data/db/app": ["read", "update"]}}),
+    ] {
+        let server = MockServer::start_async().await;
+        preflight_mocks(&server, 200, 200, caps.clone()).await;
+        let meta = metadata_mock(&server, 200).await;
+        let warnings = preflight(&cfg(&server), &target()).await.unwrap();
+        assert!(warnings.is_empty(), "{caps}: {warnings:?}");
+        meta.assert_async().await;
+    }
+
+    let refused = |status: u16| async move {
+        let server = MockServer::start_async().await;
+        preflight_mocks(&server, 200, 200, json!({"capabilities": ["update"]})).await;
+        let meta = metadata_mock(&server, status).await;
+        let text = format!(
+            "{:#}",
+            preflight(&cfg(&server), &target()).await.unwrap_err()
+        );
+        meta.assert_async().await;
+        assert!(text.contains("may not write"), "{status}: {text}");
+        assert!(text.contains("[update]"), "{status}: {text}");
+        assert!(!text.contains("good-token"), "{text}");
+        text
+    };
+    let text = refused(404).await;
+    assert!(
+        text.contains("does not exist yet") && text.contains("needs create"),
+        "{text}"
+    );
+    for status in [403, 500] {
+        let text = refused(status).await;
+        assert!(
+            text.contains("could not be checked") && text.contains(&status.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("create and update required"), "{text}");
+    }
+}
+
+/// The metadata is only read for a token with `update` and no `create`:
+/// `create` + `update` or `root` pass without it, `create` alone (or no
+/// write capability) is refused without it.
+#[tokio::test]
+async fn preflight_reads_the_metadata_only_when_needed() {
+    for (caps, ok) in [
+        (json!({"capabilities": ["create", "update"]}), true),
+        (json!({"capabilities": ["root"]}), true),
+        (json!({"capabilities": ["create"]}), false),
+        (json!({"capabilities": ["read"]}), false),
+    ] {
+        let server = MockServer::start_async().await;
+        preflight_mocks(&server, 200, 200, caps.clone()).await;
+        let meta = metadata_mock(&server, 200).await;
+        assert_eq!(
+            preflight(&cfg(&server), &target()).await.is_ok(),
+            ok,
+            "{caps}"
+        );
+        assert_eq!(meta.hits_async().await, 0, "{caps}");
+    }
+}
+
+/// A loopback VAULT_ADDR never goes through the proxy of the environment:
+/// the proxy would resolve `localhost` on its own side and see the token.
+/// The proxy variables are changed for the whole test binary, which only
+/// builds loopback clients (the ones this test is about).
+#[tokio::test]
+async fn a_loopback_address_bypasses_the_proxy_of_the_environment() {
+    let proxy = MockServer::start_async().await;
+    let relayed = proxy
+        .mock_async(|when, then| {
+            when.any_request();
+            then.status(502);
+        })
+        .await;
+    for var in ["NO_PROXY", "no_proxy"] {
+        std::env::remove_var(var);
+    }
+    for var in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY"] {
+        std::env::set_var(var, proxy.base_url());
+    }
+    let server = MockServer::start_async().await;
+    let write = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/secret/data/db/app");
+            then.status(204);
+        })
+        .await;
+    for addr in [
+        server.base_url(),
+        format!("http://localhost:{}", server.port()),
+    ] {
+        let cfg = VaultConfig::new(&addr, "tok", None).unwrap();
+        write_secret(&cfg, &target(), &build_payload("app", "x", "now"))
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: {e:#}"));
+    }
+    write.assert_hits_async(2).await;
+    assert_eq!(relayed.hits_async().await, 0, "the proxy must not be used");
+}

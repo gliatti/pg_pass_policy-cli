@@ -87,9 +87,19 @@ impl VaultTarget {
 
     /// URL of the KV v2 data endpoint, below the path of `addr` (if any).
     pub fn url(&self, addr: &Url) -> Url {
+        self.kv_url(addr, "data")
+    }
+
+    /// URL of the KV v2 metadata endpoint (`{mount}/metadata/{path}`),
+    /// read by the preflight to tell an existing secret from a new one.
+    pub fn metadata_url(&self, addr: &Url) -> Url {
+        self.kv_url(addr, "metadata")
+    }
+
+    fn kv_url(&self, addr: &Url, kind: &str) -> Url {
         let segments = std::iter::once("v1")
             .chain(self.mount.split('/'))
-            .chain(std::iter::once("data"))
+            .chain(std::iter::once(kind))
             .chain(self.path.split('/'));
         endpoint(addr, segments)
     }
@@ -135,16 +145,13 @@ pub struct VaultConfig {
     /// sensitive).
     token: HeaderValue,
     namespace: Option<HeaderValue>,
-    /// HTTP client built once (with the extra root certificates) and used
-    /// for every request: token preflight and secret write.
+    /// HTTP client built once (with the extra root certificates and the
+    /// connection timeout) and used for every request: token preflight and
+    /// secret write.
     client: reqwest::Client,
     /// Longest duration of a request, connection and response included
-    /// ([`REQUEST_TIMEOUT`] unless changed by [`VaultConfig::with_timeout`]).
+    /// ([`REQUEST_TIMEOUT`] unless given to [`VaultConfig::with_timeout`]).
     timeout: Duration,
-    /// What the client was built from, kept to rebuild it with another
-    /// connection timeout ([`VaultConfig::with_timeout`]).
-    root_certs: Vec<Certificate>,
-    pinned: Pinned,
 }
 
 /// Default longest duration of a Vault request.
@@ -170,18 +177,32 @@ impl VaultConfig {
         token: impl Into<String>,
         namespace: Option<String>,
     ) -> Result<Self> {
-        Self::with_root_certs(addr, token, namespace, &[])
+        Self::with_root_certs(addr, token, namespace, &[], REQUEST_TIMEOUT)
     }
 
-    /// Same as [`VaultConfig::new`], trusting in addition `root_certs`
-    /// (private CA) besides the system and webpki stores.
+    /// Same as [`VaultConfig::new`] with another request timeout (tests);
+    /// the connection timeout follows ([`connect_timeout_for`]).
+    pub fn with_timeout(
+        addr: impl AsRef<str>,
+        token: impl Into<String>,
+        namespace: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::with_root_certs(addr, token, namespace, &[], timeout)
+    }
+
+    /// Same as [`VaultConfig::with_timeout`], trusting in addition
+    /// `root_certs` (private CA) besides the system and webpki stores.  The
+    /// HTTP client is built here, once, with every setting.
     pub fn with_root_certs(
         addr: impl AsRef<str>,
         token: impl Into<String>,
         namespace: Option<String>,
         root_certs: &[Certificate],
+        timeout: Duration,
     ) -> Result<Self> {
         let (addr, pinned) = check_addr_pinned(addr.as_ref())?;
+        let direct = is_loopback_target(&addr, &pinned);
         let mut token = header_value(&token.into(), "VAULT_TOKEN")?;
         token.set_sensitive(true);
         let namespace = namespace
@@ -191,20 +212,9 @@ impl VaultConfig {
             addr,
             token,
             namespace,
-            client: build_client(root_certs, &pinned, connect_timeout_for(REQUEST_TIMEOUT))?,
-            timeout: REQUEST_TIMEOUT,
-            root_certs: root_certs.to_vec(),
-            pinned,
+            client: build_client(root_certs, &pinned, direct, connect_timeout_for(timeout))?,
+            timeout,
         })
-    }
-
-    /// Same configuration with another request timeout (tests); the
-    /// connection timeout follows ([`connect_timeout_for`]).
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self.client = build_client(&self.root_certs, &self.pinned, connect_timeout_for(timeout))
-            .expect("the HTTP client was already built with the same settings");
-        self
     }
 
     /// Reads the environment and validates everything (address, token,
@@ -218,7 +228,7 @@ impl VaultConfig {
         let token = clean(env_var("VAULT_TOKEN")).context("VAULT_TOKEN is not set")?;
         let namespace = clean(env_var("VAULT_NAMESPACE"));
         let certs = root_certs_from_env()?;
-        Self::with_root_certs(addr, token, namespace, &certs)
+        Self::with_root_certs(addr, token, namespace, &certs, REQUEST_TIMEOUT)
     }
 
     /// Request carrying the token and namespace headers.
@@ -295,14 +305,27 @@ fn header_value(value: &str, name: &str) -> Result<HeaderValue> {
 /// (`http://localhost`) replaces the resolution of that name by the loopback
 /// addresses checked by `check_addr_pinned`.  `connect_timeout` bounds the
 /// connection alone (see [`CONNECT_TIMEOUT`]).
+///
+/// `direct` (a loopback target, see [`is_loopback_target`]) disables the
+/// proxies of the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`):
+/// a local Vault agent must be reached on this host, never through a proxy
+/// that would resolve `localhost` on its own side and see the token (and,
+/// with `http://`, the password) in clear.  A remote address keeps the
+/// system proxy settings, `NO_PROXY` included, as the official Vault client
+/// does: the proxy then relays a TLS tunnel (`CONNECT`) whose certificate is
+/// still verified against `VAULT_ADDR`.
 fn build_client(
     root_certs: &[Certificate],
     pinned: &Pinned,
+    direct: bool,
     connect_timeout: Duration,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout);
+    if direct {
+        builder = builder.no_proxy();
+    }
     if let Some((host, addrs)) = pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -347,8 +370,7 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
         "http" => {
             // `url` lower-cases the host and normalises IPv4 (`127.1`)
             let host = url.host_str().unwrap_or("");
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            if bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+            if literal_loopback(host) {
                 return Ok((url, None));
             }
             if host != "localhost" {
@@ -369,6 +391,22 @@ fn check_addr_pinned(addr: &str) -> Result<(Url, Pinned)> {
         }
         other => bail!("VAULT_ADDR: unsupported scheme {other:?} (use https://)"),
     }
+}
+
+/// True when `VAULT_ADDR` designates this host: a literal loopback address
+/// (`http://` or `https://`), or `http://localhost` pinned to its checked
+/// loopback addresses.  `https://localhost` is not resolved by
+/// `check_addr_pinned` and follows the proxy settings like a remote name
+/// (list it in `NO_PROXY`).
+fn is_loopback_target(url: &Url, pinned: &Pinned) -> bool {
+    pinned.is_some() || literal_loopback(url.host_str().unwrap_or(""))
+}
+
+/// True for a literal loopback address as `url` prints it (`127.0.0.1`,
+/// `[::1]`); a name is never resolved here.
+fn literal_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Accepts the resolution of `localhost` only when it is not empty and
@@ -499,6 +537,13 @@ async fn drain(mut resp: reqwest::Response) {
 ///    token on that path are not enough to write it ([`can_write`]: `root`,
 ///    or both `create` and `update`).  When the answer cannot be read, a
 ///    warning is returned and the write is attempted after the rotation.
+/// 3. Only for a token that has `update` without `create` (nor `root`):
+///    `GET {addr}/v1/{mount}/metadata/{path}` ([`check_update_only`]).  A
+///    200 says that the secret exists, and every later write is then an
+///    update: `update` alone is enough.  A 404 says that it does not exist
+///    yet, and its first write needs `create`.  Any other answer (403 when
+///    the token may not read the metadata, network error) leaves the
+///    question open, and both `create` and `update` are required.
 ///
 /// A token created with `-no-default-policy` fails the first request: the
 /// caller skips this preflight on an explicit request only
@@ -539,17 +584,59 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
             "unexpected answer of {url}: the write permission of VAULT_TOKEN on \
              \"{path}\" could not be checked before the rotation"
         )),
-        Some(caps) if !can_write(&caps) => {
-            bail!(
-                "VAULT_TOKEN may not write \"{path}\": its capabilities there are [{}] \
-                 (create and update required, or root; --vault-skip-preflight skips \
-                 this check)",
-                caps.join(", ")
-            );
+        Some(caps) if can_write(&caps) => {}
+        Some(caps) if has_capability(&caps, "update") => {
+            check_update_only(cfg, target, &caps).await?;
         }
-        Some(_) => {}
+        Some(caps) => bail!(cannot_write_message(&path, &caps, "")),
     }
     Ok(warnings)
+}
+
+/// Refusal of the preflight for a token whose capabilities on `path` are
+/// not enough to write it; `why` (empty or starting with `; `) tells what
+/// the metadata read found.
+fn cannot_write_message(path: &str, caps: &[String], why: &str) -> String {
+    format!(
+        "VAULT_TOKEN may not write \"{path}\": its capabilities there are [{}] \
+         (create and update required, or root, or update alone on an existing \
+         secret{why}; --vault-skip-preflight skips this check)",
+        caps.join(", ")
+    )
+}
+
+/// Preflight of a token that has `update` without `create`: accepted only
+/// when the secret already exists, which its KV v2 metadata tells (Vault
+/// asks for `update` on a path whose metadata exists, `create` otherwise).
+/// The metadata body (versions, custom metadata) is read to its end and
+/// discarded, never parsed.  An answer other than 200 or 404, or a
+/// failed request, cannot tell whether the secret exists: the token is
+/// then refused as without `create`.
+async fn check_update_only(cfg: &VaultConfig, target: &VaultTarget, caps: &[String]) -> Result<()> {
+    let path = target.api_path();
+    let url = target.metadata_url(&cfg.addr);
+    let why = match cfg.request(reqwest::Method::GET, url.clone()).send().await {
+        Ok(resp) if resp.status() == StatusCode::OK => {
+            drain(resp).await;
+            return Ok(());
+        }
+        Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            drain(resp).await;
+            format!("; the secret does not exist yet ({url} answered 404) and its first write needs create")
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            drain(resp).await;
+            format!(
+                "; whether the secret exists could not be checked: {url} answered HTTP {status} \
+                 (read on the metadata path needed)"
+            )
+        }
+        Err(e) => format!(
+            "; whether the secret exists could not be checked: request to {url} failed ({e})"
+        ),
+    };
+    bail!(cannot_write_message(&path, caps, &why))
 }
 
 /// True when the capabilities of a token on a KV v2 data path let it write
@@ -559,12 +646,16 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
 /// and then be refused by Vault after the rotation once the secret exists;
 /// `update` alone would be refused for a secret not written yet.  `sudo`
 /// only opens root-protected paths and grants no write by itself, it is not
-/// enough either.  Requiring both is stricter than needed for one of the
-/// two cases (a new secret, or an existing one), which `capabilities-self`
-/// cannot tell apart without reading the secret.
+/// enough either.  `update` alone is enough for a secret that already
+/// exists, which `capabilities-self` cannot tell: [`check_update_only`]
+/// reads its metadata for that case.
 fn can_write(caps: &[String]) -> bool {
-    let has = |name: &str| caps.iter().any(|c| c == name);
-    has("root") || (has("create") && has("update"))
+    has_capability(caps, "root")
+        || (has_capability(caps, "create") && has_capability(caps, "update"))
+}
+
+fn has_capability(caps: &[String], name: &str) -> bool {
+    caps.iter().any(|c| c == name)
 }
 
 /// Kind of a request sent by [`send_checked`], for the wording of its
@@ -706,6 +797,14 @@ pub async fn write_secret_tracked(
 /// its headers are queued: as long as `sent` is false, no byte of the body
 /// has left the process.  The exact size is announced (`Content-Length`
 /// header, as with a plain buffer).
+///
+/// « Sent » therefore means « handed to the write buffer of the
+/// connection » (hyper, then rustls and the kernel socket), not « received
+/// by Vault »: once `sent` is true, the bytes may still be in a buffer of
+/// this process or of the kernel, or lost with the connection.  This is
+/// why a failure after that point is reported with the cautious « may or
+/// may not have been written », never as a write that took place; only
+/// `sent == false` is a certainty (nothing reached Vault).
 struct TrackedBody {
     data: Option<Bytes>,
     sent: Arc<AtomicBool>,
@@ -857,6 +956,11 @@ mod tests {
             "https://proxy.example.net/vault/v1/team/kv/data/db/app"
         );
         assert_eq!(
+            t.metadata_url(&check_addr("https://proxy.example.net/vault/").unwrap())
+                .as_str(),
+            "https://proxy.example.net/vault/v1/team/kv/metadata/db/app"
+        );
+        assert_eq!(
             endpoint(
                 &check_addr("http://127.0.0.1:8200").unwrap(),
                 ["v1", "auth", "token", "lookup-self"]
@@ -1004,6 +1108,31 @@ mod tests {
             "http://0.0.0.0:8200",
         ] {
             assert!(check_addr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_loopback_targets_bypass_the_proxy() {
+        for addr in [
+            "http://127.0.0.1:8200",
+            "https://127.0.0.1:8200",
+            "http://127.9.8.7:8200",
+            "http://[::1]:8200",
+            "https://[::1]:8200/vault",
+            "http://localhost:8200",
+        ] {
+            let (url, pinned) = check_addr_pinned(addr).unwrap();
+            assert!(is_loopback_target(&url, &pinned), "{addr}");
+        }
+        // remote or not pinned: the system proxy settings apply
+        for addr in [
+            "https://vault.example.net:8200",
+            "https://10.0.0.5:8200",
+            "https://localhost:8200",
+            "https://[::ffff:127.0.0.1]:8200",
+        ] {
+            let (url, pinned) = check_addr_pinned(addr).unwrap();
+            assert!(!is_loopback_target(&url, &pinned), "{addr}");
         }
     }
 

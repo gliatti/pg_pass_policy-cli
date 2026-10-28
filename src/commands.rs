@@ -35,12 +35,41 @@ const STATUS_COLUMNS: &str = "v.role_name, v.profile, v.password_changed_at::tex
      v.expires_at::text, v.grace_until::text, v.days_left, v.locked_until::text, \
      v.failed_count, v.status, v.expiry_state";
 
+/// Message added to an error raised because the installed extension is
+/// older than this pgpp: an unknown column (`42703`, `expiry_state` or
+/// `is_exempt` of `v_role_status`) or relation (`42P01`, `v_expiring`).
+pub const NEWER_EXTENSION: &str =
+    "this pgpp requires a newer pg_pass_policy (reinstall the extension)";
+
+/// [`NEWER_EXTENSION`] for the SQLSTATE of an undefined column or table,
+/// `None` for any other error.
+fn newer_extension_hint(sqlstate: Option<&str>) -> Option<&'static str> {
+    matches!(sqlstate, Some("42703" | "42P01")).then_some(NEWER_EXTENSION)
+}
+
+/// Error of a query on the views of the extension, with [`NEWER_EXTENSION`]
+/// in front of the server message when the schema is too old.
+fn view_error(err: sqlx::Error) -> anyhow::Error {
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned());
+    match newer_extension_hint(code.as_deref()) {
+        Some(hint) => anyhow::Error::new(err).context(hint),
+        None => err.into(),
+    }
+}
+
 pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) -> Result<()> {
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
          WHERE $1::text IS NULL OR v.role_name = $1 ORDER BY v.role_name"
     );
-    let rows = sqlx::query(&sql).bind(role).fetch_all(conn).await?;
+    let rows = sqlx::query(&sql)
+        .bind(role)
+        .fetch_all(conn)
+        .await
+        .map_err(view_error)?;
     if rows.is_empty() {
         if let Some(r) = role {
             bail!("role \"{r}\" not found among login roles");
@@ -52,7 +81,8 @@ pub async fn status(conn: &mut PgConnection, role: Option<&str>, fmt: Format) ->
 /// Rows of the view `v_expiring` (expiry state warning, grace or expired,
 /// exempt roles left out: the selection is the one of the extension, not a
 /// copy of it).  With `within`, also the roles not exempt whose password
-/// expires before `now() + within`.
+/// expires before `now() + within`: one statement, the `UNION` of both
+/// selections (a role in both appears once), sorted on the raw timestamp.
 pub async fn expiring(
     conn: &mut PgConnection,
     within: Option<Duration>,
@@ -64,22 +94,40 @@ pub async fn expiring(
                 "SELECT {STATUS_COLUMNS} FROM pass_policy.v_expiring v \
                  ORDER BY v.expires_at NULLS LAST, v.role_name"
             );
-            sqlx::query(&sql).fetch_all(conn).await?
+            sqlx::query(&sql).fetch_all(conn).await
         }
         Some(within) => {
-            let sql = format!(
-                "SELECT {STATUS_COLUMNS} FROM pass_policy.v_role_status v \
-                 WHERE v.role_oid IN (SELECT x.role_oid FROM pass_policy.v_expiring x) \
-                    OR (NOT v.is_exempt AND v.expires_at <= now() + $1::interval) \
-                 ORDER BY v.expires_at NULLS LAST, v.role_name"
-            );
-            sqlx::query(&sql)
+            sqlx::query(&expiring_within_sql())
                 .bind(to_pg_interval(within)?)
                 .fetch_all(conn)
-                .await?
+                .await
         }
-    };
+    }
+    .map_err(view_error)?;
     ResultSet::from_rows(&rows)?.print(fmt, "no expiring role")
+}
+
+/// Raw columns of the `UNION` of [`expiring_within_sql`]: those that
+/// [`STATUS_COLUMNS`] reads, plus `role_oid`, so that two distinct roles
+/// are never merged.  All of them are comparable types (`UNION` removes
+/// duplicates by comparing whole rows).
+const EXPIRING_UNION_COLUMNS: &str = "role_oid, role_name, profile, password_changed_at, \
+     expires_at, grace_until, days_left, locked_until, failed_count, status, expiry_state";
+
+/// `expiring --within`: rows of `v_expiring` (its filter is not copied)
+/// united with the roles not exempt that expire before `now() + $1`.
+/// `now()` is the same in both branches (start of the transaction), so
+/// `days_left` of a role found by both is identical and the row is kept
+/// once.
+fn expiring_within_sql() -> String {
+    format!(
+        "SELECT {STATUS_COLUMNS} FROM ( \
+           SELECT {EXPIRING_UNION_COLUMNS} FROM pass_policy.v_expiring \
+           UNION \
+           SELECT {EXPIRING_UNION_COLUMNS} FROM pass_policy.v_role_status \
+            WHERE NOT is_exempt AND expires_at <= now() + $1::interval \
+         ) v ORDER BY v.expires_at NULLS LAST, v.role_name"
+    )
 }
 
 /// Rows of the view `v_locked`.  The view joins `role_state` by OID (it
@@ -1471,6 +1519,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_older_extension_is_reported_as_such() {
+        for code in ["42703", "42P01"] {
+            assert_eq!(newer_extension_hint(Some(code)), Some(NEWER_EXTENSION));
+        }
+        for code in [Some("42501"), Some("42883"), Some("XX000"), None] {
+            assert_eq!(newer_extension_hint(code), None, "{code:?}");
+        }
+        let err = anyhow::anyhow!("column v.expiry_state does not exist").context(NEWER_EXTENSION);
+        assert_eq!(
+            crate::format_error(&err),
+            "this pgpp requires a newer pg_pass_policy (reinstall the extension): \
+             column v.expiry_state does not exist"
+        );
+    }
+
+    /// The same message on real errors of the server: unknown column and
+    /// unknown view; another error is left as it is.
+    #[tokio::test]
+    #[ignore = "needs PGPP_TEST_URL"]
+    async fn an_unknown_column_or_view_asks_for_a_newer_extension() {
+        use sqlx::Connection;
+        let url = std::env::var("PGPP_TEST_URL").expect("PGPP_TEST_URL must be set");
+        let mut conn = PgConnection::connect(&url).await.unwrap();
+        for sql in [
+            "SELECT v.pgpp_no_such_column FROM pass_policy.v_role_status v",
+            "SELECT * FROM pass_policy.v_pgpp_no_such_view",
+        ] {
+            let err = view_error(sqlx::query(sql).fetch_all(&mut conn).await.unwrap_err());
+            let m = crate::format_error(&err);
+            assert!(m.starts_with(&format!("{NEWER_EXTENSION}: ")), "{sql}: {m}");
+            assert!(m.contains("does not exist"), "{sql}: {m}");
+        }
+        let err = view_error(
+            sqlx::query("SELECT 1/0")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap_err(),
+        );
+        assert!(!crate::format_error(&err).contains(NEWER_EXTENSION));
+        // the UNION of `expiring --within` is valid against this extension
+        let rows = sqlx::query(&expiring_within_sql())
+            .bind("100 years")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        let all = sqlx::query(
+            "SELECT count(*) FROM pass_policy.v_role_status \
+              WHERE NOT is_exempt AND expires_at IS NOT NULL",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+        .get::<i64, _>(0);
+        assert!(rows.len() as i64 >= all, "{} < {all}", rows.len());
+    }
+
     /// Same check on values sent by a real server (PGPP_TEST_URL).
     #[tokio::test]
     #[ignore = "needs PGPP_TEST_URL"]
@@ -1549,9 +1654,9 @@ mod tests {
                     .json_body(json!({"data": {"version": 1}}));
             })
             .await;
-        let cfg = VaultConfig::new(server.base_url(), "t", None)
-            .unwrap()
-            .with_timeout(Duration::from_millis(300));
+        let cfg =
+            VaultConfig::with_timeout(server.base_url(), "t", None, Duration::from_millis(300))
+                .unwrap();
         let err = vault_delivery(&cfg, &target, "app", &password, &mut interrupt)
             .await
             .unwrap_err();
@@ -1584,21 +1689,47 @@ mod tests {
         );
     }
 
+    /// Loopback listener whose connections hang, with the connections that
+    /// fill it; both must stay alive during the test.
+    type Hanging = (std::net::TcpListener, Vec<std::net::TcpStream>, String);
+
     /// Loopback address whose connections hang: a listener that never
     /// accepts, its accept queue filled by connections kept open, so that
     /// the kernel drops the next SYN (the client keeps waiting for the
-    /// handshake).  The returned values must stay alive during the test.
-    fn hanging_connect_addr() -> (std::net::TcpListener, Vec<std::net::TcpStream>, String) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+    /// handshake).  This depends on the host: a kernel that answers a full
+    /// queue with a reset (`net.ipv4.tcp_abort_on_overflow = 1`), a queue
+    /// that never fills, or a sandbox that refuses connections would make
+    /// the tests below fail for a reason unrelated to pgpp.  The behaviour
+    /// is therefore checked first: `None` (the caller skips the test, with
+    /// a message on the standard error) unless two further connections
+    /// both time out.
+    fn hanging_connect_addr() -> Option<Hanging> {
+        let skip = |why: String| {
+            eprintln!("skipped: no hanging loopback connection on this host ({why})");
+            None
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
         let mut fillers = Vec::new();
+        let probe = || std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200));
         for _ in 0..4096 {
-            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            match probe() {
                 Ok(s) => fillers.push(s),
-                Err(_) => return (listener, fillers, format!("http://{addr}")),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // a single timeout may be a transient drop: check again
+                    for _ in 0..2 {
+                        match probe() {
+                            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                            Err(e) => return skip(format!("connection failed: {e}")),
+                            Ok(_) => return skip("the queue accepted again".into()),
+                        }
+                    }
+                    return Some((listener, fillers, format!("http://{addr}")));
+                }
+                Err(e) => return skip(format!("connection failed instead of hanging: {e}")),
             }
         }
-        panic!("the accept queue of the test listener never filled up");
+        skip("the accept queue never filled up".into())
     }
 
     /// A connection that does not succeed in time fails as a connection
@@ -1606,11 +1737,11 @@ mod tests {
     /// it is not mistaken for a request Vault may have received.
     #[tokio::test]
     async fn a_connection_timeout_is_not_a_request_vault_may_have_received() {
-        let (_listener, _fillers, addr) = hanging_connect_addr();
+        let Some((_listener, _fillers, addr)) = hanging_connect_addr() else {
+            return;
+        };
         let target = VaultTarget::parse("secret/db/app", None).unwrap();
-        let cfg = VaultConfig::new(&addr, "t", None)
-            .unwrap()
-            .with_timeout(Duration::from_millis(1200));
+        let cfg = VaultConfig::with_timeout(&addr, "t", None, Duration::from_millis(1200)).unwrap();
         let started = std::time::Instant::now();
         let err = vault::write_secret(&cfg, &target, &build_payload("app", "pw", "now"))
             .await
@@ -1636,7 +1767,9 @@ mod tests {
     /// Vault: « not attempted », not « may or may not have been written ».
     #[tokio::test]
     async fn a_ctrl_c_before_the_body_is_sent_means_not_attempted() {
-        let (_listener, _fillers, addr) = hanging_connect_addr();
+        let Some((_listener, _fillers, addr)) = hanging_connect_addr() else {
+            return;
+        };
         let target = VaultTarget::parse("secret/db/app", None).unwrap();
         let cfg = VaultConfig::new(&addr, "t", None).unwrap();
         let mut interrupt = Interrupt::on(tokio::signal::unix::SignalKind::user_defined2());

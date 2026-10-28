@@ -101,9 +101,19 @@ pgpp worker-status               # pid, dernier passage et rechargement du worke
 `exempt`. `expiring` lit la vue `v_expiring` de l'extension sans recopier son
 filtre : un rôle verrouillé dont le mot de passe expire y figure (avec
 `status = locked`), un rôle exempté (`pg_pass_policy.exempt_roles`) jamais,
-pas plus qu'avec `--within`. Ces deux commandes demandent une version de
-l'extension dont `v_role_status` a les colonnes `expiry_state` et
-`is_exempt`.
+pas plus qu'avec `--within`. Avec `--within`, `pgpp` envoie une seule
+requête : l'union (`UNION`) des lignes de `v_expiring` et des rôles non
+exemptés qui expirent avant `now() + durée` ; un rôle présent des deux côtés
+n'apparaît qu'une fois.
+
+Version de l'extension : `status` et `expiring` demandent une version de
+`pg_pass_policy` dont `v_role_status` a les colonnes `expiry_state` et
+`is_exempt` et qui fournit la vue `v_expiring`. Face à une extension plus
+ancienne, le serveur répond par une colonne ou une relation inconnue
+(SQLSTATE `42703` ou `42P01`) : `pgpp` affiche alors `this pgpp requires a
+newer pg_pass_policy (reinstall the extension)` suivi du message du serveur.
+Il suffit de réinstaller l'extension livrée avec ce dépôt (voir le README
+de l'extension à la racine du dépôt).
 
 `worker-status` affiche aussi `locks_loaded` : vrai quand le worker a chargé
 les verrous de `role_state` en mémoire partagée (fenêtre de démarrage
@@ -555,6 +565,19 @@ circuleraient sans chiffrement. Pour un cas non
 couvert, le contournement reste `--exec` avec le client officiel :
 `--exec 'read -r pw; printf "%s" "$pw" | vault kv put -mount=secret db/app password=-'`.
 
+Mandataire HTTP (proxy) : vers une adresse de boucle locale (adresse IP
+littérale `127.0.0.0/8` ou `[::1]`, en `http://` comme en `https://`, ou
+`http://localhost` épinglé comme décrit ci-dessus), le client se connecte
+toujours directement et ignore `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` :
+un mandataire résoudrait `localhost` de son côté et verrait passer le jeton
+(et, en `http://`, le mot de passe) en clair. Vers une adresse distante, les
+réglages de mandataire du système s'appliquent (`HTTPS_PROXY`, `NO_PROXY`
+compris), comme avec le client officiel : le mandataire relaie alors un
+tunnel TLS (`CONNECT`) dont le certificat reste vérifié pour l'hôte de
+`VAULT_ADDR`, il voit l'hôte et le port contactés mais pas le contenu.
+`https://localhost` n'est pas résolu par `pgpp` et suit lui aussi ces
+réglages : l'ajouter à `NO_PROXY` si un mandataire est configuré.
+
 Les redirections HTTP ne sont jamais suivies : une réponse 301/302/307/308
 est une erreur (code 1). Suivre une redirection rejouerait le jeton et le mot
 de passe vers l'hôte indiqué par `Location`, ce qui contournerait la règle
@@ -580,17 +603,24 @@ HTTP que pour l'écriture (redirections refusées) :
 2. `POST {VAULT_ADDR}/v1/sys/capabilities-self` avec
    `{"paths": ["{mount}/data/{chemin}"]}` : un refus de cette requête (403
    compris) ou des droits sur ce chemin qui ne comprennent ni `root`, ni à
-   la fois `create` et `update` sortent avec le code 1. Les deux sont
-   exigés : `create` écrit la première version du secret, `update` toutes
-   les suivantes, donc chaque rotation après la première. Un jeton limité à
-   `create` passerait la vérification puis serait refusé par Vault après la
-   deuxième rotation, le mot de passe déjà changé. `sudo` n'ouvre que les
-   chemins protégés et ne donne aucun droit d'écriture : il ne suffit pas.
-   La règle est plus stricte que nécessaire pour un jeton qui n'écrirait
-   qu'un secret neuf (ou qu'un secret existant) : `capabilities-self` ne
-   dit pas si le secret existe, `--vault-skip-preflight` reste possible
-   dans ce cas. Si la réponse est illisible, `pgpp` avertit et tente
-   l'écriture après la rotation.
+   la fois `create` et `update`, ni `update` seul sur un secret existant
+   (étape 3), sortent avec le code 1. `create` écrit la première version du
+   secret, `update` toutes les suivantes, donc chaque rotation après la
+   première. Un jeton limité à `create` passerait la vérification puis
+   serait refusé par Vault après la deuxième rotation, le mot de passe déjà
+   changé : il est toujours refusé. `sudo` n'ouvre que les chemins protégés
+   et ne donne aucun droit d'écriture : il ne suffit pas. Si la réponse est
+   illisible, `pgpp` avertit et tente l'écriture après la rotation ;
+3. seulement pour un jeton qui a `update` sans `create` (ni `root`) :
+   `GET {VAULT_ADDR}/v1/{mount}/metadata/{chemin}`, qui dit si le secret
+   existe déjà (`capabilities-self` ne le dit pas). Un 200 signifie que le
+   secret existe : toutes les écritures suivantes sont des mises à jour,
+   `update` suffit. Un 404 signifie qu'il n'existe pas encore : sa première
+   écriture demande `create`, la commande sort avec le code 1. Toute autre
+   réponse (403 quand le jeton n'a pas `read` sur le chemin des
+   métadonnées, erreur réseau, redirection) ne permet pas de conclure : la
+   règle stricte s'applique et `create` et `update` sont exigés (code 1).
+   Le corps des métadonnées est lu puis ignoré, jamais analysé.
 
 La seconde requête refuserait à elle seule un jeton expiré ou révoqué ; la
 première est gardée volontairement : elle désigne le jeton lui-même comme
@@ -709,7 +739,16 @@ Les tests d'intégration créent des rôles `pgpp_t_*`, un profil
 groupe `pgpp_t_grp`) dans la base désignée : à n'utiliser que sur une
 instance de test. Le test Vault utilise un serveur HTTP simulé (`httpmock`)
 qui vérifie le chemin, les en-têtes `X-Vault-Token` / `X-Vault-Namespace`, le
-corps envoyé et les deux requêtes de vérification préalable.
+corps envoyé et les requêtes de vérification préalable.
+
+Deux tests (`a_connection_timeout_is_not_a_request_vault_may_have_received`,
+`a_ctrl_c_before_the_body_is_sent_means_not_attempted`) ont besoin d'une
+connexion TCP de boucle locale qui reste bloquée : ils remplissent la file
+d'attente d'un port qui n'accepte jamais. Ce comportement dépend de l'hôte
+(`net.ipv4.tcp_abort_on_overflow = 1`, bac à sable qui refuse les
+connexions) : il est vérifié d'abord et, s'il n'est pas obtenu, les deux
+tests sautent leur partie réseau et le signalent sur la sortie d'erreur
+(`skipped: no hanging loopback connection on this host`).
 
 Le test `expiring_uses_the_view_and_leaves_exempt_roles_out` vérifie en
 outre l'exclusion des rôles exemptés quand le serveur liste
