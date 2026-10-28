@@ -497,10 +497,11 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         .filter_map(|e| e.downcast_ref::<std::io::Error>())
         .find(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
         .unwrap_or_else(|| panic!("no refused connection in {err:#}"));
-    // the rendered message carries the system's text of that refusal (the
-    // README quotes the Linux one), on any system
     let msg = pgpp::format_error(&err);
     assert!(msg.contains(&refused.to_string()), "{msg}");
+    // the wording the README quotes (Linux)
+    #[cfg(target_os = "linux")]
+    assert!(msg.contains("Connection refused (os error 111)"), "{msg}");
     drop((reserved, listener));
 }
 
