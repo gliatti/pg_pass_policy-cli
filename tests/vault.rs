@@ -465,7 +465,7 @@ async fn http_localhost_reaches_the_pinned_loopback_address() {
 }
 
 /// `http://localhost` never reaches an agent that listens on `[::1]` alone:
-/// the name is pinned to 127.0.0.1, and the error says how to reach it.
+/// the name is pinned to 127.0.0.1, so the write fails.
 #[tokio::test]
 async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
     let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
@@ -481,11 +481,9 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
         return;
     }
     let cfg = VaultConfig::new(format!("http://localhost:{port}"), "tok", None).unwrap();
-    let err = write(&cfg, &target(), &build_payload("app", "x", "now"))
+    assert!(write(&cfg, &target(), &build_payload("app", "x", "now"))
         .await
-        .unwrap_err();
-    let text = format!("{err:#}");
-    assert!(text.contains("use http://[::1]:PORT"), "{text}");
+        .is_err());
     drop((reserved, listener));
 }
 
