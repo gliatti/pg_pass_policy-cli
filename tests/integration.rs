@@ -432,7 +432,10 @@ async fn exec_timeout_and_interruption_kill_the_hook() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
     assert!(stderr.contains("interrupted (Ctrl-C)"), "{stderr}");
-    assert!(stdout.contains("delivery failed: rotate again"), "{stdout}");
+    assert!(
+        stdout.contains("nothing delivered: rotate again"),
+        "{stdout}"
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
     assert_gone(sub);
     let _ = std::fs::remove_file(&pidfile);
@@ -521,6 +524,33 @@ async fn rotate_writes_to_vault_mock() {
         "token checked before the rotation"
     );
 
+    // written to Vault but --exec failed: exit 1, and no new rotation is
+    // asked for (the password is in Vault)
+    let partial = pgpp(&url)
+        .args([
+            "rotate",
+            "pgpp_t_vault",
+            "--vault-kv",
+            "secret/pgpp/test",
+            "--exec",
+            "cat >/dev/null; exit 7",
+        ])
+        .env("VAULT_ADDR", server.base_url())
+        .env("VAULT_TOKEN", "t-cli-token")
+        .env("VAULT_NAMESPACE", "ns1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(partial.stdout).unwrap();
+    let stderr = String::from_utf8(partial.stderr).unwrap();
+    assert_eq!(partial.status.code(), Some(1), "{stdout} {stderr}");
+    assert_eq!(mock.hits_async().await, 2);
+    assert!(stdout.contains("delivered_to: vault"), "{stdout}");
+    let advice = "delivered to vault, exec failed: the password is in Vault, do not rotate again";
+    assert!(stdout.contains(advice), "{stdout}");
+    assert!(stderr.contains(advice), "{stderr}");
+    assert!(stderr.contains("--exec delivery failed"), "{stderr}");
+    assert!(!stdout.contains(": rotate again"), "{stdout}");
+
     // Vault failure: exit 1, password not shown, rotation still happened
     let fail = pgpp(&url)
         .args(["rotate", "pgpp_t_vault", "--vault-kv", "secret/other"])
@@ -532,8 +562,12 @@ async fn rotate_writes_to_vault_mock() {
     let stderr = String::from_utf8(fail.stderr).unwrap();
     assert!(stderr.contains("Vault delivery failed"), "{stderr}");
     assert!(stderr.contains("404"), "{stderr}");
-    assert_eq!(lookup.hits_async().await, 2);
-    assert_eq!(caps.hits_async().await, 2);
+    assert!(
+        stderr.contains("nothing delivered: rotate again"),
+        "{stderr}"
+    );
+    assert_eq!(lookup.hits_async().await, 3);
+    assert_eq!(caps.hits_async().await, 3);
 }
 
 /// Ctrl-C (SIGINT sent to pgpp) while the new password is being written to
@@ -617,7 +651,10 @@ async fn interruption_during_the_vault_write_asks_to_rotate_again() {
     );
     assert!(stderr.contains("2 delivery error(s)"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
-    assert!(stdout.contains("delivery failed: rotate again"), "{stdout}");
+    assert!(
+        stdout.contains("nothing delivered: rotate again"),
+        "{stdout}"
+    );
     assert!(!marker.exists(), "the --exec command must not run");
     exec_lenient(&mut conn, "DROP ROLE IF EXISTS pgpp_t_vault_int").await;
 }
@@ -1840,4 +1877,253 @@ fn an_oversized_check_input_is_a_usage_error() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("longer than 4096 bytes"), "{stderr}");
     assert!(!stderr.contains("QQQQ"), "{stderr}");
+}
+
+/// Echo flag of the terminal whose master side is `master`.
+fn pty_echo(master: libc::c_int) -> bool {
+    // SAFETY: plain system call on a descriptor owned by the test.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::tcgetattr(master, &mut t) }, 0);
+    t.c_lflag & libc::ECHO != 0
+}
+
+/// The prompt of `check` reads the terminal of its standard input, without
+/// echo, even without a controlling terminal (`setsid`: /dev/tty cannot be
+/// opened) and restores the echo afterwards.
+#[test]
+fn check_prompts_on_the_stdin_terminal_without_a_controlling_terminal() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills two descriptors, owned below.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: fresh descriptors returned by openpty.
+    let master_fd = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave_fd = unsafe { OwnedFd::from_raw_fd(slave) };
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pgpp"));
+    cmd.args(["check", "app"])
+        .env("DATABASE_URL", "postgres://u@127.0.0.1:9/db")
+        .env_remove("PGPASSWORD")
+        .stdin(Stdio::from(slave_fd))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid is async-signal-safe; it leaves pgpp without a
+    // controlling terminal.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(cmd); // closes the copy of the slave held by the Command
+
+    // wait for the prompt (echo switched off) before typing
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pty_echo(master) {
+        if let Some(st) = child.try_wait().unwrap() {
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "pgpp exited ({st}) before prompting: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(std::time::Instant::now() < deadline, "no prompt");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut typing = std::fs::File::from(master_fd.try_clone().unwrap());
+    typing.write_all(b"Pty-Secret-42\r").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("Password to check: "), "{stderr}");
+    assert!(stderr.contains("cannot connect"), "{stderr}");
+    assert!(!stderr.contains("cannot read the password"), "{stderr}");
+    assert!(pty_echo(master), "echo restored on the terminal");
+    // nothing typed was echoed on the terminal
+    // SAFETY: plain system call on a descriptor owned by the test.
+    unsafe {
+        libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    let mut echoed = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: buf is valid for its length.
+        let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        echoed.extend_from_slice(&buf[..n as usize]);
+    }
+    let echoed = String::from_utf8_lossy(&echoed);
+    assert!(!echoed.contains("Pty-Secret"), "echoed: {echoed:?}");
+    assert!(!stderr.contains("Pty-Secret"), "{stderr}");
+    drop(master_fd);
+}
+
+/// TCP proxy for one connection to `upstream`; returns its port and the
+/// bytes sent by the client, available once the client has closed.
+fn recording_proxy(upstream: (String, u16)) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut server = TcpStream::connect((upstream.0.as_str(), upstream.1)).unwrap();
+        let (mut client_r, mut server_w) =
+            (client.try_clone().unwrap(), server.try_clone().unwrap());
+        let down = std::thread::spawn(move || {
+            let _ = std::io::copy(&mut server, &mut client);
+            let _ = client.shutdown(Shutdown::Write);
+        });
+        let mut sent = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match client_r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    sent.extend_from_slice(&buf[..n]);
+                    if server_w.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = server_w.shutdown(Shutdown::Write);
+        let _ = down.join();
+        let _ = tx.send(sent);
+    });
+    (port, rx)
+}
+
+/// `url` with its host and port replaced by 127.0.0.1:`port`, TLS off (the
+/// proxy reads the protocol), and a copy of the password file whose entries
+/// point to the proxy.
+fn proxied(url: &str, port: u16, dir: &std::path::Path) -> (String, std::path::PathBuf) {
+    let at = url
+        .rfind('@')
+        .map_or(url.find("://").unwrap() + 3, |i| i + 1);
+    let end = url[at..].find(['/', '?']).map_or(url.len(), |i| at + i);
+    let mut new = format!("{}127.0.0.1:{port}{}", &url[..at], &url[end..]);
+    new.push(if new.contains('?') { '&' } else { '?' });
+    new.push_str("sslmode=disable");
+    let pgpass = dir.join("pgpass");
+    let source = std::env::var("PGPASSFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".pgpass")
+        });
+    let mut copy = String::new();
+    for line in std::fs::read_to_string(source).unwrap_or_default().lines() {
+        // host:port:rest, without escaped colons in host and port
+        let mut fields = line.splitn(3, ':');
+        if let (Some(_), Some(_), Some(rest)) = (fields.next(), fields.next(), fields.next()) {
+            copy.push_str(&format!("127.0.0.1:{port}:{rest}\n"));
+        }
+    }
+    std::fs::write(&pgpass, copy).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o600)).unwrap();
+    (new, pgpass)
+}
+
+/// `pgpp check` failing inside its transaction (a NUL byte in the
+/// candidate password, refused by the server): pgpp rolls it back and ends the session with a Terminate
+/// message instead of closing the socket (« unexpected EOF on client
+/// connection with an open transaction » in the server log).  Checked on the
+/// wire through a proxy; with PGPP_TEST_SERVER_LOG (path of the server log,
+/// to be used when this test runs alone), the log is checked too.
+#[tokio::test]
+#[ignore = "needs PGPP_TEST_URL (cargo test -- --include-ignored)"]
+async fn check_in_error_closes_the_session_cleanly() {
+    let url = db_url!();
+    let opts = PgConnectOptions::from_str(&url).unwrap();
+    let upstream = (opts.get_host().to_string(), opts.get_port());
+    let log = std::env::var("PGPP_TEST_SERVER_LOG")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let log_eofs = || {
+        log.as_ref().map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .matches("unexpected EOF")
+                .count()
+        })
+    };
+    let before = log_eofs();
+    let dir = std::env::temp_dir().join(format!("pgpp_eof_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    // a NUL byte is refused by the server when the parameter is bound,
+    // inside the transaction of `check` (a missing role is not an error:
+    // check_password() judges the password against the default profile)
+    for (args, input, code) in [
+        (
+            &["check", "pgpp_t_nosuchrole"][..],
+            &b"Zq7!vLm2\0pRw9xKt\n"[..],
+            1,
+        ),
+        (
+            &["check", "pgpp_t_nosuchrole"][..],
+            &b"Zq7!vLm2#pRw9xKt\n"[..],
+            0,
+        ),
+        (&["locked"][..], &b""[..], 0),
+    ] {
+        let (port, sent) = recording_proxy(upstream.clone());
+        let (proxied_url, pgpass) = proxied(&url, port, &dir);
+        let mut child = pgpp(&proxied_url)
+            .env("PGPASSFILE", &pgpass)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{args:?}: {stderr}");
+        if code == 1 {
+            assert!(stderr.contains("0x00"), "{stderr}");
+        }
+        let sent = sent
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the proxy did not see the end of the session");
+        // Terminate: 'X' then the length 4, last message of the session
+        assert!(
+            sent.ends_with(&[b'X', 0, 0, 0, 4]),
+            "{args:?}: no Terminate message at the end of the session"
+        );
+        if code == 1 {
+            let text = String::from_utf8_lossy(&sent);
+            assert!(
+                text.contains("ROLLBACK"),
+                "{args:?}: transaction not rolled back"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let (Some(before), Some(after)) = (before, {
+        // the server writes the log line when the backend exits
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        log_eofs()
+    }) {
+        assert_eq!(before, after, "\"unexpected EOF\" in the server log");
+    }
 }

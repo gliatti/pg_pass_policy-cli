@@ -261,12 +261,13 @@ struct RotationOutput<'a> {
 /// Policy: the password is printed only with `--show`; clap refuses a
 /// rotation without any of the three options before anything is rotated.  If
 /// a delivery (`--exec`, Vault) fails after the rotation, the password is NOT
-/// printed unless `--show` was given: the caller must rotate again.
+/// printed unless `--show` was given: the caller must rotate again, unless
+/// the password reached Vault (see [`retry_advice`]).
 ///
 /// A Ctrl-C ([`Interrupt`]) received before or during a delivery makes it
 /// fail (the Vault write or the `--exec` command in progress is abandoned,
 /// a delivery still to come is not attempted): it ends like any other
-/// failed delivery, with exit code 1 and « rotate again ».
+/// failed delivery, with exit code 1 and the advice of [`retry_advice`].
 async fn deliver(
     rot: &Rotation,
     password: Secret,
@@ -275,17 +276,22 @@ async fn deliver(
     interrupt: &mut Interrupt,
 ) -> Result<()> {
     let mut delivered: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
     if let Some((cfg, target)) = &opts.vault {
         match vault_delivery(cfg, target, &rot.role, &password, interrupt).await {
             Ok(()) => delivered.push("vault"),
-            Err(f) => failures.push(f),
+            Err(f) => {
+                failed.push("vault");
+                failures.push(f);
+            }
         }
     }
 
     if let Some(cmd) = &opts.exec {
         if interrupt.received() {
+            failed.push("exec");
             failures.push(format!(
                 "--exec delivery not attempted: interrupted (Ctrl-C); command: {cmd}"
             ));
@@ -309,7 +315,10 @@ async fn deliver(
             .await
             {
                 Ok(()) => delivered.push("exec"),
-                Err(e) => failures.push(format!("--exec delivery failed: {e:#}")),
+                Err(e) => {
+                    failed.push("exec");
+                    failures.push(format!("--exec delivery failed: {e:#}"));
+                }
             }
         }
     }
@@ -317,16 +326,32 @@ async fn deliver(
     for f in &failures {
         crate::report_text(crate::Report::Error, f);
     }
-    let printed = print_rotation(
-        rot,
-        &password,
-        &delivered,
-        failures.is_empty(),
-        opts.show,
-        fmt,
-    );
+    let printed = print_rotation(rot, &password, &delivered, &failed, opts.show, fmt);
     drop(password);
-    delivery_outcome(failures.len(), opts.show, delivered.is_empty(), printed)
+    delivery_outcome(&delivered, &failed, opts.show, printed)
+}
+
+/// What to do after a failed delivery (`failed` not empty), for a
+/// password that is not shown.  Once in Vault, the password is not lost:
+/// rotating again would only replace a delivered secret (and run the
+/// failed `--exec` again with another password); the failed delivery is to
+/// be completed from Vault.  Otherwise the password is lost (or only held
+/// by the `--exec` command): rotate again.
+fn retry_advice(delivered: &[&str], failed: &[&str]) -> String {
+    let what = if delivered.is_empty() {
+        "nothing delivered".to_string()
+    } else {
+        format!(
+            "delivered to {}, {} failed",
+            delivered.join(", "),
+            failed.join(", ")
+        )
+    };
+    if delivered.contains(&"vault") {
+        format!("{what}: the password is in Vault, do not rotate again")
+    } else {
+        format!("{what}: rotate again")
+    }
 }
 
 /// Writes the secret to Vault, the message of the failure otherwise.  A
@@ -373,20 +398,24 @@ async fn vault_delivery(
     }
 }
 
-/// Result of a rotation once the deliveries are done (`failures` of them
-/// failed, none succeeded when `nothing_delivered`) and the outcome printed
-/// (`printed`).  With `--show` the standard output is a delivery too: its
+/// Result of a rotation once the deliveries are done (to the channels of
+/// `delivered`, not to those of `failed`) and the outcome printed
+/// (`printed`).  A failed delivery ends with the advice of
+/// [`retry_advice`] (« do not rotate again » once the password is in
+/// Vault, « rotate again » otherwise) unless the password was printed.  With `--show` the standard output is a delivery too: its
 /// failure is reported (never silenced as a closed pipe, which would exit
 /// with 0) when it was the only delivery or when another one failed.
 /// Without `--show`, a print failure other than a closed pipe after a
 /// failed delivery is added to the error (a full disk must not go unseen).
 fn delivery_outcome(
-    failures: usize,
+    delivered: &[&str],
+    failed: &[&str],
     show: bool,
-    nothing_delivered: bool,
     printed: Result<()>,
 ) -> Result<()> {
+    let failures = failed.len();
     if failures > 0 {
+        let advice = retry_advice(delivered, failed);
         match printed {
             Err(e) if show => {
                 let cause = if is_broken_pipe(&e) {
@@ -396,19 +425,23 @@ fn delivery_outcome(
                 };
                 bail!(
                     "password rotated but {failures} delivery error(s) occurred and the \
-                     password could not be printed ({cause}): rotate again"
+                     password could not be printed ({cause}); {advice}"
                 )
             }
             Err(e) if !is_broken_pipe(&e) => bail!(
                 "password rotated but {failures} delivery error(s) occurred (and the \
-                 outcome could not be printed: {e:#})"
+                 outcome could not be printed: {e:#}); {advice}"
             ),
-            _ => bail!("password rotated but {failures} delivery error(s) occurred"),
+            // printed with --show: the password is on the standard output
+            _ if show && !delivered.contains(&"vault") => {
+                bail!("password rotated but {failures} delivery error(s) occurred")
+            }
+            _ => bail!("password rotated but {failures} delivery error(s) occurred; {advice}"),
         }
     }
     // with --show alone the standard output is the only delivery: a closed
     // pipe loses the password and is reported (not silenced)
-    let lost = show && nothing_delivered;
+    let lost = show && delivered.is_empty();
     match printed {
         Err(e) if lost && is_broken_pipe(&e) => bail!(
             "password rotated but it could not be printed (the standard output was \
@@ -426,7 +459,7 @@ fn print_rotation(
     rot: &Rotation,
     password: &Secret,
     delivered: &[&str],
-    succeeded: bool,
+    failed: &[&str],
     show: bool,
     fmt: Format,
 ) -> Result<()> {
@@ -467,10 +500,13 @@ fn print_rotation(
                 line.extend_from_slice(password.as_bytes());
                 line.push(b'\n');
                 write_stdout_unbuffered(&line)
-            } else if succeeded {
+            } else if failed.is_empty() {
                 write_line("password: (not shown; use --show to print it)")
             } else {
-                write_line("password: (not shown and delivery failed: rotate again)")
+                write_line(format_args!(
+                    "password: (not shown; {})",
+                    retry_advice(delivered, failed)
+                ))
             }
         }
     }
@@ -839,14 +875,24 @@ fn read_password() -> Result<Secret> {
         // the duration of the prompt, so that rpassword returns and
         // restores the terminal; the Ctrl-C is then replayed below with the
         // previous disposition.
+        //
+        // The terminal read is the one of descriptor 0 (the one tested
+        // above), reopened through /dev/stdin, not /dev/tty (the default of
+        // rpassword): the controlling terminal may be missing (`setsid`,
+        // some schedulers or containers: ENXIO) or be another terminal than
+        // the standard input.  The end of line echoed after the password
+        // (and after a Ctrl-C) goes to the standard error, like the prompt.
         let guard = SigintGuard::install();
-        let read = rpassword::read_password().map(Zeroizing::new);
+        let config = rpassword::ConfigBuilder::new()
+            .input_file_path(STDIN_TERMINAL_PATH)
+            .output_writer(std::io::stderr())
+            .build();
+        let read = rpassword::read_password_with_config(config).map(Zeroizing::new);
         let interrupted = guard.received()
             || matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::Interrupted);
         drop(guard);
         if interrupted {
             drop(read);
-            crate::output::write_stderr("", true);
             // SAFETY: plain system call; the previous disposition of SIGINT
             // (default: terminate) is back in force.
             unsafe {
@@ -876,6 +922,11 @@ fn read_password() -> Result<Secret> {
     };
     line.context("cannot read the password from stdin")
 }
+
+/// Path through which the terminal of descriptor 0 is reopened for the
+/// prompt of `check` (rpassword only switches off the echo of a terminal it
+/// opens by path).
+const STDIN_TERMINAL_PATH: &str = "/dev/stdin";
 
 /// Longest candidate password accepted by `check` (the server refuses
 /// passwords longer than 1024 characters anyway): past it, the input is a
@@ -1008,23 +1059,40 @@ async fn mask_parameters(tx: &mut PgConnection) -> Result<()> {
         }
         Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42501") => {
             tx.execute("ROLLBACK TO SAVEPOINT pgpp_mask").await?;
-            let current: String =
-                sqlx::query_scalar("SELECT current_setting('log_parameter_max_length')")
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if current.trim() != "0" {
-                crate::warn(&format!(
-                    "cannot disable parameter logging (log_parameter_max_length \
-                     = {current}); the candidate password may appear in the server log if \
-                     log_statement or log_min_duration_statement are enabled. Ask a superuser \
-                     for \"ALTER ROLE <admin> SET log_parameter_max_length = 0\" or \
-                     \"GRANT SET ON PARAMETER log_parameter_max_length TO <admin>\""
-                ));
+            let (current, version): (String, i32) = sqlx::query_as(
+                "SELECT current_setting('log_parameter_max_length'), \
+                        current_setting('server_version_num')::int",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if let Some(w) = unmasked_parameters_warning(&current, version) {
+                crate::warn(&w);
             }
             Ok(())
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Warning of [`mask_parameters`] when `log_parameter_max_length` could not
+/// be set and the value in force (`current`) is not 0.  `GRANT SET ON
+/// PARAMETER` exists from PostgreSQL 15 on (`server_version_num` 150000):
+/// it is only suggested from that version on.
+fn unmasked_parameters_warning(current: &str, server_version_num: i32) -> Option<String> {
+    if current.trim() == "0" {
+        return None;
+    }
+    let grant = if server_version_num >= 150_000 {
+        " or \"GRANT SET ON PARAMETER log_parameter_max_length TO <admin>\""
+    } else {
+        ""
+    };
+    Some(format!(
+        "cannot disable parameter logging (log_parameter_max_length = {current}); the \
+         candidate password may appear in the server log if log_statement or \
+         log_min_duration_statement are enabled. Ask a superuser for \
+         \"ALTER ROLE <admin> SET log_parameter_max_length = 0\"{grant}"
+    ))
 }
 
 /// Returns the exit code: 0 when the password complies, 3 when refused
@@ -1317,6 +1385,24 @@ mod tests {
     }
 
     #[test]
+    fn grant_set_on_parameter_is_suggested_from_postgresql_15_on() {
+        assert_eq!(unmasked_parameters_warning("0", 160004), None);
+        assert_eq!(unmasked_parameters_warning(" 0 ", 140010), None);
+        let alter = "\"ALTER ROLE <admin> SET log_parameter_max_length = 0\"";
+        let grant = "GRANT SET ON PARAMETER";
+        for version in [150000, 160004, 170000] {
+            let w = unmasked_parameters_warning("-1", version).unwrap();
+            assert!(w.contains("log_parameter_max_length = -1"), "{w}");
+            assert!(w.contains(alter) && w.contains(grant), "{version}: {w}");
+        }
+        for version in [140010, 149999, 130000] {
+            let w = unmasked_parameters_warning("64", version).unwrap();
+            assert!(w.ends_with(alter), "{version}: {w}");
+            assert!(!w.contains(grant), "{version}: {w}");
+        }
+    }
+
+    #[test]
     fn a_print_failure_after_a_failed_delivery_is_reported() {
         let closed = || Err(anyhow::Error::new(crate::output::BrokenPipe));
         let other = || Err(anyhow::anyhow!("disk full"));
@@ -1325,34 +1411,57 @@ mod tests {
             assert!(!is_broken_pipe(&e), "must not exit quietly with 0: {e:#}");
             format!("{e:#}")
         };
+        let none: &[&str] = &[];
         // --show, a delivery failed and the password could not be printed
-        let m = msg(delivery_outcome(1, true, true, closed()));
+        let m = msg(delivery_outcome(none, &["exec"], true, closed()));
         assert!(m.contains("1 delivery error(s)"), "{m}");
         assert!(
             m.contains("password could not be printed (the standard output was closed)"),
             "{m}"
         );
-        assert!(m.ends_with("rotate again"), "{m}");
-        let m = msg(delivery_outcome(1, true, false, other()));
+        assert!(m.ends_with("nothing delivered: rotate again"), "{m}");
+        let m = msg(delivery_outcome(&["vault"], &["exec"], true, other()));
         assert!(m.contains("could not be printed (disk full)"), "{m}");
-        // printed, or not shown: the delivery error alone
-        let m = msg(delivery_outcome(2, true, false, Ok(())));
-        assert_eq!(m, "password rotated but 2 delivery error(s) occurred");
-        let m = msg(delivery_outcome(1, false, true, closed()));
+        assert!(m.ends_with("do not rotate again"), "{m}");
+        // printed with --show: the delivery error alone
+        let m = msg(delivery_outcome(&["exec"], &["vault"], true, Ok(())));
         assert_eq!(m, "password rotated but 1 delivery error(s) occurred");
+        let m = msg(delivery_outcome(none, &["vault", "exec"], true, Ok(())));
+        assert_eq!(m, "password rotated but 2 delivery error(s) occurred");
+        // not shown: the advice says whether to rotate again
+        let m = msg(delivery_outcome(none, &["exec"], false, closed()));
+        assert_eq!(
+            m,
+            "password rotated but 1 delivery error(s) occurred; nothing delivered: rotate again"
+        );
+        let m = msg(delivery_outcome(&["exec"], &["vault"], false, Ok(())));
+        assert_eq!(
+            m,
+            "password rotated but 1 delivery error(s) occurred; delivered to exec, vault \
+             failed: rotate again"
+        );
+        // in Vault, the password is not lost: shown or not, no new rotation
+        for show in [false, true] {
+            let m = msg(delivery_outcome(&["vault"], &["exec"], show, Ok(())));
+            assert_eq!(
+                m,
+                "password rotated but 1 delivery error(s) occurred; delivered to vault, exec \
+                 failed: the password is in Vault, do not rotate again"
+            );
+        }
         // not shown: another print failure is kept in the message
-        let m = msg(delivery_outcome(1, false, true, other()));
+        let m = msg(delivery_outcome(none, &["exec"], false, other()));
         assert_eq!(
             m,
             "password rotated but 1 delivery error(s) occurred (and the outcome could not \
-             be printed: disk full)"
+             be printed: disk full); nothing delivered: rotate again"
         );
         // no delivery error
-        assert!(delivery_outcome(0, true, false, Ok(())).is_ok());
-        let m = msg(delivery_outcome(0, true, true, closed()));
+        assert!(delivery_outcome(&["exec"], none, true, Ok(())).is_ok());
+        let m = msg(delivery_outcome(none, none, true, closed()));
         assert!(m.contains("could not be printed"), "{m}");
         // delivered elsewhere: a closed stdout stays a quiet broken pipe
-        let e = delivery_outcome(0, true, false, closed()).unwrap_err();
+        let e = delivery_outcome(&["exec"], none, true, closed()).unwrap_err();
         assert!(is_broken_pipe(&e));
     }
 

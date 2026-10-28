@@ -439,3 +439,81 @@ async fn http_localhost_reaches_the_pinned_loopback_address() {
         .unwrap();
     mock.assert_async().await;
 }
+
+/// Minimal keep-alive HTTP/1.1 server: answers `lookup-self` with a token
+/// metadata body and `capabilities-self` with a write capability, and
+/// counts the TCP connections it accepts.
+async fn counting_vault() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    // one request: headers, then Content-Length bytes
+                    let head_end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse().unwrap());
+                    while buf.len() < head_end + len {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = if head.contains("lookup-self") {
+                        // large enough not to be read along with the headers
+                        json!({"data": {"ttl": 3600, "meta": "m".repeat(60_000)}})
+                    } else {
+                        json!({"capabilities": ["create", "update"]})
+                    }
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    buf.drain(..head_end + len);
+                }
+            });
+        }
+    });
+    (addr, accepted)
+}
+
+/// The body of `lookup-self` is read to its end (and discarded): the
+/// connection is reused by `capabilities-self` instead of a new one.
+#[tokio::test]
+async fn preflight_reuses_the_connection() {
+    let (addr, accepted) = counting_vault().await;
+    let cfg = VaultConfig::new(addr, "good-token", None).unwrap();
+    let target = VaultTarget::parse("secret/db/app", None).unwrap();
+    let warnings = preflight(&cfg, &target).await.unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one connection for both preflight requests"
+    );
+}

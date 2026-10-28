@@ -343,8 +343,9 @@ fn require_loopback(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
-/// Extensions of the files of `VAULT_CAPATH` that are loaded (PEM content
-/// in every case; a DER `.cer` is refused as not PEM).
+/// Extensions of the files of `VAULT_CAPATH` that are loaded, compared
+/// without regard to ASCII case (`CA.PEM`, `root.Crt`); PEM content in every
+/// case, a DER `.cer` is refused as not PEM.
 const CAPATH_EXTENSIONS: [&str; 3] = ["pem", "crt", "cer"];
 
 /// `*.pem / *.crt / *.cer`, for the messages.
@@ -366,7 +367,7 @@ fn capath_files(dir: &Path) -> Result<Vec<PathBuf>> {
             p.is_file()
                 && p.extension()
                     .and_then(|e| e.to_str())
-                    .is_some_and(|e| CAPATH_EXTENSIONS.contains(&e))
+                    .is_some_and(|e| CAPATH_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
         })
         .collect();
     paths.sort();
@@ -420,6 +421,25 @@ pub fn build_payload(username: &str, password: &str, rotated_at: &str) -> Value 
     })
 }
 
+/// Longest body read (and discarded) by [`drain`]: past it the connection
+/// is dropped instead of being reused.
+const DRAIN_LIMIT: usize = 64 * 1024;
+
+/// Reads the body of `resp` to its end, chunk by chunk, without keeping it
+/// (the token metadata of `lookup-self` is never parsed), so that the
+/// connection goes back to the pool and is reused by the next request
+/// instead of being closed with unread data.  A read error, or a body
+/// larger than [`DRAIN_LIMIT`], only costs a new connection.
+async fn drain(mut resp: reqwest::Response) {
+    let mut read = 0usize;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        read += chunk.len();
+        if read > DRAIN_LIMIT {
+            break;
+        }
+    }
+}
+
 /// Checks, before any rotation, that Vault is reachable at `VAULT_ADDR`
 /// (no redirect), that it accepts `VAULT_TOKEN` and that the token may write
 /// the target, so that these failures are reported while the password is
@@ -428,8 +448,8 @@ pub fn build_payload(username: &str, password: &str, rotated_at: &str) -> Value 
 /// 1. `GET {addr}/v1/auth/token/lookup-self` (allowed by Vault's `default`
 ///    policy).  Vault answers 403 "permission denied", never 401, for an
 ///    expired, revoked or unknown token: a 403 is therefore a refusal like
-///    any other non-2xx status.  The response body (token metadata) is not
-///    read.
+///    any other non-2xx status.  The response body (token metadata) is
+///    read to its end and discarded, never parsed ([`drain`]).
 /// 2. `POST {addr}/v1/sys/capabilities-self` with the KV v2 data path: an
 ///    error when this request is refused, or when the capabilities of the
 ///    token on that path contain none of `create`, `update`, `root`.  When
@@ -448,12 +468,13 @@ pub async fn preflight(cfg: &VaultConfig, target: &VaultTarget) -> Result<Vec<St
     // `lookup-self` first pins the failure on the token itself; the extra
     // round trip is accepted for that more precise message.
     let url = endpoint(&cfg.addr, ["v1", "auth", "token", "lookup-self"]);
-    send_checked(
+    let resp = send_checked(
         cfg.request(reqwest::Method::GET, url.clone()),
         &url,
         Call::Preflight,
     )
     .await?;
+    drain(resp).await;
 
     let path = target.api_path();
     let url = endpoint(&cfg.addr, ["v1", "sys", "capabilities-self"]);
@@ -917,7 +938,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pgpp-capath-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
-        for f in ["a.pem", "b.crt", "c.cer", "d.txt", "e.der", "pem"] {
+        for f in [
+            "a.pem", "b.crt", "c.cer", "d.txt", "e.der", "pem", "G.PEM", "h.Crt", "i.CER", "j.PEMX",
+        ] {
             std::fs::write(dir.join(f), "x").unwrap();
         }
         std::fs::create_dir(dir.join("f.pem")).unwrap();
@@ -926,7 +949,11 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, ["a.pem", "b.crt", "c.cer"]);
+        // extensions compared without regard to case
+        assert_eq!(
+            names,
+            ["G.PEM", "a.pem", "b.crt", "c.cer", "h.Crt", "i.CER"]
+        );
         assert_eq!(capath_patterns(), "*.pem / *.crt / *.cer");
         let _ = std::fs::remove_dir_all(&dir);
     }

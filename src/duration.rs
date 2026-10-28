@@ -18,7 +18,28 @@ pub const MAX_DURATION_SECS: u64 = 36_500 * 86_400;
 /// The total must be positive (`0s` is refused) and is bounded by
 /// [`MAX_DURATION_SECS`] (100 years).
 pub fn parse_duration(input: &str) -> Result<Duration> {
-    let s = input.trim();
+    match parse_total(input, input)? {
+        Some(d) => Ok(d),
+        None => bail!("invalid duration \"{input}\": must be greater than zero"),
+    }
+}
+
+/// Like [`parse_duration`], but a total of zero (`0`, `0s`, `0m0s`, `00`)
+/// is accepted and returned as `None` (used for "no limit").  A bare
+/// number is read as seconds; any other value follows the rules (units,
+/// bounds, messages) of [`parse_duration`].
+pub fn parse_duration_or_zero(input: &str) -> Result<Option<Duration>> {
+    let t = input.trim();
+    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+        return parse_total(&format!("{t}s"), input);
+    }
+    parse_total(input, input)
+}
+
+/// Sum of the `<number><unit>` groups of `text` (`None` when zero);
+/// messages name `input`, the value given by the user.
+fn parse_total(text: &str, input: &str) -> Result<Option<Duration>> {
+    let s = text.trim();
     if s.is_empty() {
         bail!("empty duration");
     }
@@ -63,13 +84,10 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
     if !seen_group {
         bail!("invalid duration \"{input}\"");
     }
-    if total == 0 {
-        bail!("invalid duration \"{input}\": must be greater than zero");
-    }
     if total > MAX_DURATION_SECS {
         bail!("invalid duration \"{input}\": at most 36500d (100 years)");
     }
-    Ok(Duration::from_secs(total))
+    Ok((total > 0).then(|| Duration::from_secs(total)))
 }
 
 /// Converts a delay to a PostgreSQL `interval` (days + microseconds, no
@@ -124,6 +142,29 @@ mod tests {
         ] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be refused");
         }
+    }
+
+    #[test]
+    fn zero_is_accepted_by_the_or_zero_variant() {
+        for zero in ["0", "000", "0s", "0m0s", " 0h ", "00m", "0d 0h"] {
+            assert_eq!(parse_duration_or_zero(zero).unwrap(), None, "{zero:?}");
+        }
+        assert_eq!(
+            parse_duration_or_zero("45").unwrap(),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            parse_duration_or_zero("1h30m").unwrap(),
+            Some(Duration::from_secs(5_400))
+        );
+        for bad in ["", "-1", "5x", "1h30", "36501d", "99999999999999999999999"] {
+            assert!(parse_duration_or_zero(bad).is_err(), "{bad:?}");
+        }
+        // the messages name the value given, not the internal "<n>s" form
+        let err = parse_duration_or_zero("3153600001")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"3153600001\""), "{err}");
     }
 
     #[test]

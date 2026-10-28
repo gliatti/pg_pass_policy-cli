@@ -167,42 +167,57 @@ pub async fn run(cli: Cli) -> Result<i32> {
         _ => None,
     };
     let mut conn = db::connect().await?;
-    match cli.command {
-        Command::Status { role } => commands::status(&mut conn, role.as_deref(), fmt).await?,
-        Command::Expiring { within } => commands::expiring(&mut conn, within, fmt).await?,
-        Command::Locked => commands::locked(&mut conn, fmt).await?,
+    let result = dispatch(&mut conn, cli.command, fmt, settings, password, delivery).await;
+    db::close(conn).await;
+    result
+}
+
+/// Runs the command on the open connection; [`run`] closes it afterwards,
+/// whatever the result.
+async fn dispatch(
+    conn: &mut sqlx::PgConnection,
+    command: Command,
+    fmt: output::Format,
+    settings: Option<serde_json::Map<String, serde_json::Value>>,
+    password: Option<secret::Secret>,
+    delivery: Option<Delivery>,
+) -> Result<i32> {
+    match command {
+        Command::Status { role } => commands::status(conn, role.as_deref(), fmt).await?,
+        Command::Expiring { within } => commands::expiring(conn, within, fmt).await?,
+        Command::Locked => commands::locked(conn, fmt).await?,
         Command::Rotate { role, .. } => {
             let delivery = delivery.expect("delivery prepared above");
-            commands::rotate(&mut conn, &role, delivery, fmt).await?
+            commands::rotate(conn, &role, delivery, fmt).await?
         }
         Command::SwitchPair { pair, .. } => {
             let delivery = delivery.expect("delivery prepared above");
-            commands::switch_pair(&mut conn, &pair, delivery, fmt).await?
+            commands::switch_pair(conn, &pair, delivery, fmt).await?
         }
         Command::Lock {
             role,
             duration,
             reason,
-        } => commands::lock(&mut conn, &role, duration, reason.as_deref(), fmt).await?,
-        Command::Unlock { role } => commands::unlock(&mut conn, &role, fmt).await?,
-        Command::Expire { role } => commands::expire(&mut conn, &role, fmt).await?,
+        } => commands::lock(conn, &role, duration, reason.as_deref(), fmt).await?,
+        Command::Unlock { role } => commands::unlock(conn, &role, fmt).await?,
+        Command::Expire { role } => commands::expire(conn, &role, fmt).await?,
         Command::Profile { action } => match action {
-            ProfileCommand::List => commands::profile_list(&mut conn, fmt).await?,
-            ProfileCommand::Show { name } => commands::profile_show(&mut conn, &name, fmt).await?,
+            ProfileCommand::List => commands::profile_list(conn, fmt).await?,
+            ProfileCommand::Show { name } => commands::profile_show(conn, &name, fmt).await?,
             ProfileCommand::Create { name, .. } => {
                 let settings = settings.expect("settings validated above");
-                commands::profile_create(&mut conn, &name, settings, fmt).await?
+                commands::profile_create(conn, &name, settings, fmt).await?
             }
             ProfileCommand::Alter { name, .. } => {
                 let settings = settings.expect("settings validated above");
-                commands::profile_alter(&mut conn, &name, settings, fmt).await?
+                commands::profile_alter(conn, &name, settings, fmt).await?
             }
-            ProfileCommand::Drop { name } => commands::profile_drop(&mut conn, &name, fmt).await?,
+            ProfileCommand::Drop { name } => commands::profile_drop(conn, &name, fmt).await?,
             ProfileCommand::Assign { role, profile } => {
-                commands::profile_assign(&mut conn, &role, &profile, fmt).await?
+                commands::profile_assign(conn, &role, &profile, fmt).await?
             }
             ProfileCommand::Unassign { role } => {
-                commands::profile_unassign(&mut conn, &role, fmt).await?
+                commands::profile_unassign(conn, &role, fmt).await?
             }
         },
         Command::Audit {
@@ -212,7 +227,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             limit,
         } => {
             commands::audit(
-                &mut conn,
+                conn,
                 since,
                 role.as_deref(),
                 event_type.as_deref(),
@@ -223,11 +238,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Check { role } => {
             let password = password.expect("password read above");
-            return commands::check(&mut conn, &role, password, fmt).await;
+            return commands::check(conn, &role, password, fmt).await;
         }
-        Command::Maintenance => commands::maintenance(&mut conn, fmt).await?,
-        Command::FailedAttempts => commands::failed_attempts(&mut conn, fmt).await?,
-        Command::WorkerStatus => commands::worker_status(&mut conn, fmt).await?,
+        Command::Maintenance => commands::maintenance(conn, fmt).await?,
+        Command::FailedAttempts => commands::failed_attempts(conn, fmt).await?,
+        Command::WorkerStatus => commands::worker_status(conn, fmt).await?,
     }
     Ok(EXIT_OK)
 }

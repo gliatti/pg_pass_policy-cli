@@ -145,8 +145,22 @@ Politique d'affichage :
 - si une remise (`--exec`, Vault) échoue malgré cela (Vault devenu
   injoignable, droits insuffisants sur le chemin, commande en erreur ou qui
   n'a pas lu le mot de passe), le mot de passe a déjà été changé côté serveur ; il
-  n'est pas affiché sauf `--show`, le code de retour est 1 et le message
-  invite à relancer la rotation ;
+  n'est pas affiché sauf `--show` et le code de retour est 1. Le message
+  (ligne `password:` de la sortie en table et erreur finale) dit s'il faut
+  relancer la rotation :
+  - « nothing delivered: rotate again » : aucune remise n'a abouti, le mot
+    de passe est perdu, relancer la rotation ;
+  - « delivered to vault, exec failed: the password is in Vault, do not
+    rotate again » : l'écriture Vault a réussi mais `--exec` a échoué. Le
+    mot de passe n'est pas perdu : le reprendre dans Vault pour terminer la
+    remise à la main. Une nouvelle rotation remplacerait le secret déjà
+    remis et relancerait le hook avec un autre mot de passe ;
+  - « delivered to exec, vault failed: rotate again » : seul le hook a reçu
+    le mot de passe, Vault ne l'a pas, relancer la rotation une fois Vault
+    corrigé ;
+
+  en JSON, `delivered_to` donne les remises réussies (`["vault"]` dans le
+  deuxième cas) ;
 - un Ctrl-C (`SIGINT`) ne tue plus `pgpp` à partir de l'appel SQL de
   rotation : pendant cet appel, `pgpp` l'abandonne et termine avec le code 1
   (le serveur a pu changer le mot de passe : relancer la rotation) ; pendant
@@ -154,7 +168,8 @@ Politique d'affichage :
   la remise en cours est abandonnée, celles qui restent ne sont pas tentées
   (message « not attempted » ; une écriture Vault abandonnée en cours de
   route a pu, ou non, aboutir) et `pgpp` termine comme pour une remise
-  échouée (code 1, message « rotate again », mot de passe affiché seulement
+  échouée (code 1, message « rotate again », ou « do not rotate again » si
+  l'écriture Vault avait abouti, mot de passe affiché seulement
   avec `--show`) ;
 - avec `--show`, l'affichage compte comme une remise : s'il échoue (sortie
   standard fermée, par exemple) alors qu'il était la seule remise ou qu'une
@@ -360,7 +375,7 @@ les cas suivants :
   serveur exclut ; l'écriture et l'attente du processus sont menées en
   parallèle, un hook qui se termine sans lire ne bloque donc pas `pgpp` ;
 - le hook dure plus que `--exec-timeout` (300 s par défaut ; durée comme
-  `90s`, `5m`, `1h`, ou nombre de secondes ; `0` supprime la limite). C'est
+  `90s`, `5m`, `1h`, ou nombre de secondes ; `0` ou `0s` supprime la limite). C'est
   le cas d'un hook qui a fermé son entrée sans se terminer
   (`exec 0<&-; sleep 100000`) ou qui est suspendu (voir ci-dessous) ;
 - `pgpp` reçoit un Ctrl-C (`SIGINT`) pendant que le hook tourne : le
@@ -440,7 +455,7 @@ client Vault :
 | variable | contenu |
 |---|---|
 | `VAULT_CACERT` | un fichier PEM (un certificat ou une chaîne complète), prioritaire sur `VAULT_CAPATH` |
-| `VAULT_CAPATH` | un répertoire de fichiers `*.pem` / `*.crt` / `*.cer`, tous chargés (contenu PEM attendu quelle que soit l'extension : un `.cer` binaire DER est refusé) |
+| `VAULT_CAPATH` | un répertoire de fichiers `*.pem` / `*.crt` / `*.cer` (extension en majuscules ou minuscules), tous chargés (contenu PEM attendu quelle que soit l'extension : un `.cer` binaire DER est refusé) |
 
 `VAULT_ADDR` est une URL sans paramètres (`?…`), sans fragment (`#…`) et
 sans identifiants (`user:pass@`), refusée sinon (code 2). Un préfixe de
@@ -526,7 +541,9 @@ secours) ou relancer la rotation après correction du jeton.
   `log_min_duration_statement >= 0` est actif : `pgpp check` neutralise cela
   par `SET LOCAL log_parameter_max_length = 0` quand le rôle y est autorisé
   (voir la section « Vérifier un mot de passe candidat » pour `ALTER ROLE …
-  SET` / `GRANT SET ON PARAMETER`), sinon il avertit. Ce réglage ne couvre
+  SET` / `GRANT SET ON PARAMETER`), sinon il avertit (l'avertissement ne
+  propose `GRANT SET ON PARAMETER` qu'à partir de PostgreSQL 15, version qui
+  l'introduit). Ce réglage ne couvre
   pas pgaudit : `pgaudit.log_parameter` doit rester à `off` pour le rôle
   appelant.
 - Aucun mot de passe n'est écrit par `pgpp` dans un journal, un message

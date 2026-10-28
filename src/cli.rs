@@ -5,9 +5,9 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::Value;
 
-use crate::duration::parse_duration;
 #[cfg(test)]
 use crate::duration::MAX_DURATION_SECS;
+use crate::duration::{parse_duration, parse_duration_or_zero};
 use crate::kv::parse_kv;
 use crate::output::Format;
 use crate::secret::EXEC_DEFAULT_TIMEOUT;
@@ -17,17 +17,11 @@ fn duration_arg(s: &str) -> Result<Duration, String> {
 }
 
 /// `--exec-timeout`: a duration (`300s`, `5m`), a bare number of seconds,
-/// or `0` for no limit.  Everything but `0` goes through [`parse_duration`]
-/// (a bare number as `<n>s`), which owns the bounds and their messages.
+/// or zero (`0`, `0s`...) for no limit; [`parse_duration_or_zero`] owns the
+/// rules, the bounds and their messages.
 fn exec_timeout_arg(s: &str) -> Result<ExecTimeout, String> {
-    let t = s.trim();
-    let bare = !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
-    if bare && t.bytes().all(|b| b == b'0') {
-        return Ok(ExecTimeout(None));
-    }
-    let input = if bare { format!("{t}s") } else { s.to_string() };
-    parse_duration(&input)
-        .map(|d| ExecTimeout(Some(d)))
+    parse_duration_or_zero(s)
+        .map(ExecTimeout)
         .map_err(|e| e.to_string())
 }
 
@@ -134,7 +128,7 @@ pub struct RotateOpts {
     pub exec: Option<String>,
 
     /// Longest run time of the --exec command (e.g. 300s, 5m, 1h; a bare
-    /// number is in seconds; 0: no limit).  Past it, or on Ctrl-C, the
+    /// number is in seconds; 0 or 0s: no limit).  Past it, or on Ctrl-C, the
     /// process group of the command is killed and the delivery fails
     #[arg(
         long = "exec-timeout",
@@ -514,12 +508,15 @@ mod tests {
         );
         assert_eq!(parse(&["--exec-timeout", "0"]), Ok(None), "unbounded");
         assert_eq!(parse(&["--exec-timeout", "000"]), Ok(None), "unbounded");
+        for zero in ["0s", "0m", "0h0m0s"] {
+            assert_eq!(parse(&["--exec-timeout", zero]), Ok(None), "{zero}");
+        }
         assert_eq!(
             parse(&["--exec-timeout", &MAX_DURATION_SECS.to_string()]),
             Ok(Some(Duration::from_secs(MAX_DURATION_SECS)))
         );
         let over = (MAX_DURATION_SECS + 1).to_string();
-        for bad in ["", "-1", "5x", "0s", "99999999999999999999999", &over] {
+        for bad in ["", "-1", "5x", "99999999999999999999999", &over] {
             assert_eq!(parse(&["--exec-timeout", bad]), Err(2), "{bad:?}");
         }
         // only with --exec
