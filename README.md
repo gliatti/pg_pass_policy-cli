@@ -796,8 +796,8 @@ secours) ou relancer la rotation après correction du jeton.
   enfant hérite en revanche de l'environnement de `pgpp` (voir la section
   `--exec`).
 - Vault n'est joint qu'en TLS vérifié (ou en clair sur la boucle locale
-  uniquement, un nom `localhost` étant épinglé sur `127.0.0.1`), avec `VAULT_CACERT` /
-  `VAULT_CAPATH` pour une autorité privée.
+  uniquement, un nom `localhost` étant épinglé sur `127.0.0.1`), avec
+  `VAULT_CACERT` / `VAULT_CAPATH` pour une autorité privée.
 - Le rôle de connexion doit être membre de `pass_policy_admin` : les
   vérifications de droits sont faites par les fonctions `SECURITY DEFINER`
   de l'extension (un administrateur non superutilisateur ne peut pas agir sur

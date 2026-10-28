@@ -501,8 +501,8 @@ async fn http_localhost_does_not_reach_an_ipv6_only_agent() {
     // any system
     let msg = pgpp::format_error(&err);
     assert!(msg.contains(&refused.to_string()), "{msg}");
-    // the wording the README quotes for Linux (the errno, cited by the
-    // message too, differs between architectures and is not quoted)
+    // the wording the README quotes for Linux; the README does not cite
+    // the errno, which varies by architecture
     #[cfg(target_os = "linux")]
     assert!(msg.contains("Connection refused (os error "), "{msg}");
     drop((reserved, listener));
